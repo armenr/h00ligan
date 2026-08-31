@@ -768,6 +768,24 @@ def validate_integration_workflow(workflow: str | None) -> list[str]:
     return failures
 
 
+def validate_test_profile(manifest: str | None) -> list[str]:
+    """Forbid throwaway incremental state in the complete test population."""
+    if manifest is None:
+        return ["missing workspace manifest"]
+    try:
+        parsed = tomllib.loads(manifest)
+    except tomllib.TOMLDecodeError as error:
+        return [f"workspace manifest is invalid TOML: {error}"]
+
+    test_profile = parsed.get("profile", {}).get("test", {})
+    if test_profile.get("incremental") is not False:
+        return [
+            "workspace test profile must set incremental = false so a clean "
+            "gate does not retain disposable compiler state"
+        ]
+    return []
+
+
 def validate_portable_lockfile(lockfile: str | None) -> list[str]:
     """Require one tracked Cargo lock for the exact embedded product graph."""
     if lockfile is None:
@@ -1250,6 +1268,26 @@ def self_test() -> int:
         if not validate_integration_workflow(sabotaged):
             raise AssertionError(f"integration {name} did not fire")
 
+    valid_manifest = """\
+[workspace]
+members = []
+
+[profile.test]
+debug = 1
+incremental = false
+"""
+    if failures := validate_test_profile(valid_manifest):
+        raise AssertionError(f"valid test profile rejected: {failures!r}")
+    test_profile_sabotages = {
+        "incremental omission": valid_manifest.replace("incremental = false\n", "", 1),
+        "incremental enablement": valid_manifest.replace(
+            "incremental = false", "incremental = true", 1
+        ),
+    }
+    for name, sabotaged in test_profile_sabotages.items():
+        if not validate_test_profile(sabotaged):
+            raise AssertionError(f"test profile {name} sabotage did not fire")
+
     valid_lock = """\
 version = 4
 
@@ -1312,6 +1350,7 @@ dependencies = [
         + len(DISTRIBUTION_REQUIRED_FRAGMENTS)
         + len(DISTRIBUTION_FORBIDDEN_FRAGMENTS)
         + len(integration_sabotages)
+        + len(test_profile_sabotages)
         + len(lock_sabotages)
         + len(REPOSITORY_LOCAL_IGNORE_PATTERNS)
     )
@@ -1414,6 +1453,13 @@ def main() -> int:
         else None
     )
     failures.extend(validate_integration_workflow(integration_text))
+    manifest_path = root / "Cargo.toml"
+    manifest_text = (
+        manifest_path.read_text(encoding="utf-8")
+        if manifest_path.is_file()
+        else None
+    )
+    failures.extend(validate_test_profile(manifest_text))
     lock_path = root / PORTABLE_PRODUCT_LOCK
     lock_text = lock_path.read_text(encoding="utf-8") if lock_path.is_file() else None
     failures.extend(validate_portable_lockfile(lock_text))

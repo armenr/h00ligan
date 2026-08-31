@@ -55,6 +55,12 @@ fn h00ligan() -> Command {
     Command::new(env!("CARGO_BIN_EXE_h00ligan"))
 }
 
+#[cfg(unix)]
+fn canonical_fixture_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|error| panic!("canonicalize fixture path {}: {error}", path.display()))
+}
+
 fn create_source_root(temporary: &TempDir, name: &str, source: &str) -> PathBuf {
     let root = temporary.path().join(name);
     std::fs::create_dir_all(root.join("src")).expect("source directory");
@@ -6704,7 +6710,7 @@ fn shipped_go_calls_distinguishes_missing_module_root_from_provider_failure() {
         std::fs::read_to_string(&provider_executed)
             .expect("go.mod positive control must execute provider")
             .trim(),
-        root.display().to_string(),
+        canonical_fixture_path(&root).display().to_string(),
         "the provider must execute at the discovered Go module root"
     );
     let with_module_json = stdout_json(&with_module);
@@ -7009,7 +7015,7 @@ fn shipped_go_callable_bindings_are_qualified_execution_paths_across_cli_and_mcp
         std::fs::read_to_string(&provider_executed)
             .expect("fixture provider must execute")
             .trim(),
-        root.display().to_string(),
+        canonical_fixture_path(&root).display().to_string(),
         "the provider must execute at the discovered Go module root",
     );
     assert_eq!(
@@ -8907,7 +8913,10 @@ fn every_rust_execution_root_is_rebased_into_one_repository_authority() {
         execution_roots
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>(),
-        [root.clone(), detached].into_iter().collect(),
+        [&root, &detached]
+            .into_iter()
+            .map(|path| canonical_fixture_path(path))
+            .collect(),
         "the root workspace and detached workspace must each be indexed exactly once"
     );
     let index_payload = stdout_json(&indexed);

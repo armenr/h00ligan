@@ -56,3 +56,7 @@ tracing-subscriber = "0.3.23"
 # Level 1 retains line-table backtraces while keeping the local/CI gate bounded.
 [profile.test]
 debug = 1
+# A complete source gate is a fresh, one-shot population. Incremental state is
+# never reused there and previously consumed another 5.8 GiB on the measured
+# standalone build, exhausting GitHub's hosted Linux runner during test links.
+incremental = false
