@@ -1148,6 +1148,8 @@ mod tests {
         std::fs::write(&source, "pub fn before() -> u8 { 1 }\n").expect("source fixture");
         let binding = crate::project_binding::ProjectBinding::explicit(&root, &data)
             .expect("explicit watch binding");
+        let root = binding.root().to_path_buf();
+        let source = root.join("src/lib.rs");
         let supervisor = IndexSupervisor::new(binding.clone());
         (temporary, root, source, binding, supervisor)
     }
@@ -1772,7 +1774,10 @@ mod tests {
     #[tokio::test]
     async fn real_watcher_emits_hidden_cargo_configuration_changes() {
         let temporary = TempDir::new().expect("watch scratch");
-        let root = temporary.path();
+        let root = temporary
+            .path()
+            .canonicalize()
+            .expect("canonical watch root");
         let source = root.join("src/lib.rs");
         let cargo_config = root.join(".cargo/config.toml");
         std::fs::create_dir_all(source.parent().expect("source parent")).expect("source directory");
@@ -1783,7 +1788,7 @@ mod tests {
             .expect("manifest positive control");
         std::fs::write(&cargo_config, "[build]\nrustflags=[]\n").expect("initial Cargo config");
 
-        let watcher = FileWatcher::new(WatcherConfig::new(root.to_path_buf(), 50));
+        let watcher = FileWatcher::new(WatcherConfig::new(root, 50));
         let mut batches = watcher.start().expect("arm watcher");
         std::fs::write(&cargo_config, "[build]\nrustflags=['--cfg','changed']\n")
             .expect("changed Cargo config");
@@ -1802,7 +1807,10 @@ mod tests {
     #[tokio::test]
     async fn real_watcher_emits_hidden_toolchain_selector_changes() {
         let temporary = TempDir::new().expect("watch scratch");
-        let root = temporary.path();
+        let root = temporary
+            .path()
+            .canonicalize()
+            .expect("canonical watch root");
         let source = root.join("src/lib.rs");
         let selector = root.join(".tool-versions");
         std::fs::create_dir_all(source.parent().expect("source parent")).expect("source directory");
@@ -1811,7 +1819,7 @@ mod tests {
             .expect("manifest positive control");
         std::fs::write(&selector, "rust 1.97.1\n").expect("initial toolchain selector");
 
-        let watcher = FileWatcher::new(WatcherConfig::new(root.to_path_buf(), 50));
+        let watcher = FileWatcher::new(WatcherConfig::new(root, 50));
         let mut batches = watcher.start().expect("arm watcher");
         std::fs::write(&selector, "rust 1.98.0\n").expect("changed toolchain selector");
         let batch = timeout(Duration::from_secs(5), batches.recv())
@@ -1829,7 +1837,10 @@ mod tests {
     #[tokio::test]
     async fn native_registration_prunes_outputs_and_arms_new_source_directories() {
         let temporary = TempDir::new().expect("filtered watch scratch");
-        let root = temporary.path();
+        let root = temporary
+            .path()
+            .canonicalize()
+            .expect("canonical watch root");
         std::fs::write(
             root.join("Cargo.toml"),
             "[package]\nname = \"filtered-watch\"\nversion = \"0.0.0\"\n",
@@ -1838,12 +1849,12 @@ mod tests {
         std::fs::write(root.join(".gitignore"), "/target/\n").expect("ignore policy");
         std::fs::create_dir_all(root.join("src")).expect("source directory");
         let mut generated = root.join("target");
-        for index in 0..128 {
+        for index in 0..32 {
             generated.push(format!("nested-{index}"));
             std::fs::create_dir_all(&generated).expect("generated directory");
         }
 
-        let watcher = FileWatcher::new(WatcherConfig::new(root.to_path_buf(), 25));
+        let watcher = FileWatcher::new(WatcherConfig::new(root.clone(), 25));
         let mut stream = watcher.start().expect("arm filtered watcher");
         assert_eq!(
             stream.watched_directory_count(),

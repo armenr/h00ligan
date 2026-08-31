@@ -4895,9 +4895,6 @@ fn source_call_evidence(
     relative_path: &str,
     language: &str,
 ) -> Result<SourceSyntaxEvidence, NormalizationFailure> {
-    #[cfg(test)]
-    SOURCE_SYNTAX_CENSUS_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
     let extension = Path::new(relative_path)
         .extension()
         .and_then(|extension| extension.to_str())
@@ -5824,10 +5821,6 @@ fn line_ranges(source: &[u8]) -> Vec<(usize, usize)> {
     ranges.push((start, source.len()));
     ranges
 }
-
-#[cfg(test)]
-static SOURCE_SYNTAX_CENSUS_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
 std::thread_local! {
@@ -11785,7 +11778,6 @@ mod tests {
             Some(baseline_changed_storage),
             "positive control: the affected canonical document must own new immutable storage"
         );
-        SOURCE_SYNTAX_CENSUS_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
         NORMALIZED_PROVIDER_OCCURRENCE_RETAIN_COUNT.with(|count| count.set(0));
         PROVIDER_DEFINITION_RECORD_RETAIN_COUNT.with(|count| count.set(0));
         DEFINITION_RECORD_GROUP_SCAN_COUNT.with(|count| count.set(0));
@@ -11807,7 +11799,7 @@ mod tests {
         assert_eq!(uncached.timings.provider_documents, 2);
         assert_eq!(uncached.timings.provider_document_cache_hits, 0);
         assert_eq!(
-            SOURCE_SYNTAX_CENSUS_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+            uncached.timings.source_documents - uncached.timings.syntax_cache_hits,
             2,
             "positive control: ordinary global normalization reparses both source documents"
         );
@@ -11828,7 +11820,6 @@ mod tests {
             "positive control: the global pass must canonicalize every provider definition group"
         );
 
-        SOURCE_SYNTAX_CENSUS_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
         NORMALIZED_PROVIDER_OCCURRENCE_RETAIN_COUNT.with(|count| count.set(0));
         PROVIDER_DEFINITION_RECORD_RETAIN_COUNT.with(|count| count.set(0));
         DEFINITION_GROUP_CANONICALIZATION_COUNT.with(|count| count.set(0));
@@ -11851,7 +11842,7 @@ mod tests {
         assert_eq!(incremental.timings.call_documents, 2);
         assert_eq!(incremental.timings.call_document_reuse_hits, 1);
         assert_eq!(
-            SOURCE_SYNTAX_CENSUS_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+            incremental.timings.source_documents - incremental.timings.syntax_cache_hits,
             1,
             "only the source whose exact content identity changed may be reparsed"
         );

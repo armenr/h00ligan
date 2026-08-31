@@ -7,11 +7,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 use globset::{GlobBuilder, GlobMatcher};
 use rayon::prelude::*;
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -38,21 +38,41 @@ thread_local! {
 }
 
 #[cfg(test)]
-/// Successful project-input file reads across the worker threads used by one
-/// exact observation.
-static PROJECT_INPUT_FILE_READS: AtomicUsize = AtomicUsize::new(0);
+#[derive(Default)]
+struct TestProjectInputProbeState {
+    file_reads: BTreeMap<PathBuf, usize>,
+    delayed_roots: BTreeSet<PathBuf>,
+    in_flight: BTreeMap<PathBuf, usize>,
+    max_in_flight: BTreeMap<PathBuf, usize>,
+}
 
 #[cfg(test)]
-fn reset_project_discovery_read_counts() {
-    PROJECT_INPUT_FILE_READS.store(0, Ordering::SeqCst);
+fn test_project_input_probe_state() -> &'static Mutex<TestProjectInputProbeState> {
+    static STATE: OnceLock<Mutex<TestProjectInputProbeState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(TestProjectInputProbeState::default()))
+}
+
+#[cfg(test)]
+fn reset_project_discovery_read_counts(root: &Path) {
+    test_project_input_probe_state()
+        .lock()
+        .expect("project-input probe state")
+        .file_reads
+        .remove(root);
     PROJECT_MANIFEST_FILE_READS.with(|count| count.set(0));
     PROJECT_INPUT_PLAN_BUILDS.with(|count| count.set(0));
 }
 
 #[cfg(test)]
-fn project_discovery_read_counts() -> (usize, usize) {
+fn project_discovery_read_counts(root: &Path) -> (usize, usize) {
     (
-        PROJECT_INPUT_FILE_READS.load(Ordering::SeqCst),
+        test_project_input_probe_state()
+            .lock()
+            .expect("project-input probe state")
+            .file_reads
+            .get(root)
+            .copied()
+            .unwrap_or(0),
         PROJECT_MANIFEST_FILE_READS.with(std::cell::Cell::get),
     )
 }
@@ -68,8 +88,13 @@ fn record_project_input_plan_build() {
 }
 
 #[cfg(test)]
-fn record_project_input_file_read() {
-    PROJECT_INPUT_FILE_READS.fetch_add(1, Ordering::SeqCst);
+fn record_project_input_file_read(root: &Path) {
+    let mut state = test_project_input_probe_state()
+        .lock()
+        .expect("project-input probe state");
+    let reads = state.file_reads.entry(root.to_path_buf()).or_default();
+    *reads = reads.saturating_add(1);
+    drop(state);
 }
 
 #[cfg(test)]
@@ -78,25 +103,25 @@ fn record_project_manifest_file_read() {
 }
 
 #[cfg(test)]
-static TEST_PROJECT_INPUT_DELAY_ENABLED: AtomicBool = AtomicBool::new(false);
-#[cfg(test)]
-static TEST_PROJECT_INPUTS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static TEST_MAX_PROJECT_INPUTS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(test)]
-struct TestProjectInputFlightGuard;
+struct TestProjectInputFlightGuard {
+    root: PathBuf,
+}
 
 #[cfg(test)]
 struct TestProjectInputDelayGuard {
-    previous: bool,
+    root: PathBuf,
 }
 
 #[cfg(test)]
 impl TestProjectInputDelayGuard {
-    fn enable() -> Self {
+    fn enable(root: &Path) -> Self {
+        test_project_input_probe_state()
+            .lock()
+            .expect("project-input probe state")
+            .delayed_roots
+            .insert(root.to_path_buf());
         Self {
-            previous: TEST_PROJECT_INPUT_DELAY_ENABLED.swap(true, Ordering::SeqCst),
+            root: root.to_path_buf(),
         }
     }
 }
@@ -104,27 +129,80 @@ impl TestProjectInputDelayGuard {
 #[cfg(test)]
 impl Drop for TestProjectInputDelayGuard {
     fn drop(&mut self) {
-        TEST_PROJECT_INPUT_DELAY_ENABLED.store(self.previous, Ordering::SeqCst);
+        test_project_input_probe_state()
+            .lock()
+            .expect("project-input probe state")
+            .delayed_roots
+            .remove(&self.root);
     }
 }
 
 #[cfg(test)]
 impl TestProjectInputFlightGuard {
-    fn enter() -> Self {
-        let in_flight = TEST_PROJECT_INPUTS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
-        TEST_MAX_PROJECT_INPUTS_IN_FLIGHT.fetch_max(in_flight, Ordering::SeqCst);
-        if TEST_PROJECT_INPUT_DELAY_ENABLED.load(Ordering::SeqCst) {
+    fn enter(root: &Path) -> Self {
+        let delay = {
+            let mut state = test_project_input_probe_state()
+                .lock()
+                .expect("project-input probe state");
+            let root = root.to_path_buf();
+            let in_flight = state.in_flight.entry(root.clone()).or_default();
+            *in_flight = in_flight.saturating_add(1);
+            let current = *in_flight;
+            state
+                .max_in_flight
+                .entry(root.clone())
+                .and_modify(|maximum| *maximum = (*maximum).max(current))
+                .or_insert(current);
+            let delay = state.delayed_roots.contains(&root);
+            drop(state);
+            delay
+        };
+        if delay {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        Self
+        Self {
+            root: root.to_path_buf(),
+        }
     }
 }
 
 #[cfg(test)]
 impl Drop for TestProjectInputFlightGuard {
     fn drop(&mut self) {
-        TEST_PROJECT_INPUTS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        let mut state = test_project_input_probe_state()
+            .lock()
+            .expect("project-input probe state");
+        let Some(in_flight) = state.in_flight.get_mut(&self.root) else {
+            return;
+        };
+        if *in_flight <= 1 {
+            state.in_flight.remove(&self.root);
+        } else {
+            *in_flight -= 1;
+        }
+        drop(state);
     }
+}
+
+#[cfg(test)]
+fn reset_project_input_concurrency(root: &Path) {
+    let mut state = test_project_input_probe_state()
+        .lock()
+        .expect("project-input probe state");
+    state.in_flight.remove(root);
+    state.max_in_flight.remove(root);
+    drop(state);
+}
+
+#[cfg(test)]
+fn max_project_inputs_in_flight(root: &Path) -> usize {
+    test_project_input_probe_state()
+        .lock()
+        .expect("project-input probe state")
+        .max_in_flight
+        .get(root)
+        .copied()
+        .unwrap_or(0)
 }
 
 pub const PROJECT_INVENTORY_SCHEMA_VERSION: &str = "h00/code-intel/project-inventory/v8";
@@ -2067,7 +2145,7 @@ fn capture_project_input_observation(
 
 fn observe_project_input_file(root: &Path, relative_path: &Path) -> ProjectInputFileObservation {
     #[cfg(test)]
-    let _flight = TestProjectInputFlightGuard::enter();
+    let _flight = TestProjectInputFlightGuard::enter(root);
     let absolute = root.join(relative_path);
     let metadata = match std::fs::symlink_metadata(&absolute) {
         Ok(metadata) => metadata,
@@ -2100,7 +2178,7 @@ fn observe_project_input_file(root: &Path, relative_path: &Path) -> ProjectInput
         }
     };
     #[cfg(test)]
-    record_project_input_file_read();
+    record_project_input_file_read(root);
     ProjectInputFileObservation::Content {
         path: path_label(relative_path),
         content_sha256: sha256_hex(&bytes),
@@ -9066,10 +9144,10 @@ mod tests {
         );
         let witness = ProjectInventoryWitness::new(sources.to_vec(), Arc::new(expected));
 
-        reset_project_discovery_read_counts();
+        reset_project_discovery_read_counts(root);
         assert_eq!(witness.observe(root), ProjectInventoryFreshness::Current);
         assert_eq!(witness.observe(root), ProjectInventoryFreshness::Current);
-        let (project_input_reads, project_manifest_reads) = project_discovery_read_counts();
+        let (project_input_reads, project_manifest_reads) = project_discovery_read_counts(root);
         assert_eq!(
             project_input_reads, 2,
             "each exact request must still re-read the manifest bytes"
@@ -9109,9 +9187,8 @@ mod tests {
         let expected = Arc::new(build_project_inventory(root, &sources));
         let witness = ProjectInventoryWitness::new(sources, expected);
 
-        TEST_PROJECT_INPUTS_IN_FLIGHT.store(0, Ordering::SeqCst);
-        TEST_MAX_PROJECT_INPUTS_IN_FLIGHT.store(0, Ordering::SeqCst);
-        let _delay = TestProjectInputDelayGuard::enable();
+        reset_project_input_concurrency(root);
+        let _delay = TestProjectInputDelayGuard::enable(root);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(4)
             .build()
@@ -9120,7 +9197,7 @@ mod tests {
 
         assert_eq!(verdict, ProjectInventoryFreshness::Current);
         assert!(
-            TEST_MAX_PROJECT_INPUTS_IN_FLIGHT.load(Ordering::SeqCst) > 1,
+            max_project_inputs_in_flight(root) > 1,
             "positive multi-thread control must observe overlapping project-input candidates"
         );
     }
@@ -9216,14 +9293,14 @@ mod tests {
             "positive control: malformed topology must not enter the complete fast path"
         );
 
-        reset_project_discovery_read_counts();
+        reset_project_discovery_read_counts(root);
         assert_eq!(
             check_project_inventory_freshness(root, &sources, &expected),
             ProjectInventoryFreshness::Current,
             "an unchanged partial observation retains the previous exact behavior"
         );
         assert_eq!(
-            project_discovery_read_counts(),
+            project_discovery_read_counts(root),
             (1, 1),
             "partial authority must reconstruct both project-input and parse evidence"
         );
@@ -9533,9 +9610,9 @@ mod tests {
             (0..64).map(|index| InventorySource::new(format!("src/module_{index}.go"), "go")),
         );
 
-        reset_project_discovery_read_counts();
+        reset_project_discovery_read_counts(root);
         let inventory = build_project_inventory(root, &sources);
-        let (input_reads, manifest_reads) = project_discovery_read_counts();
+        let (input_reads, manifest_reads) = project_discovery_read_counts(root);
 
         assert_eq!(inventory.project_topology.memberships.len(), sources.len());
         assert_eq!(
