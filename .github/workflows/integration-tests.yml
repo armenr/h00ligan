@@ -1,0 +1,153 @@
+name: Portable CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: portable-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_LOG: warn
+
+jobs:
+  policy:
+    name: Repository and release policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (checked 2026-08-16)
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prove policy canaries and release coordinates
+        run: |
+          python3 scripts/check-conventional-commits.py --self-test
+          python3 scripts/check-action-pins.py --self-test
+          python3 scripts/check-action-pins.py
+          python3 scripts/check-h00ligan-ci.py --self-test
+          python3 scripts/check-h00ligan-release.py
+          python3 scripts/normalize-h00ligan-sbom.py --self-test
+          python3 scripts/check-h00ligan-sbom.py --self-test
+          scripts/package-h00ligan-release.sh --self-test
+
+      - name: Lint workflow semantics with verified actionlint
+        run: |
+          curl --location --proto '=https' --proto-redir '=https' \
+            --tlsv1.2 --retry 5 --fail --silent --show-error \
+            --output "$RUNNER_TEMP/actionlint.tar.gz" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          test -s "$RUNNER_TEMP/actionlint.tar.gz"
+          echo '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz' \
+            > "$RUNNER_TEMP/actionlint.SHA256SUMS"
+          (cd "$RUNNER_TEMP" && sha256sum --check actionlint.SHA256SUMS)
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color
+
+      - name: Validate the proposed merge subject
+        run: >-
+          python3 scripts/check-conventional-commits.py
+          --github-event "$GITHUB_EVENT_PATH"
+
+  source-linux:
+    name: Standalone source gate (Linux x86-64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (checked 2026-08-16)
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned development environment
+        uses: jetify-com/devbox-install-action@8c6a66ed6273138b1915457069de78cb52fe3bd7 # v0.15.0 (checked 2026-08-22)
+        with:
+          devbox-version: 0.17.5
+          enable-cache: true
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0 (checked 2026-08-16)
+        with:
+          components: rust-analyzer
+          rustflags: ""
+          cache: false
+
+      - name: Fetch the exact locked source graph
+        run: devbox run -- cargo fetch --locked
+
+      - name: Format and compile every source target
+        run: |
+          devbox run -- cargo fmt --all -- --check
+          devbox run -- cargo check --locked --offline --workspace --all-targets --all-features
+
+      - name: Strict lint
+        run: >-
+          devbox run -- cargo clippy --locked --offline --workspace
+          --all-targets --all-features -- -D warnings
+
+      - name: Serial source and real-process tests
+        run: >-
+          devbox run -- cargo test --locked --offline --workspace
+          --all-targets --all-features -- --test-threads=1
+
+      - name: Dependency policy
+        run: |
+          devbox run -- cargo deny --version | grep -Fx 'cargo-deny 0.20.2'
+          devbox run -- cargo deny fetch
+          devbox run -- cargo deny --offline --locked --exclude-dev -L error check
+
+      - name: Static product and script authorities
+        run: |
+          python3 scripts/check-h00ligan-binary.py --self-test
+          python3 scripts/publish-h00ligan-cache-directory.py --self-test
+          python3 scripts/bench-h00ligan.py --self-test
+          shellcheck .githooks/commit-msg scripts/bench-h00ligan-product.sh \
+            scripts/build-h00-go-semantic-provider.sh \
+            scripts/build-h00-pyrefly-semantic-provider.sh \
+            scripts/build-h00-rust-semantic-provider.sh \
+            scripts/build-h00-typescript-semantic-provider.sh \
+            scripts/build-h00ligan-portable.sh \
+            scripts/package-h00ligan-release.sh \
+            scripts/resolve-h00-official-go-sdk.sh \
+            scripts/test-h00ligan-installed-product.sh
+
+  source-macos:
+    name: Standalone source gate (macOS ${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26-intel
+            arch: Intel
+            deployment_target: "10.12"
+          - runner: macos-26
+            arch: ARM64
+            deployment_target: "11.0"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (checked 2026-08-16)
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0 (checked 2026-08-16)
+        with:
+          components: rust-analyzer
+          rustflags: ""
+          cache: false
+
+      - name: Compile every source target
+        run: cargo check --locked --workspace --all-targets --all-features
+
+      - name: Test every source target
+        run: >-
+          cargo test --locked --workspace --all-targets --all-features
+          -- --test-threads=1

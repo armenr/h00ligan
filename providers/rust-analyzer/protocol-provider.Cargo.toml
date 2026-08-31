@@ -1,0 +1,25 @@
+[package]
+name = "h00ligan-provider-protocol"
+version = "0.1.0"
+license = "LicenseRef-BSL-1.1"
+description = "Bounded wire contract shared by h00ligan and its semantic providers"
+edition = "2024"
+rust-version = "1.97.1"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Latest stable releases on 2026-08-21 are serde 1.0.229,
+# serde_json 1.0.151, sha2 0.11.0, and thiserror 2.0.20. The h00ligan
+# workspace pins those exact releases. This provider-build manifest instead
+# matches the immutable Rust 1.97.1 rust-analyzer lock wherever possible so
+# adding the sidecar does not opportunistically upgrade its upstream graph.
+# sha2 0.10.9 is already locked by the pinned provider graph and is API-compatible with this shared
+# source. Re-evaluate these pins whenever the certified Rust/rust-analyzer
+# source commit changes; use the latest releases once they no longer perturb
+# unrelated upstream packages.
+serde = { version = "=1.0.226", features = ["derive"] }
+serde_json = { version = "=1.0.145", features = ["preserve_order"] }
+sha2 = "=0.10.9"
+thiserror = "=2.0.16"

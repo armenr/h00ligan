@@ -1,0 +1,12 @@
+/target/
+/.devbox/
+/.h00ligan/
+/dist/
+/index.scip
+/.env
+/.env.*
+!.env.example
+.codex-home/
+__pycache__/
+*.pyc
+.DS_Store

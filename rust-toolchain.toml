@@ -1,0 +1,6 @@
+[toolchain]
+# MSRV policy: track latest stable by deliberate bump (ADR-0032, WU-0012).
+# Pinned (not floating "stable") so a mid-work stable release can't silently
+# change the `-D warnings` lint surface; re-pin on each adopt-latest pass.
+channel = "1.97.1"
+components = ["rustfmt", "clippy", "rust-analyzer"]

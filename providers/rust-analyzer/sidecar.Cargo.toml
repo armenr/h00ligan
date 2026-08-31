@@ -1,0 +1,44 @@
+[package]
+name = "h00ligan-ra-provider"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license = "LicenseRef-BSL-1.1"
+
+[lib]
+name = "h00ligan_ra_provider"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "h00ligan-ra-provider"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+h00ligan-provider-protocol = { path = "../h00ligan-provider-protocol" }
+hir.workspace = true
+ide.workspace = true
+libc.workspace = true
+load-cargo.workspace = true
+# lsp-types 0.97.0 is the latest stable release on 2026-08-21, but this
+# sidecar passes capabilities directly into the pinned rust-analyzer 1.97.1
+# API, whose exact public type is 0.95.0. Advance this pin with the certified
+# upstream source commit, not independently.
+lsp-types = { version = "=0.95.0", features = ["proposed"] }
+# Latest stable releases verified on 2026-08-21.
+num_cpus = "=1.17.0"
+project-model.workspace = true
+protobuf = "=3.7.2"
+rust-analyzer = { path = "../rust-analyzer" }
+serde_json = { workspace = true, features = ["preserve_order"] }
+# sha2 0.11.0 is latest stable as verified from upstream docs on 2026-08-22.
+# The pinned rust-analyzer 1.97.1 lock already carries 0.10.9 through h00ligan's
+# protocol crate; use that exact API-compatible release here so the embedded
+# provider does not duplicate or perturb its certified upstream graph.
+sha2 = "=0.10.9"
+vfs.workspace = true
+
+[lints]
+workspace = true

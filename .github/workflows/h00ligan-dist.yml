@@ -1,0 +1,441 @@
+name: h00ligan distribution
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Immutable release commit or tag
+        required: true
+        type: string
+      version:
+        description: Plain h00ligan SemVer
+        required: true
+        type: string
+      tag:
+        description: Existing draft release tag
+        required: true
+        type: string
+      publish:
+        description: Upload assets and publish the existing draft
+        required: false
+        default: false
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit, branch, or tag to build
+        required: true
+        default: main
+        type: string
+      version:
+        description: Expected SemVer; empty reads Cargo.toml
+        required: false
+        type: string
+      tag:
+        description: Expected tag; empty derives h00ligan-vX.Y.Z
+        required: false
+        type: string
+      publish:
+        description: Publish an existing matching draft after assets succeed
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: h00ligan-dist-${{ inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+  CARGO_PROFILE_RELEASE_LTO: thin
+  CARGO_PROFILE_RELEASE_PANIC: abort
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+
+jobs:
+  prepare:
+    name: Resolve immutable release input
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.release.outputs.sha }}
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (checked 2026-08-16)
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate and freeze release coordinates
+        id: release
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          python3 scripts/check-h00ligan-release.py
+          manifest_version="$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("crates/h00ligan/Cargo.toml").read_text())["package"]["version"])')"
+          version="${REQUESTED_VERSION:-$manifest_version}"
+          if [[ "$version" != "$manifest_version" ]]; then
+            echo "requested version $version != manifest version $manifest_version" >&2
+            exit 1
+          fi
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "release version must be plain SemVer: $version" >&2
+            exit 1
+          fi
+          expected_tag="h00ligan-v${version}"
+          tag="${REQUESTED_TAG:-$expected_tag}"
+          if [[ "$tag" != "$expected_tag" ]]; then
+            echo "requested tag $tag != component tag $expected_tag" >&2
+            exit 1
+          fi
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "version=$version"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            platform: linux-amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            platform: linux-arm64
+          - runner: macos-26-intel
+            target: x86_64-apple-darwin
+            platform: macos-amd64
+          - runner: macos-26
+            target: aarch64-apple-darwin
+            platform: macos-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (checked 2026-08-16)
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out the exact Rust semantic-provider source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (checked 2026-08-16)
+        with:
+          repository: rust-lang/rust
+          ref: 8bab26f4f68e0e26f0bb7960be334d5b520ea452
+          path: target/upstream-rust-1.97.1
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install the pinned product build environment
+        uses: jetify-com/devbox-install-action@8c6a66ed6273138b1915457069de78cb52fe3bd7 # v0.15.0 (checked 2026-08-22)
+        with:
+          devbox-version: 0.17.5
+          enable-cache: true
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0 (checked 2026-08-16)
+        with:
+          target: ${{ matrix.target }}
+          rustflags: ""
+          cache: false
+
+      - name: Fetch the exact locked build and acceptance dependencies
+        env:
+          H00_RUST_SOURCE_DIR: target/upstream-rust-1.97.1
+        run: |
+          details="$(devbox run -- scripts/build-h00ligan-portable.sh \
+            --prepare-only \
+            --rust-source "$H00_RUST_SOURCE_DIR" \
+            --machine)"
+          product_manifest="$(printf '%s\n' "$details" | sed -n 's/^H00LIGAN_PRODUCT_MANIFEST=//p')"
+          [[ -f "$product_manifest" ]]
+          devbox run -- cargo fetch --locked --manifest-path "$product_manifest"
+          devbox run -- cargo fetch --locked --manifest-path Cargo.toml
+
+      - name: Build the locked one-file product
+        id: product
+        env:
+          H00_RUST_SOURCE_DIR: target/upstream-rust-1.97.1
+          TARGET: ${{ matrix.target }}
+        run: |
+          details="$(devbox run -- scripts/build-h00ligan-portable.sh \
+            --target "$TARGET" \
+            --rust-source "$H00_RUST_SOURCE_DIR" \
+            --machine)"
+          binary="$(printf '%s\n' "$details" | sed -n 's/^H00LIGAN_BINARY=//p')"
+          receipt="$(printf '%s\n' "$details" | sed -n 's/^H00LIGAN_RECEIPT=//p')"
+          source_receipt="$(printf '%s\n' "$details" | sed -n 's/^H00LIGAN_PRODUCT_SOURCE_RECEIPT=//p')"
+          [[ -x "$binary" && -f "$receipt" && -f "$source_receipt" ]]
+          echo "binary=$binary" >> "$GITHUB_OUTPUT"
+          echo "receipt=$receipt" >> "$GITHUB_OUTPUT"
+          echo "source_receipt=$source_receipt" >> "$GITHUB_OUTPUT"
+
+      - name: Exercise the exact installed provider, MCP, and WATCH boundaries
+        env:
+          H00_RUST_SOURCE_DIR: target/upstream-rust-1.97.1
+          H00_TEST_H00LIGAN_BINARY: ${{ steps.product.outputs.binary }}
+          H00_TEST_H00LIGAN_RECEIPT: ${{ steps.product.outputs.receipt }}
+          H00_TEST_H00LIGAN_PRODUCT_SOURCE_RECEIPT: ${{ steps.product.outputs.source_receipt }}
+        run: devbox run -- scripts/test-h00ligan-installed-product.sh
+
+      - name: Prove architecture, linkage, and real CLI reachability
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          binary="${{ steps.product.outputs.binary }}"
+          python3 scripts/check-h00ligan-binary.py \
+            --binary "$binary" \
+            --target "$TARGET" \
+            --receipt "${{ steps.product.outputs.receipt }}" \
+            --source-receipt "${{ steps.product.outputs.source_receipt }}"
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          for runner_prefix in \
+            "$GITHUB_WORKSPACE" "$cargo_home" "$RUNNER_TEMP" "$HOME" "${RUNNER_TOOL_CACHE:-}"; do
+            [[ -z "$runner_prefix" ]] && continue
+            if grep -aFq "$runner_prefix/" "$binary"; then
+              echo "release binary contains a runner-local path beneath $runner_prefix" >&2
+              exit 1
+            fi
+          done
+          identity="$($binary --version)"
+          short_sha="$(git rev-parse --short "$SOURCE_SHA")"
+          [[ "$identity" == "h00ligan ${VERSION}+"* ]]
+          [[ "$identity" == *"+$short_sha" ]]
+          [[ "$identity" != *'+dirty'* ]]
+          [[ "$identity" != *'+nogit'* ]]
+          "$binary" --help >/dev/null
+          python3 scripts/smoke-h00ligan-mcp.py \
+            --binary "$binary" \
+            --version "$VERSION" \
+            --scratch "$RUNNER_TEMP"
+          mkdir -p "$RUNNER_TEMP/h00ligan-raw"
+          install -m 0755 "$binary" "$RUNNER_TEMP/h00ligan-raw/h00ligan-$PLATFORM"
+          printf '%s\n' "$identity" > "$RUNNER_TEMP/h00ligan-raw/identity-$PLATFORM.txt"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1 (checked 2026-08-16)
+        with:
+          name: h00ligan-raw-${{ matrix.platform }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/h00ligan-raw/
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    name: Package and inventory release
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (checked 2026-08-16)
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out the exact Rust semantic-provider source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (checked 2026-08-16)
+        with:
+          repository: rust-lang/rust
+          ref: 8bab26f4f68e0e26f0bb7960be334d5b520ea452
+          path: target/upstream-rust-1.97.1
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install the pinned product build environment
+        uses: jetify-com/devbox-install-action@8c6a66ed6273138b1915457069de78cb52fe3bd7 # v0.15.0 (checked 2026-08-22)
+        with:
+          devbox-version: 0.17.5
+          enable-cache: true
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0 (checked 2026-08-16)
+        with:
+          target: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,x86_64-apple-darwin,aarch64-apple-darwin
+          rustflags: ""
+          cache: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1 (checked 2026-08-16)
+        with:
+          pattern: h00ligan-raw-*-${{ github.run_id }}
+          path: ${{ runner.temp }}/h00ligan-raw
+          merge-multiple: true
+
+      - name: Install verified inventory-generator releases
+        run: |
+          tool_root="$RUNNER_TEMP/h00ligan-release-tools"
+          mkdir -p "$tool_root/bin" "$tool_root/downloads"
+          curl --location --proto '=https' --proto-redir '=https' \
+            --tlsv1.2 --retry 5 --fail --silent --show-error \
+            --output "$tool_root/downloads/cargo-cyclonedx.tar.xz" \
+            https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-0.5.9/cargo-cyclonedx-x86_64-unknown-linux-musl.tar.xz
+          curl --location --proto '=https' --proto-redir '=https' \
+            --tlsv1.2 --retry 5 --fail --silent --show-error \
+            --output "$tool_root/downloads/cargo-about.tar.gz" \
+            https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.1/cargo-about-0.9.1-x86_64-unknown-linux-musl.tar.gz
+          test -s "$tool_root/downloads/cargo-cyclonedx.tar.xz"
+          test -s "$tool_root/downloads/cargo-about.tar.gz"
+          echo '9bd3e599314f50810c9d98b8b68a617ff9d3cc20873968d90b29d121f6b226ff  cargo-cyclonedx.tar.xz' \
+            > "$tool_root/downloads/SHA256SUMS"
+          echo 'c0e7dc6f5d74b0beec5c0053d39ab24514c717d19acd91886907a22457ea9e98  cargo-about.tar.gz' \
+            >> "$tool_root/downloads/SHA256SUMS"
+          (cd "$tool_root/downloads" && sha256sum --check SHA256SUMS)
+          tar -xJf "$tool_root/downloads/cargo-cyclonedx.tar.xz" -C "$tool_root/downloads"
+          tar -xzf "$tool_root/downloads/cargo-about.tar.gz" -C "$tool_root/downloads"
+          install -m 0755 \
+            "$tool_root/downloads/cargo-cyclonedx-x86_64-unknown-linux-musl/cargo-cyclonedx" \
+            "$tool_root/bin/cargo-cyclonedx"
+          install -m 0755 \
+            "$tool_root/downloads/cargo-about-0.9.1-x86_64-unknown-linux-musl/cargo-about" \
+            "$tool_root/bin/cargo-about"
+          echo "$tool_root/bin" >> "$GITHUB_PATH"
+
+      - name: Verify inventory tool versions
+        run: |
+          cargo cyclonedx --version | grep -F '0.5.9'
+          cargo about --version | grep -F '0.9.1'
+
+      - name: Generate target SBOMs and dependency licenses
+        run: |
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export SOURCE_DATE_EPOCH
+          mkdir -p "$RUNNER_TEMP/h00ligan-inventory"
+          product_details="$(devbox run -- scripts/build-h00ligan-portable.sh \
+            --prepare-only \
+            --rust-source target/upstream-rust-1.97.1 \
+            --machine)"
+          product_root="$(printf '%s\n' "$product_details" | sed -n 's/^H00LIGAN_PRODUCT_ROOT=//p')"
+          product_manifest="$(printf '%s\n' "$product_details" | sed -n 's/^H00LIGAN_PRODUCT_MANIFEST=//p')"
+          product_lockfile="$(printf '%s\n' "$product_details" | sed -n 's/^H00LIGAN_PRODUCT_LOCKFILE=//p')"
+          [[ -d "$product_root" && -f "$product_manifest" && -f "$product_lockfile" ]]
+          cmp "$product_lockfile" providers/rust-analyzer/h00ligan-product.Cargo.lock
+          devbox run -- cargo fetch --locked --manifest-path "$product_manifest"
+
+          inventory_root="$RUNNER_TEMP/h00ligan-product-inventory"
+          cp -a "$product_root" "$inventory_root"
+          product_manifest_relative="${product_manifest#"$product_root"/}"
+          inventory_manifest="$inventory_root/$product_manifest_relative"
+          cargo metadata --locked --manifest-path "$inventory_manifest" \
+            --format-version 1 >/dev/null
+          while read -r platform target; do
+            cargo cyclonedx \
+              --manifest-path "$inventory_manifest" \
+              --format json --describe binaries --spec-version 1.5 \
+              --target "$target" --no-default-features
+            generated_sbom="${inventory_manifest%/Cargo.toml}/h00ligan-product_bin.cdx.json"
+            python3 scripts/normalize-h00ligan-sbom.py \
+              --sbom "$generated_sbom" \
+              --workspace-root "$inventory_root"
+            install -m 0644 "$generated_sbom" \
+              "$RUNNER_TEMP/h00ligan-inventory/$platform.cdx.json"
+            python3 scripts/check-h00ligan-sbom.py \
+              --sbom "$RUNNER_TEMP/h00ligan-inventory/$platform.cdx.json" \
+              --target "$target" \
+              --manifest "$inventory_manifest"
+            cargo about generate --locked --fail --no-default-features \
+              --target "$target" \
+              --manifest-path "$inventory_manifest" \
+              --config release/about.toml \
+              --output-file "$RUNNER_TEMP/h00ligan-inventory/$platform-THIRD-PARTY-LICENSES.html" \
+              release/about.hbs
+          done <<'TARGETS'
+          linux-amd64 x86_64-unknown-linux-musl
+          linux-arm64 aarch64-unknown-linux-musl
+          macos-amd64 x86_64-apple-darwin
+          macos-arm64 aarch64-apple-darwin
+          TARGETS
+          for platform in linux-amd64 linux-arm64; do
+            notices="$RUNNER_TEMP/h00ligan-inventory/$platform-THIRD-PARTY-LICENSES.html"
+            grep -F 'inotify ' "$notices"
+            if grep -Fq 'fsevent-sys ' "$notices"; then
+              echo "$platform notices contain a macOS-only dependency" >&2
+              exit 1
+            fi
+          done
+          for platform in macos-amd64 macos-arm64; do
+            notices="$RUNNER_TEMP/h00ligan-inventory/$platform-THIRD-PARTY-LICENSES.html"
+            grep -F 'fsevent-sys ' "$notices"
+            grep -F 'core-foundation-sys ' "$notices"
+            if grep -Fq 'inotify ' "$notices"; then
+              echo "$platform notices contain a Linux-only dependency" >&2
+              exit 1
+            fi
+          done
+
+      - name: Create deterministic archives and checksums
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export SOURCE_DATE_EPOCH
+          output="$RUNNER_TEMP/h00ligan-dist"
+          while read -r platform target; do
+            scripts/package-h00ligan-release.sh \
+              "$VERSION" "$platform" "$target" \
+              "$RUNNER_TEMP/h00ligan-raw/h00ligan-$platform" \
+              "$RUNNER_TEMP/h00ligan-raw/identity-$platform.txt" \
+              "$RUNNER_TEMP/h00ligan-inventory/$platform.cdx.json" \
+              "$RUNNER_TEMP/h00ligan-inventory/$platform-THIRD-PARTY-LICENSES.html" \
+              "$output"
+          done <<'TARGETS'
+          linux-amd64 x86_64-unknown-linux-musl
+          linux-arm64 aarch64-unknown-linux-musl
+          macos-amd64 x86_64-apple-darwin
+          macos-arm64 aarch64-apple-darwin
+          TARGETS
+          (
+            cd "$output"
+            archives=(./*.tar.gz)
+            [[ "${#archives[@]}" -eq 4 ]]
+            sha256sum "${archives[@]}" > SHA256SUMS
+          )
+          (cd "$output" && sha256sum --check SHA256SUMS)
+          for archive in "$output"/*.tar.gz; do
+            tar -tzf "$archive"
+          done
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1 (checked 2026-08-16)
+        with:
+          name: h00ligan-bundles-${{ needs.prepare.outputs.version }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/h00ligan-dist/*.tar.gz
+            ${{ runner.temp }}/h00ligan-dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Complete the draft GitHub Release
+    if: inputs.publish
+    needs: [prepare, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1 (checked 2026-08-16)
+        with:
+          name: h00ligan-bundles-${{ needs.prepare.outputs.version }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/h00ligan-release-assets
+
+      - name: Upload complete assets, then publish the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" == true ]]
+          tag_sha="$(gh api "repos/$GH_REPO/commits/$TAG" --jq .sha)"
+          [[ "$tag_sha" == "$SOURCE_SHA" ]]
+          gh release upload "$TAG" "$RUNNER_TEMP"/h00ligan-release-assets/* --clobber
+          gh release edit "$TAG" --draft=false

@@ -1,0 +1,34 @@
+[package]
+name = "h00ligan-ra-provider"
+version = "0.1.0"
+publish = false
+edition = "2024"
+rust-version = "1.97.1"
+license = "LicenseRef-BSL-1.1"
+
+[lib]
+name = "h00ligan_ra_provider"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[dependencies]
+# Exact current stable releases verified against crates.io on 2026-08-24.
+anyhow = "=1.0.104"
+h00ligan-provider-protocol = { path = "../source/crates/h00ligan-provider-protocol" }
+hir = { path = "@H00_RA_SOURCE_PATH@/crates/hir" }
+ide = { path = "@H00_RA_SOURCE_PATH@/crates/ide" }
+libc = "=0.2.189"
+load-cargo = { path = "@H00_RA_SOURCE_PATH@/crates/load-cargo" }
+# rust-analyzer 1.97.1 passes this concrete public type directly. Its API is
+# lsp-types 0.95.0, not the current 0.97.0; advance both together.
+lsp-types = { version = "=0.95.0", features = ["proposed"] }
+num_cpus = "=1.17.0"
+project-model = { path = "@H00_RA_SOURCE_PATH@/crates/project-model" }
+protobuf = "=3.7.2"
+rust-analyzer = { path = "@H00_RA_SOURCE_PATH@/crates/rust-analyzer" }
+serde_json = { version = "=1.0.151", features = ["preserve_order"] }
+# sha2 0.11.0 is current, but its digest output no longer implements LowerHex;
+# the pinned provider hashes with `format!("{:x}", finalize())`. Retain the
+# latest compatible 0.10 release until that provider API is deliberately moved.
+sha2 = "=0.10.9"
+vfs = { path = "@H00_RA_SOURCE_PATH@/crates/vfs" }

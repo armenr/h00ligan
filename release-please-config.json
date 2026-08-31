@@ -1,0 +1,48 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/v17.11.1/schemas/config.json",
+  "release-type": "rust",
+  "bump-minor-pre-major": true,
+  "bump-patch-for-minor-pre-major": false,
+  "draft-pull-request": false,
+  "changelog-sections": [
+    { "type": "feat", "section": "Features" },
+    { "type": "fix", "section": "Bug Fixes" },
+    { "type": "perf", "section": "Performance" },
+    { "type": "revert", "section": "Reverts" },
+    { "type": "docs", "section": "Documentation" },
+    { "type": "refactor", "section": "Code Refactoring" },
+    { "type": "build", "section": "Build System" },
+    { "type": "ci", "section": "Continuous Integration" },
+    { "type": "test", "section": "Tests", "hidden": true },
+    { "type": "style", "section": "Styles", "hidden": true },
+    { "type": "chore", "section": "Miscellaneous Chores", "hidden": true }
+  ],
+  "packages": {
+    "crates/h00ligan": {
+      "component": "h00ligan",
+      "package-name": "h00ligan",
+      "changelog-path": "CHANGELOG.md",
+      "include-component-in-tag": true,
+      "include-v-in-tag": true,
+      "force-tag-creation": true,
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "/Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value == 'h00ligan')].version"
+        },
+        {
+          "type": "toml",
+          "path": "/providers/rust-analyzer/h00ligan-product.Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value == 'h00ligan')].version"
+        },
+        {
+          "type": "toml",
+          "path": "/providers/rust-analyzer/h00ligan-product.Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value == 'h00ligan-product')].version"
+        }
+      ],
+      "draft": true
+    }
+  }
+}

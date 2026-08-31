@@ -1,0 +1,68 @@
+name: Release h00ligan
+
+on:
+  workflow_run:
+    workflows: [Portable CI]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-h00ligan-main
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Propose or create the component release
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release-created: ${{ steps.release.outputs['crates/h00ligan--release_created'] }}
+      sha: ${{ steps.release.outputs['crates/h00ligan--sha'] }}
+      version: ${{ steps.release.outputs['crates/h00ligan--version'] }}
+      tag: ${{ steps.release.outputs['crates/h00ligan--tag_name'] }}
+    steps:
+      - name: Refuse to spend a stale green result
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          current_sha="$(gh api "repos/$GH_REPO/commits/main" --jq .sha)"
+          if [[ "$current_sha" == "$VERIFIED_SHA" ]]; then
+            echo 'current=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'current=false' >> "$GITHUB_OUTPUT"
+            echo "main advanced beyond verified $VERIFIED_SHA; a newer CI run owns release admission"
+          fi
+
+      - name: Maintain the Release Please PR or create its draft release
+        if: steps.gate.outputs.current == 'true'
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0 (checked 2026-08-16)
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          target-branch: main
+
+  distribution:
+    name: Build and publish release assets
+    needs: release-please
+    if: needs.release-please.outputs.release-created == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/h00ligan-dist.yml
+    with:
+      ref: ${{ needs.release-please.outputs.sha }}
+      version: ${{ needs.release-please.outputs.version }}
+      tag: ${{ needs.release-please.outputs.tag }}
+      publish: true

@@ -1,0 +1,17 @@
+[package]
+name = "h00ligan-provider-protocol"
+version = "0.1.0"
+license = "LicenseRef-BSL-1.1"
+description = "Bounded wire contract shared by h00ligan and its semantic providers"
+publish = false
+edition = "2024"
+rust-version = "1.97.1"
+
+[dependencies]
+# Exact current workspace releases, verified from crates.io on 2026-08-21.
+# Explicit pins keep this crate portable when compiled inside a provider's
+# upstream workspace rather than only as a h00ligan workspace member.
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.151", features = ["preserve_order"] }
+sha2 = "=0.11.0"
+thiserror = "=2.0.20"

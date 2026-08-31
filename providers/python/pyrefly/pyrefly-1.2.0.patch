@@ -1,0 +1,625 @@
+diff --git a/crates/pyrefly_config/src/args.rs b/crates/pyrefly_config/src/args.rs
+index 5d98197..766087f 100644
+--- a/crates/pyrefly_config/src/args.rs
++++ b/crates/pyrefly_config/src/args.rs
+@@ -365,6 +365,14 @@ pub struct ConfigOverrideArgs {
+ }
+ 
+ impl ConfigOverrideArgs {
++    /// Construct overrides that prohibit ambient interpreter discovery while
++    /// preserving repository configuration for explicit search paths.
++    pub fn without_interpreter_query() -> Self {
++        let mut overrides = Self::default();
++        overrides.environment.skip_interpreter_query = true;
++        overrides
++    }
++
+     pub fn validate(&self) -> anyhow::Result<()> {
+         self.environment.validate()?;
+         let ignored_errors = &self.ignore.iter().collect::<HashSet<_>>();
+@@ -576,6 +584,20 @@ impl ConfigOverrideArgs {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn interpreter_free_overrides_disable_discovery_before_configuration() {
++        let overrides = ConfigOverrideArgs::without_interpreter_query();
++        let (config, errors) = overrides.override_config(ConfigFile::default());
++        assert!(errors.is_empty());
++        assert!(config.interpreters.skip_interpreter_query);
++        assert!(
++            config
++                .python_environment
++                .interpreter_site_package_path
++                .is_empty()
++        );
++    }
++
+     #[test]
+     fn repeated_python_platform_flags_merge() {
+         let args = ConfigOverrideArgs::parse_from([
+diff --git a/crates/pyrefly_config/src/finder.rs b/crates/pyrefly_config/src/finder.rs
+index 2e7fc0b..2dba67d 100644
+--- a/crates/pyrefly_config/src/finder.rs
++++ b/crates/pyrefly_config/src/finder.rs
+@@ -8,7 +8,7 @@
+ use std::ffi::OsString;
+ use std::iter;
+ use std::mem;
+-use std::path::Path;
++use std::path::{Path, PathBuf};
+ use std::sync::Arc;
+ 
+ use dupe::Dupe;
+@@ -155,12 +155,24 @@ impl ConfigFinder {
+         load: LoadCallback,
+         fallback: FallbackCallback,
+         clear_extra_caches: Box<dyn Fn() + Send + Sync>,
++    ) -> Self {
++        Self::new_custom_with_search_ceiling(before, load, fallback, clear_extra_caches, None)
++    }
++
++    /// Create a custom finder whose on-disk upward search is bounded by an
++    /// inclusive repository-owned ceiling.
++    pub fn new_custom_with_search_ceiling(
++        before: BeforeCallback,
++        load: LoadCallback,
++        fallback: FallbackCallback,
++        clear_extra_caches: Box<dyn Fn() + Send + Sync>,
++        search_ceiling: Option<PathBuf>,
+     ) -> Self {
+         let errors = Arc::new(Mutex::new(Vec::new()));
+         let errors2 = errors.dupe();
+ 
+         Self {
+-            search: UpwardSearch::new_grouped(
++            search: UpwardSearch::new_grouped_bounded(
+                 vec![
+                     // Group 1: Prefer config files with actual Pyrefly configuration.
+                     // For `pyproject.toml`, this requires a `[tool.pyrefly]` section
+@@ -205,6 +217,7 @@ impl ConfigFinder {
+                     errors2.lock().extend(errors);
+                     v
+                 },
++                search_ceiling,
+             ),
+             errors,
+             before,
+diff --git a/crates/pyrefly_util/src/upward_search.rs b/crates/pyrefly_util/src/upward_search.rs
+index f19932d..ea22693 100644
+--- a/crates/pyrefly_util/src/upward_search.rs
++++ b/crates/pyrefly_util/src/upward_search.rs
+@@ -69,6 +69,8 @@ pub struct UpwardSearch<T> {
+     state: RwLock<SmallMap<PathBuf, (Option<T>, Arc<PathBuf>)>>,
+     /// Given a config file that exists on disk, load it.
+     load: Box<dyn Fn(&Path) -> T + Send + Sync>,
++    /// Optional inclusive ceiling for repository-owned searches.
++    search_ceiling: Option<PathBuf>,
+ }
+ 
+ impl<T: Dupe + Debug> UpwardSearch<T> {
+@@ -94,11 +96,22 @@ impl<T: Dupe + Debug> UpwardSearch<T> {
+     pub fn new_grouped(
+         filegroups: Vec<FileGroup<T>>,
+         load: impl Fn(&Path) -> T + Send + Sync + 'static,
++    ) -> Self {
++        Self::new_grouped_bounded(filegroups, load, None)
++    }
++
++    /// Create a cached searcher which never inspects ancestors above the
++    /// inclusive `search_ceiling`.
++    pub fn new_grouped_bounded(
++        filegroups: Vec<FileGroup<T>>,
++        load: impl Fn(&Path) -> T + Send + Sync + 'static,
++        search_ceiling: Option<PathBuf>,
+     ) -> Self {
+         Self {
+             filegroups,
+             state: Default::default(),
+             load: Box::new(load),
++            search_ceiling,
+         }
+     }
+ 
+@@ -120,11 +133,26 @@ impl<T: Dupe + Debug> UpwardSearch<T> {
+         // 3. Fill in all the results (write lock).
+         const FULL_PATH: usize = 100; // If we want to hit everything in the path
+ 
++        if self
++            .search_ceiling
++            .as_deref()
++            .is_some_and(|ceiling| !dir.starts_with(ceiling))
++        {
++            return None;
++        }
++        let bounded_ancestors = || {
++            dir.ancestors().take_while(|path| {
++                self.search_ceiling
++                    .as_deref()
++                    .is_none_or(|ceiling| path.starts_with(ceiling))
++            })
++        };
++
+         let mut cache_answer = None; // The (index, result, path) further up
+         let mut found_answer = None;
+ 
+         let lock = self.state.read();
+-        for (i, x) in dir.ancestors().enumerate() {
++        for (i, x) in bounded_ancestors().enumerate() {
+             if let Some((res, path)) = lock.get(x) {
+                 if i == 0 {
+                     // We found a perfect hit
+@@ -139,24 +167,19 @@ impl<T: Dupe + Debug> UpwardSearch<T> {
+ 
+         // We didn't find a perfect hit, so now search the actual path
+         'outer: for filegroup in &self.filegroups {
+-            let mut buffer = dir.to_owned();
+-            for i in 0..cache_answer.as_ref().map_or(FULL_PATH, |x| x.0) {
++            for (i, ancestor) in bounded_ancestors()
++                .take(cache_answer.as_ref().map_or(FULL_PATH, |x| x.0))
++                .enumerate()
++            {
+                 for stem in &filegroup.filenames {
+-                    let stem_length = PathBuf::from(stem).components().count();
+-                    buffer.push(stem);
+-                    if buffer.exists() {
+-                        let c = (self.load)(&buffer);
++                    let candidate = ancestor.join(stem);
++                    if candidate.exists() {
++                        let c = (self.load)(&candidate);
+                         if (filegroup.predicate)(&c) {
+-                            found_answer = Some((i + 1, Some(c), Arc::new(buffer)));
++                            found_answer = Some((i + 1, Some(c), Arc::new(candidate)));
+                             break 'outer;
+                         }
+                     }
+-                    for _ in 0..stem_length {
+-                        buffer.pop();
+-                    }
+-                }
+-                if !buffer.pop() {
+-                    break;
+                 }
+             }
+             if let Some((i, Some(c), cache_path)) = &cache_answer
+@@ -168,12 +191,20 @@ impl<T: Dupe + Debug> UpwardSearch<T> {
+             }
+         }
+ 
+-        let (applicable, result, path) = found_answer
+-            .or(cache_answer)
+-            .unwrap_or_else(|| (FULL_PATH, None, Arc::new(PathBuf::from("/"))));
++        let (applicable, result, path) = found_answer.or(cache_answer).unwrap_or_else(|| {
++            (
++                FULL_PATH,
++                None,
++                Arc::new(
++                    self.search_ceiling
++                        .clone()
++                        .unwrap_or_else(|| PathBuf::from("/")),
++                ),
++            )
++        });
+ 
+         let mut lock = self.state.write();
+-        for (i, x) in dir.ancestors().take(applicable).enumerate() {
++        for (i, x) in bounded_ancestors().take(applicable).enumerate() {
+             match lock.entry(x.to_owned()) {
+                 Entry::Occupied(e) => {
+                     if i == 0 {
+@@ -263,6 +294,42 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn bounded_search_never_reads_above_its_inclusive_ceiling() {
++        let root = TempDir::new().unwrap();
++        let repository = root.path().join("repository");
++        let nested = repository.join("src/package");
++        fs::create_dir_all(&nested).unwrap();
++        fs::write(root.path().join("pyrefly.toml"), "outside").unwrap();
++
++        let loaded = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
++        let loaded_for_search = loaded.dupe();
++        let search = UpwardSearch::new_grouped_bounded(
++            vec![FileGroup::new_simple(vec![OsString::from("pyrefly.toml")])],
++            move |path| {
++                loaded_for_search.lock().push(path.to_path_buf());
++                Arc::new(path.to_path_buf())
++            },
++            Some(repository.clone()),
++        );
++
++        assert!(search.directory_absolute(&nested).is_none());
++        assert!(
++            loaded.lock().is_empty(),
++            "the outside marker was never read"
++        );
++
++        let inside = repository.join("pyrefly.toml");
++        fs::write(&inside, "inside").unwrap();
++        search.clear();
++        assert_eq!(
++            search.directory_absolute(&nested).as_deref(),
++            Some(&inside),
++            "positive control: a marker at the ceiling remains discoverable"
++        );
++        assert_eq!(loaded.lock().as_slice(), &[inside]);
++    }
++
+     #[test]
+     fn test_multi_component_path() {
+         let root = TempDir::new().unwrap();
+diff --git a/pyrefly/Cargo.toml b/pyrefly/Cargo.toml
+index 92d9d8d..0d74925 100644
+--- a/pyrefly/Cargo.toml
++++ b/pyrefly/Cargo.toml
+@@ -15,6 +15,7 @@ path = "lib/lib.rs"
+ [[bin]]
+ name = "pyrefly"
+ path = "bin/main.rs"
++required-features = ["pyrefly-bin"]
+ 
+ [[test]]
+ name = "pyrefly_laziness_tests"
+@@ -32,7 +33,7 @@ harness = false
+ anstream = "0.6.11"
+ anyhow = "1.0.103"
+ arc-swap = { version = "1.9.2", features = ["weak"] }
+-blake3 = { version = "=1.8.2", features = ["mmap", "rayon", "traits-preview"] }
++blake3 = { version = "=1.8.7", features = ["mmap", "rayon", "traits-preview"] }
+ capnp = "0.25.6"
+ clap = { version = "4.6.2", features = ["cargo", "derive", "env", "string", "unicode", "wrap_help"] }
+ crossbeam-channel = "0.5.16"
+@@ -91,7 +92,7 @@ pyrefly_lsp_test = { path = "../crates/pyrefly_lsp_test" }
+ 
+ [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+ backtrace-on-stack-overflow = { version = "0.3", optional = true }
+-tikv-jemallocator = "0.6.0"
++tikv-jemallocator = { version = "0.6.0", optional = true }
+ 
+ [target.'cfg(target_os = "windows")'.dependencies]
+ mimalloc = { version = "0.1.46", default-features = false }
+@@ -99,6 +100,7 @@ mimalloc = { version = "0.1.46", default-features = false }
+ [features]
+ debug-stack-overflow = ["dep:backtrace-on-stack-overflow"]
+ default = []
++pyrefly-bin = ["dep:tikv-jemallocator"]
+ 
+ [lints.rust]
+ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fbcode_build)"]}
+diff --git a/pyrefly/lib/commands/config_finder.rs b/pyrefly/lib/commands/config_finder.rs
+index 0698b92..e30cd26 100644
+--- a/pyrefly/lib/commands/config_finder.rs
++++ b/pyrefly/lib/commands/config_finder.rs
+@@ -177,12 +177,29 @@ pub fn default_config_finder_with_overrides(
+     ignore_errors: bool,
+     wrapper: Option<ConfigConfigurerWrapper>,
+ ) -> ConfigFinder {
+-    standard_config_finder(
++    standard_config_finder_with_search_ceiling(
+         Arc::new(DefaultConfigConfigurerWithOverrides::new(
+             args,
+             ignore_errors,
+         )),
+         wrapper,
++        None,
++    )
++}
++
++pub fn default_config_finder_with_overrides_bounded(
++    args: ConfigOverrideArgs,
++    ignore_errors: bool,
++    wrapper: Option<ConfigConfigurerWrapper>,
++    search_ceiling: PathBuf,
++) -> ConfigFinder {
++    standard_config_finder_with_search_ceiling(
++        Arc::new(DefaultConfigConfigurerWithOverrides::new(
++            args,
++            ignore_errors,
++        )),
++        wrapper,
++        Some(search_ceiling),
+     )
+ }
+ 
+@@ -194,6 +211,14 @@ pub fn default_config_finder_with_overrides(
+ pub fn standard_config_finder(
+     configure: Arc<dyn ConfigConfigurer>,
+     wrapper: Option<ConfigConfigurerWrapper>,
++) -> ConfigFinder {
++    standard_config_finder_with_search_ceiling(configure, wrapper, None)
++}
++
++fn standard_config_finder_with_search_ceiling(
++    configure: Arc<dyn ConfigConfigurer>,
++    wrapper: Option<ConfigConfigurerWrapper>,
++    search_ceiling: Option<PathBuf>,
+ ) -> ConfigFinder {
+     let configure = match wrapper {
+         Some(wrap) => wrap(configure),
+@@ -211,8 +236,9 @@ pub fn standard_config_finder(
+         Arc::new(Mutex::new(SmallMap::new()));
+     // A cache where path `p` maps to search paths from `p` to the nearest on-disk config,
+     // marker file, or filesystem root. Used as the `fallback_search_path` in `cache_parents`.
+-    let cache_ancestors: Arc<DirectoryRelativeFallbackSearchPathCache> =
+-        Arc::new(DirectoryRelativeFallbackSearchPathCache::new(None));
++    let cache_ancestors: Arc<DirectoryRelativeFallbackSearchPathCache> = Arc::new(
++        DirectoryRelativeFallbackSearchPathCache::new(search_ceiling.clone()),
++    );
+ 
+     // Single-slot cache for the synthesized config used by parent-less
+     // paths (the rare `/`, empty memory paths, etc.). Populated lazily
+@@ -249,7 +275,7 @@ pub fn standard_config_finder(
+             .dupe()
+     };
+ 
+-    ConfigFinder::new_custom(
++    ConfigFinder::new_custom_with_search_ceiling(
+         Box::new(move |_, path| {
+             Ok(GENERATED_FILE_CONFIG_OVERRIDE
+                 .read()
+@@ -333,6 +359,7 @@ pub fn standard_config_finder(
+             }
+         }),
+         clear_extra_caches,
++        search_ceiling,
+     )
+ }
+ 
+diff --git a/pyrefly/lib/lib.rs b/pyrefly/lib/lib.rs
+index 7d57335..8df9aa2 100644
+--- a/pyrefly/lib/lib.rs
++++ b/pyrefly/lib/lib.rs
+@@ -33,6 +33,8 @@ mod compat;
+ mod error;
+ mod export;
+ #[doc(hidden)]
++pub mod h00_semantic;
++#[doc(hidden)]
+ pub mod lsp;
+ #[doc(hidden)]
+ pub mod module;
+diff --git a/pyrefly/lib/report/glean/convert.rs b/pyrefly/lib/report/glean/convert.rs
+index d58bdda..707ab56 100644
+--- a/pyrefly/lib/report/glean/convert.rs
++++ b/pyrefly/lib/report/glean/convert.rs
+@@ -203,6 +203,7 @@ pub(crate) enum ScopeType {
+ struct DeclarationInfo {
+     declaration: python::Declaration,
+     decl_span: src::ByteSpan,
++    h00_name_span: Option<src::ByteSpan>,
+     definition: Option<python::Definition>,
+     def_span: Option<src::ByteSpan>,
+     top_level_decl: python::Declaration,
+@@ -224,6 +225,54 @@ struct Facts {
+     xrefs: Vec<python_xrefs::XRef>,
+     declaration_docstrings: Vec<python::DeclarationDocstring>,
+     name_to_sname: Vec<python::NameToSName>,
++    h00_declarations: Vec<H00DeclarationFact>,
++}
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct H00ByteSpan {
++    pub start: u64,
++    pub length: u64,
++}
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub enum H00DeclarationKind {
++    Class,
++    Function,
++    Method,
++    Constructor,
++    Variable,
++}
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct H00DeclarationFact {
++    pub name: String,
++    pub kind: H00DeclarationKind,
++    pub name_span: H00ByteSpan,
++    pub extent_span: H00ByteSpan,
++    pub bases: Vec<String>,
++}
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct H00ReferenceFact {
++    pub target_name: String,
++    pub target_file: Option<String>,
++    pub source_span: H00ByteSpan,
++}
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct H00SemanticFacts {
++    pub file: String,
++    pub declarations: Vec<H00DeclarationFact>,
++    pub references: Vec<H00ReferenceFact>,
++}
++
++impl From<&src::ByteSpan> for H00ByteSpan {
++    fn from(span: &src::ByteSpan) -> Self {
++        Self {
++            start: span.start,
++            length: span.length,
++        }
++    }
+ }
+ 
+ #[derive(Clone)]
+@@ -276,6 +325,7 @@ impl Facts {
+             xrefs_via_name_by_target: HashMap::new(),
+             declaration_docstrings: vec![],
+             name_to_sname: vec![],
++            h00_declarations: vec![],
+         }
+     }
+ }
+@@ -391,6 +441,7 @@ impl GleanState<'_> {
+         let mod_decl_info = DeclarationInfo {
+             declaration: python::Declaration::module(self.module_fact()),
+             decl_span: to_span(range),
++            h00_name_span: None,
+             definition: Some(python::Definition::module(python::ModuleDefinition::new(
+                 self.module_fact(),
+             ))),
+@@ -418,6 +469,65 @@ impl GleanState<'_> {
+     }
+ 
+     fn declaration_facts(&mut self, decl_info: DeclarationInfo) {
++        if let Some(name_span) = &decl_info.h00_name_span {
++            let extent_span = decl_info.def_span.as_ref().unwrap_or(&decl_info.decl_span);
++            let fact = match (&decl_info.declaration, decl_info.definition.as_ref()) {
++                (
++                    python::Declaration::cls(declaration),
++                    Some(python::Definition::cls(definition)),
++                ) => Some(H00DeclarationFact {
++                    name: (*declaration.key.name.key).clone(),
++                    kind: H00DeclarationKind::Class,
++                    name_span: name_span.into(),
++                    extent_span: extent_span.into(),
++                    bases: definition
++                        .key
++                        .bases
++                        .as_ref()
++                        .into_iter()
++                        .flatten()
++                        .map(|base| (*base.key.name.key).clone())
++                        .collect(),
++                }),
++                (
++                    python::Declaration::func(declaration),
++                    Some(python::Definition::func(definition)),
++                ) => {
++                    let name = (*declaration.key.name.key).clone();
++                    let kind = if name.rsplit('.').next() == Some("__init__") {
++                        H00DeclarationKind::Constructor
++                    } else if matches!(
++                        &definition.key.container,
++                        Some(python::DeclarationContainer::cls(_))
++                    ) {
++                        H00DeclarationKind::Method
++                    } else {
++                        H00DeclarationKind::Function
++                    };
++                    Some(H00DeclarationFact {
++                        name,
++                        kind,
++                        name_span: name_span.into(),
++                        extent_span: extent_span.into(),
++                        bases: Vec::new(),
++                    })
++                }
++                (
++                    python::Declaration::variable(declaration),
++                    Some(python::Definition::variable(_)),
++                ) => Some(H00DeclarationFact {
++                    name: (*declaration.key.name.key).clone(),
++                    kind: H00DeclarationKind::Variable,
++                    name_span: name_span.into(),
++                    extent_span: extent_span.into(),
++                    bases: Vec::new(),
++                }),
++                _ => None,
++            };
++            if let Some(fact) = fact {
++                self.facts.h00_declarations.push(fact);
++            }
++        }
+         self.facts.containing_top_level_declarations.push(
+             python::ContainingTopLevelDeclaration::new(
+                 decl_info.declaration.clone(),
+@@ -876,6 +986,7 @@ impl GleanState<'_> {
+         DeclarationInfo {
+             declaration: python::Declaration::cls(cls_declaration),
+             decl_span: to_span(range_without_decorators(cls.range, &cls.decorator_list)),
++            h00_name_span: Some(to_span(cls.name.range)),
+             definition: Some(python::Definition::cls(cls_definition)),
+             def_span: Some(to_span(cls.range)),
+             top_level_decl: (*context.top_level_decl).clone(),
+@@ -1034,6 +1145,7 @@ impl GleanState<'_> {
+         &self,
+         name: python::Name,
+         range: TextRange,
++        name_range: TextRange,
+         type_info: Option<python::TypeInfo>,
+         docstring_range: Option<TextRange>,
+         ctx: &NodeContext,
+@@ -1048,6 +1160,7 @@ impl GleanState<'_> {
+         DeclarationInfo {
+             declaration: python::Declaration::variable(variable_declaration),
+             decl_span: to_span(range),
++            h00_name_span: Some(to_span(name_range)),
+             definition: Some(python::Definition::variable(variable_definition)),
+             def_span: Some(to_span(range)),
+             top_level_decl: (*ctx.top_level_decl).clone(),
+@@ -1070,6 +1183,7 @@ impl GleanState<'_> {
+         decl_infos.push(self.variable_info(
+             fqname,
+             param.name.range(),
++            param.name.range(),
+             type_info.clone(),
+             None,
+             context,
+@@ -1157,6 +1271,7 @@ impl GleanState<'_> {
+         decl_infos.push(DeclarationInfo {
+             declaration: python::Declaration::func(func_declaration),
+             decl_span: to_span(range_without_decorators(func.range, &func.decorator_list)),
++            h00_name_span: Some(to_span(func.name.range)),
+             definition: Some(python::Definition::func(func_definition)),
+             def_span: Some(to_span(func.range)),
+             top_level_decl: (*parent_ctx.top_level_decl).clone(),
+@@ -1192,6 +1307,7 @@ impl GleanState<'_> {
+             def_infos.push(self.variable_info(
+                 fqname,
+                 info.range,
++                name_id.range(),
+                 info.type_info.clone(),
+                 docstring_range,
+                 ctx,
+@@ -1263,6 +1379,7 @@ impl GleanState<'_> {
+         DeclarationInfo {
+             declaration: python::Declaration::imp(import_fact),
+             decl_span: to_span(from_name.range),
++            h00_name_span: None,
+             definition: None,
+             def_span: None,
+             top_level_decl: top_level_declaration.clone(),
+@@ -1677,6 +1794,7 @@ impl GleanState<'_> {
+                             decl_infos.push(self.variable_info(
+                                 fq_name,
+                                 name.range(),
++                                name.range(),
+                                 None,
+                                 None,
+                                 context,
+@@ -1695,6 +1813,29 @@ impl GleanState<'_> {
+     }
+ }
+ 
++pub fn h00_semantic_facts(transaction: &Transaction, handle: &Handle) -> H00SemanticFacts {
++    let ast = &*transaction.get_ast(handle).unwrap();
++    let mut glean_state = GleanState::new(transaction, handle);
++    glean_state.record_name("".to_owned());
++    glean_state.generate_facts(&ast.body, ast.range());
++
++    let facts = glean_state.facts;
++    let references = facts
++        .xrefs
++        .into_iter()
++        .map(|xref| H00ReferenceFact {
++            target_name: *xref.target.name.key,
++            target_file: xref.target.file.map(|file| *file.key),
++            source_span: (&xref.source).into(),
++        })
++        .collect();
++    H00SemanticFacts {
++        file: *facts.file.key,
++        declarations: facts.h00_declarations,
++        references,
++    }
++}
++
+ pub fn glean(transaction: &Transaction, handle: &Handle) -> Glean {
+     let ast = &*transaction.get_ast(handle).unwrap();
+     let mut glean_state = GleanState::new(transaction, handle);

@@ -1,0 +1,39 @@
+[package]
+name = "h00ligan"
+version = "0.2.0"
+license = "MIT OR Apache-2.0"
+description = "Portable compiler-backed code intelligence for humans and agents"
+readme = "README.md"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "h00ligan"
+path = "src/bin/h00ligan.rs"
+
+[dependencies]
+h00ligan-interface = { path = "../h00ligan-interface", default-features = false, features = ["code-intel", "mcp"] }
+h00ligan-engine = { path = "../h00ligan-engine", default-features = false, features = ["code-intel"] }
+h00ligan-provider-protocol = { path = "../h00ligan-provider-protocol" }
+clap = { workspace = true, features = ["derive"] }
+tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+redb = { workspace = true }
+toml = { workspace = true }
+libc = { workspace = true }
+regex = { workspace = true }
+globset = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

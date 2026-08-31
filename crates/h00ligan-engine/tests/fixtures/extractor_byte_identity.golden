@@ -1,0 +1,54 @@
+NODE	Config	types.rs	struct	pub	Unclassified	Some(34)	Some(37)	Some(false)	Some(false)	false	EntryRetainFlags(0)	false	false	8d58605c9eed232d7aad1fadd4ddfec1ab5255cfd12a87684bb6c565f9cafe20	pub struct Config
+NODE	Config::value	types.rs	field	pub	Unclassified	Some(36)	Some(36)	Some(false)	Some(false)	false	EntryRetainFlags(0)	false	false	3480dc9d65690117c2c8e0b1f6c34c8f2dbe59109758bb575825d6fd4e1622f6	u32
+NODE	Drawable	types.rs	trait	pub	Unclassified	Some(16)	Some(21)	Some(false)	Some(false)	false	EntryRetainFlags(0)	false	false	4b6c97085d94250054c7e335a3eab5b32d25a7c7f01238bc781653522a4fc391	pub trait Drawable: std::fmt::Debug
+NODE	Drawable::area	types.rs	function	private	Unclassified	Some(18)	Some(20)	Some(true)	Some(false)	false	EntryRetainFlags(0)	false	false	dfd31783096acfe41aa86f8b264a2445250d16001ff91e68b0518d9af0bf54bc	fn area(&self) -> f64
+NODE	Drawable::draw	types.rs	function	private	Unclassified	Some(17)	Some(17)	Some(false)	Some(false)	false	EntryRetainFlags(0)	false	false	73f5f788d015ed56cef551c7846879ba04dff1d5598787d0cfbc1b802717f6f6	fn draw(&self);
+NODE	GREETING	lib.rs	static	private	Unclassified	Some(15)	Some(15)	Some(false)	Some(false)	false	EntryRetainFlags(0)	true	true	88f8c3c0bbfac9ee23fc02044de7992dd0fc3fe3e1ed8ce4f12734bcbd8e8478	static GREETING: &str = "hello";
+NODE	MAX_ITEMS	lib.rs	const	pub	Unclassified	Some(14)	Some(14)	Some(false)	Some(false)	false	EntryRetainFlags(0)	true	true	47a7905a8bf2021581d1a0d5ba0a7d6c19cf52a605df1cc7c3bfc4f1bf4d21a4	pub const MAX_ITEMS: usize = 10;
+NODE	Point	types.rs	struct	pub	Unclassified	Some(3)	Some(6)	Some(false)	Some(false)	false	EntryRetainFlags(0)	false	false	e8804be33d91ad1c3f68ec886347c2334af2df30499683733d08e3c5935c2d2f	pub struct Point
+NODE	Point::x	types.rs	field	pub	Unclassified	Some(4)	Some(4)	Some(false)	Some(false)	false	EntryRetainFlags(0)	false	false	f0606c63dbb2d554a4d9c2c9be4ed45451db7a361c31f50ef3f5cc77145d85b4	f64
+NODE	Point::y	types.rs	field	private	Unclassified	Some(5)	Some(5)	Some(false)	Some(false)	false	EntryRetainFlags(0)	false	false	7d26f6357e773f80f2dfdacf3f0ae78054f5355c9aec5066bf44fa840a121004	f64
+NODE	Shape	types.rs	enum	pub	Unclassified	Some(10)	Some(14)	Some(false)	Some(false)	false	EntryRetainFlags(0)	false	false	6315175be3b4be864eb0cafd94795f8bf3a71daf8114809b792fecf1a2daccd2	pub enum Shape
+NODE	Shape::Circle::0	types.rs	field	pub	Unclassified	Some(11)	Some(11)	Some(false)	Some(false)	false	EntryRetainFlags(0)	false	false	f0c7308d5e0de00ea3c6443422c9bce4e85870b865e057fdbec01a7a0bd7e374	f64
+NODE	Shape::Rect::h	types.rs	field	private	Unclassified	Some(12)	Some(12)	Some(false)	Some(false)	false	EntryRetainFlags(0)	false	false	96c9c58768bbc42420258735f4bf9c07d66003b2b0b08c3a2180e026d4dc800f	f64
+NODE	Shape::Rect::w	types.rs	field	private	Unclassified	Some(12)	Some(12)	Some(false)	Some(false)	false	EntryRetainFlags(0)	false	false	c6c206e599636223bdecceaaafca0587446128a20a23853d7388d76c298d13b1	f64
+NODE	StringMap	lib.rs	type_alias	pub	Unclassified	Some(16)	Some(16)	Some(false)	Some(false)	false	EntryRetainFlags(0)	true	true	6a4db14d9e0729e18955c9da25c146b2ca3d89f8b10584e4607409fe0a5983e4	pub type StringMap = HashMap<String, u32>;
+NODE	Wrapper	types.rs	struct	pub	Unclassified	Some(8)	Some(8)	Some(false)	Some(false)	false	EntryRetainFlags(0)	false	false	9fef8fcd34955fc397119ef538f76e3d1624c7d210fbafd494b5c62adacd477f	pub struct Wrapper(pub Point);
+NODE	Wrapper::0	types.rs	field	pub	Unclassified	Some(8)	Some(8)	Some(false)	Some(false)	false	EntryRetainFlags(0)	false	false	499a630cbb46d415786777cfa647ee1e281055edaa8835b56ef63f8b63aa64bd	Point
+NODE	exported_symbol	lib.rs	function	pub	Unclassified	Some(26)	Some(26)	Some(true)	Some(false)	false	EntryRetainFlags(1)	true	true	1e586068d6fd4be582aec80a9793a9140be416313bd74af08f86501f9a7a1c47	pub extern "C" fn exported_symbol()
+NODE	impl Drawable for Point	types.rs	impl	private	Unclassified	Some(29)	Some(31)	Some(false)	Some(false)	false	EntryRetainFlags(0)	false	false	50ef6562249eac86af5b4d3116832fd21dbc03d4ff68878ff5dd771b0b4d3db8	impl Drawable for Point
+NODE	impl Drawable for Point::draw	types.rs	function	private	Unclassified	Some(30)	Some(30)	Some(true)	Some(false)	false	EntryRetainFlags(0)	false	false	39d2378500c155507734966c018ce9f78d9d9107490159e44df216a7ad335d18	fn draw(&self)
+NODE	impl Point	types.rs	impl	private	Unclassified	Some(23)	Some(27)	Some(false)	Some(false)	false	EntryRetainFlags(0)	false	false	3e15c6ae9d2fc923462ca656297177f13ab2687aa6d0d47638119998b1b4a45c	impl Point
+NODE	impl Point::new	types.rs	function	pub	Unclassified	Some(24)	Some(26)	Some(true)	Some(false)	false	EntryRetainFlags(0)	false	false	9510c26c75cae55604d81ca79ab87ab6c460d08f27fc83a8fa5622283f6ce0df	pub fn new(x: f64, y: f64) -> Self
+NODE	noop	lib.rs	macro	private	Unclassified	Some(18)	Some(20)	Some(false)	Some(false)	false	EntryRetainFlags(0)	true	true	7fcd0f8bcda51532f660e0f1e1ca57d3bc9491217ccbec27279b2fd9cd638c54	macro_rules! noop
+NODE	only_on_unix	lib.rs	function	pub	Unclassified	Some(23)	Some(23)	Some(true)	Some(false)	false	EntryRetainFlags(0)	true	true	cc9edefd50f506c7a49506d5ceac6732d48aeb7480cae4ac0ed87365853a0a71	pub fn only_on_unix()
+NODE	private_fn	lib.rs	function	private	Unclassified	Some(10)	Some(12)	Some(true)	Some(false)	false	EntryRetainFlags(0)	true	true	32a8542f933b864c335626053947b53b3a1b85f92443e4420e565b1ecc751f3a	fn private_fn() -> bool
+NODE	public_fn	lib.rs	function	pub	Unclassified	Some(6)	Some(8)	Some(true)	Some(false)	false	EntryRetainFlags(0)	true	true	8986bb9735ea85db6d62022bd4934d78fc7f03a1357df3468421e6e9e3823de3	pub fn public_fn(x: i32) -> i32
+NODE	serde::Deserialize	types.rs	use	private	Unclassified	Some(0)	Some(0)	Some(false)	Some(false)	false	EntryRetainFlags(0)	false	false	2e095f3d19ca1648c37860125ac2a9f64c7544eb5775f49de1159e3213056258	use serde::Deserialize;
+NODE	std::collections::HashMap	lib.rs	use	private	Unclassified	Some(3)	Some(3)	Some(false)	Some(false)	false	EntryRetainFlags(0)	true	true	b00542b76e5cafd4c1094fbb557fa663291adc8ba034700fe0b55ba930bc752c	use std::collections::HashMap;
+NODE	tests	lib.rs	module	private	Unclassified	Some(29)	Some(34)	Some(false)	Some(true)	false	EntryRetainFlags(0)	true	true	09b328c8ad8f52de42579f80be35484f1876870003f33dfc9b191c28661d86be	mod tests
+NODE	tests::inner_test	lib.rs	function	private	Unclassified	Some(31)	Some(33)	Some(true)	Some(true)	true	EntryRetainFlags(0)	true	true	95720e4554e3e058fc09df2bcd8093b9a2e62d7b758b9c1580abc637cddc16a0	fn inner_test()
+NODE	top_level_test	lib.rs	function	private	Unclassified	Some(37)	Some(39)	Some(true)	Some(false)	true	EntryRetainFlags(0)	true	true	5fae471605d74bff9fe3c465b1a3bd7809c1079b553c36a2261ba891b371fff3	fn top_level_test()
+NODE	types	lib.rs	module	pub	Unclassified	Some(1)	Some(1)	Some(false)	Some(false)	false	EntryRetainFlags(0)	true	true	ceab9e18739da4864157319610b018e6df9a3eee67d704ba421cae810577e5f5	pub mod types;
+EDGE	Contains	Config	types.rs	Config::value	types.rs	TreeSitter	0.7	Production
+EDGE	Contains	Drawable	types.rs	Drawable::area	types.rs	TreeSitter	0.7	Production
+EDGE	Contains	Drawable	types.rs	Drawable::draw	types.rs	TreeSitter	0.7	Production
+EDGE	Contains	Point	types.rs	Point::x	types.rs	TreeSitter	0.7	Production
+EDGE	Contains	Point	types.rs	Point::y	types.rs	TreeSitter	0.7	Production
+EDGE	Contains	Point	types.rs	impl Drawable for Point	types.rs	TreeSitter	0.7	Production
+EDGE	Contains	Point	types.rs	impl Point	types.rs	TreeSitter	0.7	Production
+EDGE	Contains	Wrapper	types.rs	Wrapper::0	types.rs	TreeSitter	0.7	Production
+EDGE	Contains	impl Drawable for Point	types.rs	impl Drawable for Point::draw	types.rs	TreeSitter	0.7	Production
+EDGE	Contains	impl Point	types.rs	impl Point::new	types.rs	TreeSitter	0.7	Production
+EDGE	Contains	tests	lib.rs	tests::inner_test	lib.rs	TreeSitter	0.7	Test
+EDGE	Contains	types	lib.rs	Config	types.rs	TreeSitter	0.7	Production
+EDGE	Contains	types	lib.rs	Drawable	types.rs	TreeSitter	0.7	Production
+EDGE	Contains	types	lib.rs	Point	types.rs	TreeSitter	0.7	Production
+EDGE	Contains	types	lib.rs	Shape	types.rs	TreeSitter	0.7	Production
+EDGE	Contains	types	lib.rs	Wrapper	types.rs	TreeSitter	0.7	Production
+EDGE	Contains	types	lib.rs	impl Drawable for Point	types.rs	TreeSitter	0.7	Production
+EDGE	Contains	types	lib.rs	impl Point	types.rs	TreeSitter	0.7	Production
+EDGE	FieldOf	Wrapper	types.rs	Point	types.rs	TreeSitter	0.7	Production
+EDGE	HasImpl	Drawable	types.rs	Point	types.rs	TreeSitter	0.7	Production
+EDGE	Implements	impl Drawable for Point	types.rs	Drawable	types.rs	TreeSitter	0.7	Production
+EDGE	TypeOf	Wrapper::0	types.rs	Point	types.rs	TreeSitter	0.7	Production

@@ -1,0 +1,25 @@
+[package]
+name = "h00-pyrefly-semantic-provider"
+version = "0.1.0"
+publish = false
+edition = "2024"
+rust-version = "1.97.1"
+license = "MIT"
+
+[lib]
+name = "h00_pyrefly_semantic_provider"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "h00-pyrefly-semantic-provider"
+path = "src/main.rs"
+
+[dependencies]
+# Exact latest stable releases verified against crates.io on 2026-08-26.
+anyhow = "=1.0.104"
+h00ligan-provider-protocol = { path = "@H00_PROTOCOL_PATH@" }
+libc = "=0.2.189"
+protobuf = "=3.7.2"
+pyrefly = { path = "@H00_PYREFLY_PATH@", default-features = false }
+scip = "=0.9.0"

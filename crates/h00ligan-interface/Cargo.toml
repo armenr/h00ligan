@@ -1,0 +1,39 @@
+[package]
+name = "h00ligan-interface"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+description = "Lean MCP and tool-contract adapter for h00ligan"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+h00ligan-engine = { path = "../h00ligan-engine", default-features = false }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+regex = { workspace = true }
+grep-searcher = { workspace = true }
+grep-regex = { workspace = true }
+ignore = { workspace = true }
+globset = { workspace = true }
+parking_lot = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
+redb = { workspace = true, optional = true }
+sha2 = { workspace = true }
+blake3 = { workspace = true }
+
+[features]
+default = ["code-intel", "mcp"]
+code-intel = ["h00ligan-engine/code-intel", "dep:redb"]
+mcp = []
+
+[dev-dependencies]
+h00ligan-engine = { path = "../h00ligan-engine", default-features = false, features = ["code-intel"] }
+h00ligan-provider-protocol = { path = "../h00ligan-provider-protocol" }
+tempfile = { workspace = true }

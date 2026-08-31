@@ -1,0 +1,40 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.17.5/.schema/devbox.schema.json",
+  "packages": {
+    "rustup": "1.29.0",
+    "cargo-audit": "0.22.2",
+    "cargo-deny": {
+      "version": "0.20.2",
+      "platforms": [
+        "aarch64-darwin",
+        "aarch64-linux",
+        "x86_64-linux"
+      ]
+    },
+    "path:./nix/cargo-deny-intel-darwin#cargo-deny": {
+      "platforms": ["x86_64-darwin"]
+    },
+    "cargo-zigbuild": "0.23.0",
+    "github:NixOS/nixpkgs/b775a19875ed1f8979f9029090781599b139c4c7#go_1_27": {},
+    "zig": "0.16.0",
+    "gcc": {
+      "version": "15.3.0",
+      "platforms": ["x86_64-linux", "aarch64-linux"]
+    },
+    "github:NixOS/nixpkgs/a5cbcfe954791221bfffe2307f7d1a1bf61a871e#gcc.cc.lib": {
+      "platforms": ["x86_64-linux", "aarch64-linux"]
+    },
+    "github:scip-code/scip-go/v0.2.7#scip-go": {}
+  },
+  "env": {
+    "RUSTUP_TOOLCHAIN": "1.97.1"
+  },
+  "shell": {
+    "init_hook": [
+      "test \"$(uname -s)\" != Linux || export NIX_LDFLAGS=\"$NIX_LDFLAGS -rpath $(readlink -f \"$DEVBOX_PACKAGES_DIR/lib\")\"",
+      "echo '🦉 h00ligan development environment ready'",
+      "echo '   semantic providers: rust-analyzer (Rust 1.97.1 component) + scip-go 0.2.7 / Go 1.27.0'",
+      "echo '   dependency policy: cargo-audit 0.22.2 + cargo-deny 0.20.2'"
+    ]
+  }
+}

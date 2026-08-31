@@ -1,0 +1,81 @@
+[package]
+name = "h00ligan-engine"
+version = "0.1.0"
+license = "LicenseRef-BSL-1.1"
+description = "Code-intelligence indexing, graph publication, and query engine for h00ligan"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+h00ligan-provider-protocol = { path = "../h00ligan-provider-protocol" }
+redb = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = "0.1.19"
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde-saphyr = { workspace = true, optional = true }
+jsonc-parser = { workspace = true, optional = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+toml = { workspace = true }
+dirs = "6.0.0"
+tracing = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+bincode = { version = "2", features = ["serde"] }
+rmp-serde = "1.3.1"
+regex = { workspace = true }
+globset = { workspace = true, optional = true }
+parking_lot = { workspace = true }
+futures = "0.3"
+libc = { workspace = true }
+cap-std = { version = "=4.0.2", optional = true }
+tempfile = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tree-sitter = { version = "=0.26.13", optional = true }
+tree-sitter-rust = { version = "=0.24.2", optional = true }
+tree-sitter-go = { version = "=0.25.0", optional = true }
+tree-sitter-python = { version = "=0.25.0", optional = true }
+tree-sitter-typescript = { version = "=0.23.2", optional = true }
+blake3 = { workspace = true, optional = true }
+petgraph = { version = "0.8.3", optional = true }
+notify = { version = "8.2.0", optional = true }
+scip = { version = "0.6.1", optional = true }
+protobuf = { version = "3.7.2", optional = true }
+ignore = { workspace = true, optional = true }
+grep-searcher = { workspace = true, optional = true }
+grep-regex = { workspace = true, optional = true }
+rayon = { version = "1.12.0", optional = true }
+
+[features]
+default = ["code-intel"]
+code-intel = [
+    "dep:cap-std",
+    "dep:tree-sitter",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-go",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-typescript",
+    "dep:blake3",
+    "dep:petgraph",
+    "dep:notify",
+    "dep:scip",
+    "dep:protobuf",
+    "dep:ignore",
+    "dep:grep-searcher",
+    "dep:grep-regex",
+    "dep:globset",
+    "dep:jsonc-parser",
+    "dep:rayon",
+    "dep:serde-saphyr",
+    "dep:tempfile",
+]
+
+[dev-dependencies]
+serial_test = "3.5.0"
+h00ligan = { path = "../h00ligan" }
+
+[build-dependencies]
+sha2 = { workspace = true }

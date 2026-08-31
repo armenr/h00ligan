@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Fast local feedback for the Conventional Commit contract enforced again in CI.
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+exec python3 "$repo_root/scripts/check-conventional-commits.py" \
+  --message-file "$1" \
+  --allow-fixup

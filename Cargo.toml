@@ -1,0 +1,58 @@
+[workspace]
+members = [
+    "crates/h00ligan-interface",
+    "crates/h00ligan-engine",
+    "crates/h00ligan",
+    "crates/h00ligan-provider-protocol",
+]
+exclude = ["target"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+# MSRV floor: track latest stable Rust. Raised 1.85 → 1.97.1; the patch
+# release includes an upstream LLVM miscompilation fix.
+rust-version = "1.97.1"
+
+[workspace.dependencies]
+# Shared dependencies — current stable releases checked on crates.io 2026-08-16.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+# Typed, budgeted, pure-Rust YAML parsing. Latest stable release verified from
+# upstream docs.rs/crates.io metadata on 2026-08-25.
+serde-saphyr = { version = "=1.1.0", default-features = false, features = ["deserialize"] }
+# TypeScript configuration is JSONC, not strict JSON. Latest stable release
+# verified from upstream docs.rs/crates.io metadata on 2026-08-25.
+jsonc-parser = { version = "=0.33.1", features = ["serde"] }
+tokio = { version = "1.53.1", features = ["full"] }
+tracing = "0.1.44"
+thiserror = "2.0.20"
+uuid = { version = "1.24.1", features = ["v4", "serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+async-trait = "0.1.92"
+sha2 = "0.11.0"
+# Latest stable verified against the upstream crate on 2026-08-26. Pyrefly's
+# exact older pin is advanced to this same version by the maintained provider
+# patch so the one-file product has one qualified hashing implementation.
+blake3 = "=1.8.7"
+clap = "4.6.6"
+globset = "0.4.20"
+hex = "0.4.3"
+ignore = "0.4.33"
+# Source-search kernel; latest stable releases verified against crates.io on
+# 2026-08-17 and pinned exactly for reproducible CLI/MCP behavior.
+grep-searcher = "=0.1.17"
+grep-regex = "=0.1.14"
+libc = "0.2.189"
+parking_lot = "0.12.5"
+redb = "3.1.3"
+regex = "1.13.1"
+tempfile = "3.27.0"
+tokio-util = "0.7.19"
+toml = "1.1.4"
+tracing-subscriber = "0.3.23"
+# Full DWARF made each integration-test executable 1.3-1.7 GiB and allowed a
+# clean 32-core build to create more than 42 GiB of concurrent linker output.
+# Level 1 retains line-table backtraces while keeping the local/CI gate bounded.
+[profile.test]
+debug = 1
