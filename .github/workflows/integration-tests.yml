@@ -39,18 +39,30 @@ jobs:
           python3 scripts/check-h00ligan-sbom.py --self-test
           scripts/package-h00ligan-release.sh --self-test
 
-      - name: Lint workflow semantics with verified actionlint
+      - name: Lint workflow semantics with verified actionlint and ShellCheck
         run: |
           curl --location --proto '=https' --proto-redir '=https' \
             --tlsv1.2 --retry 5 --fail --silent --show-error \
             --output "$RUNNER_TEMP/actionlint.tar.gz" \
             https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          curl --location --proto '=https' --proto-redir '=https' \
+            --tlsv1.2 --retry 5 --fail --silent --show-error \
+            --output "$RUNNER_TEMP/shellcheck.tar.xz" \
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
           test -s "$RUNNER_TEMP/actionlint.tar.gz"
-          echo '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz' \
-            > "$RUNNER_TEMP/actionlint.SHA256SUMS"
-          (cd "$RUNNER_TEMP" && sha256sum --check actionlint.SHA256SUMS)
+          test -s "$RUNNER_TEMP/shellcheck.tar.xz"
+          printf '%s\n' \
+            '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz' \
+            '8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  shellcheck.tar.xz' \
+            > "$RUNNER_TEMP/workflow-lint.SHA256SUMS"
+          (cd "$RUNNER_TEMP" && sha256sum --check workflow-lint.SHA256SUMS)
           tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
-          "$RUNNER_TEMP/actionlint" -color
+          tar -xJf "$RUNNER_TEMP/shellcheck.tar.xz" -C "$RUNNER_TEMP"
+          actionlint="$RUNNER_TEMP/actionlint"
+          shellcheck="$RUNNER_TEMP/shellcheck-v0.11.0/shellcheck"
+          test "$("$actionlint" -version | sed -n '1p')" = '1.7.12'
+          "$shellcheck" --version | grep -Fx 'version: 0.11.0'
+          "$actionlint" -color -shellcheck "$shellcheck"
 
       - name: Validate the proposed merge subject
         run: >-

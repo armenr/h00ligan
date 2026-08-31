@@ -60,6 +60,9 @@ deps-check:
 # Static release authorities. Exact installed-product acceptance remains in
 # `ci-product`, where it cannot be mistaken for source-only compilation.
 release-check:
+    @test "$(actionlint -version | sed -n '1p')" = '1.7.12'
+    shellcheck --version | grep -Fx 'version: 0.11.0'
+    actionlint -color
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/check-conventional-commits.py --self-test
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/check-action-pins.py --self-test
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/check-action-pins.py

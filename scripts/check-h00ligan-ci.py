@@ -53,7 +53,18 @@ CI_COMPLETION_COMMAND = (
     "--source-preflight .h00ligan/gates/ci-product-source-preflight.json"
 )
 
+ACTIONLINT_VERSION_COMMAND = (
+    'test "$(actionlint -version | sed -n \'1p\')" = \'1.7.12\''
+)
+SHELLCHECK_VERSION_COMMAND = (
+    "shellcheck --version | grep -Fx 'version: 0.11.0'"
+)
+ACTIONLINT_COMMAND = "actionlint -color"
+
 RELEASE_REQUIRED_COMMANDS = (
+    ACTIONLINT_VERSION_COMMAND,
+    SHELLCHECK_VERSION_COMMAND,
+    ACTIONLINT_COMMAND,
     "PYTHONDONTWRITEBYTECODE=1 python3 scripts/check-conventional-commits.py --self-test",
     "PYTHONDONTWRITEBYTECODE=1 python3 scripts/check-action-pins.py --self-test",
     "PYTHONDONTWRITEBYTECODE=1 python3 scripts/check-action-pins.py",
@@ -899,7 +910,22 @@ def self_test() -> int:
         "test population": valid.replace(f"    {TEST_COMMANDS[0]}\n", "", 1),
         "serial process tests": valid.replace("-- --test-threads=1", "", 1),
         "release static authority": valid.replace(
-            f"    {RELEASE_REQUIRED_COMMANDS[2]}\n",
+            f"    {RELEASE_REQUIRED_COMMANDS[5]}\n",
+            "",
+            1,
+        ),
+        "actionlint version": valid.replace(
+            f"    {ACTIONLINT_VERSION_COMMAND}\n",
+            "",
+            1,
+        ),
+        "shellcheck version": valid.replace(
+            f"    {SHELLCHECK_VERSION_COMMAND}\n",
+            "",
+            1,
+        ),
+        "workflow lint": valid.replace(
+            f"    {ACTIONLINT_COMMAND}\n",
             "",
             1,
         ),
@@ -968,6 +994,9 @@ def self_test() -> int:
         "test population": "test command population",
         "serial process tests": "test command population",
         "release static authority": "release-check is missing required command",
+        "actionlint version": "release-check is missing required command",
+        "shellcheck version": "release-check is missing required command",
+        "workflow lint": "release-check is missing required command",
         "portable install": "install command population",
         "local hook installation": "install-hooks command population",
         "installed product boundary": "test-installed command population",

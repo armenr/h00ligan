@@ -176,9 +176,11 @@ jobs:
           receipt="$(printf '%s\n' "$details" | sed -n 's/^H00LIGAN_RECEIPT=//p')"
           source_receipt="$(printf '%s\n' "$details" | sed -n 's/^H00LIGAN_PRODUCT_SOURCE_RECEIPT=//p')"
           [[ -x "$binary" && -f "$receipt" && -f "$source_receipt" ]]
-          echo "binary=$binary" >> "$GITHUB_OUTPUT"
-          echo "receipt=$receipt" >> "$GITHUB_OUTPUT"
-          echo "source_receipt=$source_receipt" >> "$GITHUB_OUTPUT"
+          {
+            echo "binary=$binary"
+            echo "receipt=$receipt"
+            echo "source_receipt=$source_receipt"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Exercise the exact installed provider, MCP, and WATCH boundaries
         env:
