@@ -1722,7 +1722,7 @@ mod tests {
         let coordinator = Arc::new(LiveInputObservationCoordinator::default());
         let executions = Arc::new(AtomicUsize::new(0));
         let first_started = Arc::new(tokio::sync::Notify::new());
-        let release_first = Arc::new(tokio::sync::Notify::new());
+        let (release_first, release_first_receiver) = tokio::sync::oneshot::channel();
         let fallback = StalenessVerdict::Unknown {
             reason: StalenessReason::SourceVerificationFailed,
             files_checked: 0,
@@ -1732,13 +1732,14 @@ mod tests {
             let coordinator = Arc::clone(&coordinator);
             let executions = Arc::clone(&executions);
             let first_started = Arc::clone(&first_started);
-            let release_first = Arc::clone(&release_first);
             tokio::spawn(async move {
                 coordinator
                     .observe(fallback, move || async move {
                         executions.fetch_add(1, Ordering::SeqCst);
                         first_started.notify_one();
-                        release_first.notified().await;
+                        release_first_receiver
+                            .await
+                            .expect("test owns the first observation release");
                         StalenessVerdict::Fresh
                     })
                     .await
@@ -1749,20 +1750,35 @@ mod tests {
         let second = {
             let coordinator = Arc::clone(&coordinator);
             let executions = Arc::clone(&executions);
-            async move {
+            tokio::spawn(async move {
                 coordinator
                     .observe(fallback, move || async move {
                         executions.fetch_add(1, Ordering::SeqCst);
                         StalenessVerdict::Stale
                     })
                     .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let joined = coordinator
+                    .state
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|in_flight| in_flight.result.receiver_count() == 2);
+                if joined {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-        };
-        let release = async {
-            tokio::task::yield_now().await;
-            release_first.notify_waiters();
-        };
-        let (second, ()) = tokio::join!(second, release);
+        })
+        .await
+        .expect("the overlapping waiter must join the in-flight observation");
+        release_first
+            .send(())
+            .expect("release the first observation exactly once");
+        let second = second.await.expect("second observation request");
         let first = first.await.expect("first observation request");
 
         assert_eq!(first, StalenessVerdict::Fresh);
@@ -1801,7 +1817,7 @@ mod tests {
         let coordinator = Arc::new(LiveInputObservationCoordinator::default());
         let executions = Arc::new(AtomicUsize::new(0));
         let producer_started = Arc::new(tokio::sync::Notify::new());
-        let release_producer = Arc::new(tokio::sync::Notify::new());
+        let (release_producer, release_producer_receiver) = tokio::sync::oneshot::channel();
         let fallback = StalenessVerdict::Unknown {
             reason: StalenessReason::SourceVerificationFailed,
             files_checked: 0,
@@ -1811,13 +1827,14 @@ mod tests {
             let coordinator = Arc::clone(&coordinator);
             let executions = Arc::clone(&executions);
             let producer_started = Arc::clone(&producer_started);
-            let release_producer = Arc::clone(&release_producer);
             tokio::spawn(async move {
                 coordinator
                     .observe(fallback, move || async move {
                         executions.fetch_add(1, Ordering::SeqCst);
                         producer_started.notify_one();
-                        release_producer.notified().await;
+                        release_producer_receiver
+                            .await
+                            .expect("test owns the producer release");
                         StalenessVerdict::Fresh
                     })
                     .await
@@ -1861,7 +1878,9 @@ mod tests {
         })
         .await
         .expect("surviving waiter must join the in-flight observation");
-        release_producer.notify_waiters();
+        release_producer
+            .send(())
+            .expect("release the snapshot-owned observation exactly once");
 
         assert_eq!(
             surviving_waiter.await.expect("surviving request"),
