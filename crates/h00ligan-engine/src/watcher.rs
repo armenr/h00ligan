@@ -1252,17 +1252,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_control_probes_do_not_run_full_reconciliation_but_source_events_do() {
-        let (_temporary, root, source, _binding, supervisor) = watch_fixture();
+    async fn idle_control_probes_do_not_run_full_reconciliation() {
+        let (_temporary, root, _source, _binding, supervisor) = watch_fixture();
+        // This is the publication-probe causal control. Native source delivery
+        // has its own real-watcher test below; mixing the two lets Darwin's
+        // coarse registration events masquerade as probe-driven work.
+        let watcher = WatcherConfig::new(root.clone(), 10).exclude_root(root);
         let service = IndexWatchService::start(
             supervisor.clone(),
-            WatcherConfig::new(root, 10),
+            watcher,
             IndexSupervisorRequest::default(),
             WatchCadence::new(Duration::from_millis(10), Duration::from_secs(30)),
         )
         .expect("start WATCH service");
 
-        let initial_epoch = wait_for_epoch_after(&supervisor, 0).await;
+        wait_for_epoch_after(&supervisor, 0).await;
         tokio::time::sleep(Duration::from_millis(80)).await;
         let idle_status = service.status();
         assert!(
@@ -1280,15 +1284,6 @@ mod tests {
             supervisor.retained_snapshots().len(),
             1,
             "unchanged control probes must not schedule whole-repository operations"
-        );
-
-        std::fs::write(&source, "pub fn after() -> u8 { 2 }\n").expect("changed source");
-        let changed_epoch = wait_for_epoch_after(&supervisor, initial_epoch).await;
-        assert!(changed_epoch > initial_epoch);
-        let changed_status = service.status();
-        assert!(
-            changed_status.filesystem_batches >= 1,
-            "positive control: the native event path must remain live: {changed_status:?}"
         );
 
         let stopped = service.stop().await.expect("stop WATCH service");
