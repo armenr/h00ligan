@@ -98,11 +98,21 @@ fn wait_for_direct_child_at_root(parent: u32, executable: &Path, root: &Path) ->
     }
 }
 
-#[cfg(target_os = "linux")]
 fn process_exists(pid: u32) -> bool {
     // SAFETY: signal zero is a read-only liveness probe for the exact positive
-    // PID discovered beneath the test-owned WATCH process.
+    // PID recorded by the test-owned provider fixture.
     unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+fn wait_for_process_exit(pid: u32, label: &str) {
+    let deadline = Instant::now() + test_timeout(5);
+    while process_exists(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "{label} process {pid} survived its owning WATCH process"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1261,18 +1271,30 @@ fn shipped_semantic_watch_serves_structural_truth_while_provider_is_blocked() {
         "changed structural truth must be queryable while semantic enrichment is blocked: {result}"
     );
 
-    let heartbeat_before_stop = std::fs::metadata(&provider_heartbeat)
-        .expect("provider heartbeat before WATCH stop")
-        .len();
     let watch_output_path = watch.stdout.clone();
     let status = watch.terminate();
     assert!(status.success(), "semantic WATCH shutdown failed: {status}");
-    std::thread::sleep(Duration::from_millis(250));
+    let provider_pid = std::fs::read_to_string(&provider_pid)
+        .expect("provider PID after WATCH stop")
+        .trim()
+        .parse::<u32>()
+        .expect("numeric provider PID");
+    let provider_descendant_pid = std::fs::read_to_string(&provider_descendant_pid)
+        .expect("provider descendant PID after WATCH stop")
+        .trim()
+        .parse::<u32>()
+        .expect("numeric provider descendant PID");
+    wait_for_process_exit(provider_pid, "provider parent");
+    wait_for_process_exit(provider_descendant_pid, "provider descendant");
     let heartbeat_after_stop = std::fs::metadata(&provider_heartbeat)
         .expect("provider heartbeat after WATCH stop")
         .len();
+    std::thread::sleep(Duration::from_millis(250));
+    let heartbeat_after_grace = std::fs::metadata(&provider_heartbeat)
+        .expect("provider heartbeat after WATCH shutdown grace")
+        .len();
     assert_eq!(
-        heartbeat_after_stop, heartbeat_before_stop,
+        heartbeat_after_grace, heartbeat_after_stop,
         "WATCH stop must cancel and reap the blocked provider process group"
     );
     assert!(
