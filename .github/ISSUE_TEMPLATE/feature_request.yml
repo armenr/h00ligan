@@ -1,0 +1,46 @@
+name: Feature request
+description: Propose a concrete product capability or usability improvement.
+title: ""
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem should h00ligan solve?
+      description: Describe the workflow or question that is difficult today.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: What would a useful result or interaction look like?
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Most relevant area
+      options:
+        - CLI and MCP contract
+        - WATCH and incremental indexing
+        - Rust
+        - Go
+        - Python
+        - TypeScript or JavaScript
+        - Packaging or installation
+        - Performance
+        - Agent integration
+        - Other or cross-cutting
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Examples or evidence
+      description: Share representative code shapes, expected output, comparisons, or performance needs.
+  - type: textarea
+    id: tradeoffs
+    attributes:
+      label: Tradeoffs or alternatives
+      description: Optional—note approaches already tried or constraints that matter.
+

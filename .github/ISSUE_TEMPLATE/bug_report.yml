@@ -1,0 +1,57 @@
+name: Bug report
+description: Report incorrect behavior, misleading authority, a crash, or a regression.
+title: ""
+labels:
+  - bug
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Tell us what you expected and what h00ligan did instead.
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      options:
+        - CLI
+        - MCP
+        - WATCH
+        - Indexing or provider
+        - Build, install, or release artifact
+        - Unsure or multiple
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Include commands or MCP calls, a small fixture when possible, and sanitized output.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: h00ligan version
+      description: Output from `h00ligan --version`, including the content identity when present.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Platform and language toolchain
+      placeholder: Linux ARM64; Rust 1.xx; Python 3.xx
+  - type: textarea
+    id: authority
+    attributes:
+      label: Status and authority evidence
+      description: Paste the relevant sanitized `status` output or structured authority/freshness fields.
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: Add logs, timing evidence, or repository shape details that materially help reproduce it.
+
