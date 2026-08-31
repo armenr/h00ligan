@@ -1461,6 +1461,7 @@ mod tests {
         std::fs::write(&source, "pub fn first() {}\n").expect("initial source");
 
         let binding = ProjectBinding::explicit(&root, &graph).expect("explicit binding");
+        let source = binding.root().join("src/lib.rs");
         BoundIndexPlan::prepare(&binding, BoundIndexRequest::default())
             .expect("prepare seed")
             .publish()

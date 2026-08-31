@@ -1408,7 +1408,11 @@ mod tests {
     #[tokio::test]
     async fn publication_probe_reconciles_one_external_head_advance_without_replay() {
         let (_temporary, root, source, binding, supervisor) = watch_fixture();
-        let watcher = WatcherConfig::new(root.clone(), 10).exclude_root(root.join("src"));
+        // Isolate the publication-control path from platform-specific native
+        // event coalescing. Some Darwin backends report a coarse parent event
+        // for an excluded descendant; this test is specifically the no-native-
+        // event control for foreign immutable-head adoption.
+        let watcher = WatcherConfig::new(root.clone(), 10).exclude_root(root.clone());
         let service = IndexWatchService::start(
             supervisor.clone(),
             watcher,

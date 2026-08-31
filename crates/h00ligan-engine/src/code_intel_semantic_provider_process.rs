@@ -1105,9 +1105,13 @@ mod tests {
             }
             let fixture = FakeProvider::new();
             let mut provider =
-                SemanticProviderProcess::spawn(fixture.config(mode, Duration::from_millis(75)))
+                SemanticProviderProcess::spawn(fixture.config(mode, Duration::from_secs(2)))
                     .await
                     .expect("provider hello positive control");
+            // Boot is a positive control, not part of the timeout sabotage.
+            // Apply the deliberately short deadline only after the child has
+            // completed its mandatory identity/limits hello.
+            provider.request_timeout = Duration::from_millis(75);
             let pid = fixture.pid();
             let error = provider
                 .request(
