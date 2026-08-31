@@ -61,6 +61,11 @@ SHELLCHECK_VERSION_COMMAND = (
 )
 ACTIONLINT_COMMAND = "actionlint -color"
 
+LINUX_LINT_STEP = "- name: Strict lint"
+LINUX_CLEAN_STEP = "- name: Reclaim compiler artifacts before test linking"
+LINUX_CLEAN_COMMAND = "run: devbox run -- cargo clean --profile dev"
+LINUX_TEST_STEP = "- name: Serial source and real-process tests"
+
 RELEASE_REQUIRED_COMMANDS = (
     ACTIONLINT_VERSION_COMMAND,
     SHELLCHECK_VERSION_COMMAND,
@@ -733,6 +738,36 @@ def validate_distribution_workflow(workflow: str) -> list[str]:
     return failures
 
 
+def validate_integration_workflow(workflow: str | None) -> list[str]:
+    """Keep the hosted Linux gate below its bounded compiler-artifact budget."""
+    if workflow is None:
+        return ["missing integration workflow"]
+    active_lines = [
+        line.strip()
+        for line in workflow.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    required = (
+        LINUX_LINT_STEP,
+        LINUX_CLEAN_STEP,
+        LINUX_CLEAN_COMMAND,
+        LINUX_TEST_STEP,
+    )
+    failures = [
+        f"integration workflow is missing Linux artifact boundary {line!r}"
+        for line in required
+        if active_lines.count(line) != 1
+    ]
+    if not failures:
+        positions = [active_lines.index(line) for line in required]
+        if positions != sorted(positions):
+            failures.append(
+                "Linux compiler-artifact cleanup must run after strict lint and "
+                "before serial tests"
+            )
+    return failures
+
+
 def validate_portable_lockfile(lockfile: str | None) -> list[str]:
     """Require one tracked Cargo lock for the exact embedded product graph."""
     if lockfile is None:
@@ -1186,6 +1221,35 @@ def self_test() -> int:
                 f"forbidden distribution fragment did not fire: {fragment!r}"
             )
 
+    valid_integration = "\n".join(
+        (
+            LINUX_LINT_STEP,
+            "run: devbox run -- cargo clippy --locked --offline --workspace",
+            LINUX_CLEAN_STEP,
+            LINUX_CLEAN_COMMAND,
+            LINUX_TEST_STEP,
+            "run: devbox run -- cargo test --locked --offline --workspace",
+        )
+    )
+    if failures := validate_integration_workflow(valid_integration):
+        raise AssertionError(f"valid integration workflow rejected: {failures!r}")
+    integration_sabotages = {
+        "cleanup omission": valid_integration.replace(
+            f"{LINUX_CLEAN_COMMAND}\n", "", 1
+        ),
+        "cleanup misordering": "\n".join(
+            (
+                LINUX_CLEAN_STEP,
+                LINUX_CLEAN_COMMAND,
+                LINUX_LINT_STEP,
+                LINUX_TEST_STEP,
+            )
+        ),
+    }
+    for name, sabotaged in integration_sabotages.items():
+        if not validate_integration_workflow(sabotaged):
+            raise AssertionError(f"integration {name} did not fire")
+
     valid_lock = """\
 version = 4
 
@@ -1247,6 +1311,7 @@ dependencies = [
         + len(PERFORMANCE_WRAPPER_REQUIRED_FRAGMENTS)
         + len(DISTRIBUTION_REQUIRED_FRAGMENTS)
         + len(DISTRIBUTION_FORBIDDEN_FRAGMENTS)
+        + len(integration_sabotages)
         + len(lock_sabotages)
         + len(REPOSITORY_LOCAL_IGNORE_PATTERNS)
     )
@@ -1342,6 +1407,13 @@ def main() -> int:
     failures.extend(
         validate_distribution_workflow(distribution_path.read_text(encoding="utf-8"))
     )
+    integration_path = root / ".github/workflows/integration-tests.yml"
+    integration_text = (
+        integration_path.read_text(encoding="utf-8")
+        if integration_path.is_file()
+        else None
+    )
+    failures.extend(validate_integration_workflow(integration_text))
     lock_path = root / PORTABLE_PRODUCT_LOCK
     lock_text = lock_path.read_text(encoding="utf-8") if lock_path.is_file() else None
     failures.extend(validate_portable_lockfile(lock_text))

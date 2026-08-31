@@ -103,6 +103,9 @@ jobs:
           devbox run -- cargo clippy --locked --offline --workspace
           --all-targets --all-features -- -D warnings
 
+      - name: Reclaim compiler artifacts before test linking
+        run: devbox run -- cargo clean --profile dev
+
       - name: Serial source and real-process tests
         run: >-
           devbox run -- cargo test --locked --offline --workspace
