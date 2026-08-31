@@ -8868,12 +8868,14 @@ fn every_rust_execution_root_is_rebased_into_one_repository_authority() {
     .expect("detached Cargo manifest");
     let detached_source = "use fixture_pkg::target;\npub fn detached_only() { target(); }\n";
     std::fs::write(detached.join("src/lib.rs"), detached_source).expect("detached source fixture");
+    let canonical_root = canonical_fixture_path(&root);
+    let canonical_detached = canonical_fixture_path(&detached);
 
     let data_dir = temporary.path().join("bundle");
     let provider = install_multiroot_fixture_rust_analyzer(
         temporary.path(),
-        &root,
-        &detached,
+        &canonical_root,
+        &canonical_detached,
         detached_source,
     );
     let indexed = h00ligan()
@@ -8883,8 +8885,8 @@ fn every_rust_execution_root_is_rebased_into_one_repository_authority() {
         .arg(&data_dir)
         .args(["index", "--scip", "--format", "json"])
         .env("PATH", &provider.path)
-        .env("H00_TEST_PROVIDER_ROOT", &root)
-        .env("H00_TEST_PROVIDER_DETACHED", &detached)
+        .env("H00_TEST_PROVIDER_ROOT", &canonical_root)
+        .env("H00_TEST_PROVIDER_DETACHED", &canonical_detached)
         .env("H00_TEST_PROVIDER_ROOT_ARTIFACT", &provider.root_artifact)
         .env(
             "H00_TEST_PROVIDER_DETACHED_ARTIFACT",
@@ -8913,10 +8915,7 @@ fn every_rust_execution_root_is_rebased_into_one_repository_authority() {
         execution_roots
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>(),
-        [&root, &detached]
-            .into_iter()
-            .map(|path| canonical_fixture_path(path))
-            .collect(),
+        [canonical_root, canonical_detached].into_iter().collect(),
         "the root workspace and detached workspace must each be indexed exactly once"
     );
     let index_payload = stdout_json(&indexed);

@@ -778,12 +778,18 @@ def validate_test_profile(manifest: str | None) -> list[str]:
         return [f"workspace manifest is invalid TOML: {error}"]
 
     test_profile = parsed.get("profile", {}).get("test", {})
+    failures = []
+    if test_profile.get("debug") != 0:
+        failures.append(
+            "workspace test profile must set debug = 0 so linked test artifacts "
+            "fit the hosted-runner disk budget"
+        )
     if test_profile.get("incremental") is not False:
-        return [
+        failures.append(
             "workspace test profile must set incremental = false so a clean "
             "gate does not retain disposable compiler state"
-        ]
-    return []
+        )
+    return failures
 
 
 def validate_portable_lockfile(lockfile: str | None) -> list[str]:
@@ -1273,12 +1279,14 @@ def self_test() -> int:
 members = []
 
 [profile.test]
-debug = 1
+debug = 0
 incremental = false
 """
     if failures := validate_test_profile(valid_manifest):
         raise AssertionError(f"valid test profile rejected: {failures!r}")
     test_profile_sabotages = {
+        "debug omission": valid_manifest.replace("debug = 0\n", "", 1),
+        "debug enablement": valid_manifest.replace("debug = 0", "debug = 1", 1),
         "incremental omission": valid_manifest.replace("incremental = false\n", "", 1),
         "incremental enablement": valid_manifest.replace(
             "incremental = false", "incremental = true", 1
