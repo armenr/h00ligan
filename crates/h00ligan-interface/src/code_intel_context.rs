@@ -1845,7 +1845,22 @@ mod tests {
                     .await
             })
         };
-        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let joined = coordinator
+                    .state
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|in_flight| in_flight.result.receiver_count() == 1);
+                if joined {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("surviving waiter must join the in-flight observation");
         release_producer.notify_waiters();
 
         assert_eq!(

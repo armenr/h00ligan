@@ -41,10 +41,11 @@ fn resolving_a_repo_default_binding_does_not_create_managed_state() {
 
     let binding = ProjectBinding::resolve(ProjectBindingOptions::new(repo.path()))
         .expect("resolve read-only project binding");
+    let canonical_repo = repo.path().canonicalize().expect("canonical scratch repo");
 
     assert_eq!(
         binding.graph_dir(),
-        repo.path().join(".h00ligan/code-intel")
+        canonical_repo.join(".h00ligan/code-intel")
     );
     assert!(
         !repo.path().join(".h00ligan").exists(),
@@ -86,10 +87,14 @@ fn implicit_non_git_fails_before_creating_scaffolding_but_explicit_non_git_works
         ProjectBindingOptions::new(workspace.path()).explicit_root(workspace.path()),
     )
     .expect("an explicitly selected non-git workspace is valid");
+    let canonical_workspace = workspace
+        .path()
+        .canonicalize()
+        .expect("canonical explicit workspace");
     assert_eq!(binding.root_source(), RootSource::Explicit);
     assert_eq!(
         binding.graph_dir(),
-        workspace.path().join(".h00ligan/code-intel")
+        canonical_workspace.join(".h00ligan/code-intel")
     );
     assert!(!binding.graph_dir().exists());
 }
@@ -102,9 +107,10 @@ fn explicit_paths_anchor_the_graph_to_the_supplied_root_without_discovery() {
 
     let binding = ProjectBinding::explicit(&root, Path::new("semantic-data"))
         .expect("explicit project and graph binding");
+    let canonical_root = root.canonicalize().expect("canonical explicit root");
 
-    assert_eq!(binding.root(), root);
-    assert_eq!(binding.graph_dir(), root.join("semantic-data"));
+    assert_eq!(binding.root(), canonical_root);
+    assert_eq!(binding.graph_dir(), canonical_root.join("semantic-data"));
     assert_eq!(binding.root_source(), RootSource::Explicit);
     assert_eq!(binding.graph_source(), GraphSource::Cli);
 }
@@ -118,8 +124,12 @@ fn explicit_binding_does_not_create_the_graph_destination() {
 
     let binding = ProjectBinding::explicit(&root, Path::new("semantic-data"))
         .expect("explicit read-only binding");
+    let canonical_graph = root
+        .canonicalize()
+        .expect("canonical explicit root")
+        .join("semantic-data");
 
-    assert_eq!(binding.graph_dir(), graph);
+    assert_eq!(binding.graph_dir(), canonical_graph);
     assert!(
         !graph.exists(),
         "explicit binding selection must not create the writer destination"
@@ -244,9 +254,10 @@ fn relative_cli_graph_paths_are_anchored_to_the_root_not_startup_cwd() {
         ProjectBindingOptions::new(&nested).global_graph_dir(Path::new("build/intel")),
     )
     .expect("resolve relative CLI graph path");
+    let canonical_repo = repo.path().canonicalize().expect("canonical scratch repo");
 
     assert_eq!(binding.graph_source(), GraphSource::Cli);
-    assert_eq!(binding.graph_dir(), repo.path().join("build/intel"));
+    assert_eq!(binding.graph_dir(), canonical_repo.join("build/intel"));
     assert!(!binding.graph_dir().exists());
     assert!(!nested.join("build").exists());
 }

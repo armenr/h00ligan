@@ -6,8 +6,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -394,15 +392,10 @@ struct CurrentGenerationProbe {
     phase_timings: Vec<IndexPhaseTiming>,
 }
 
-#[cfg(test)]
-static COMPLETE_SOURCE_FRESHNESS_CHECKS: AtomicUsize = AtomicUsize::new(0);
-
 fn check_complete_indexed_source_freshness(
     root: &std::path::Path,
     indexed_files: &[(String, FileRecord)],
 ) -> Result<StalenessVerdict, crate::graph_stats::IndexedSourceFreshnessError> {
-    #[cfg(test)]
-    COMPLETE_SOURCE_FRESHNESS_CHECKS.fetch_add(1, Ordering::SeqCst);
     check_indexed_source_freshness(root, indexed_files)
 }
 
@@ -1468,6 +1461,7 @@ mod tests {
         std::fs::write(&source, "pub fn first() {}\n").expect("initial source");
 
         let binding = ProjectBinding::explicit(&root, &graph).expect("explicit binding");
+        let source = binding.root().join("src/lib.rs");
         BoundIndexPlan::prepare(&binding, BoundIndexRequest::default())
             .expect("prepare seed")
             .publish()
@@ -1475,7 +1469,6 @@ mod tests {
             .expect("publish seed");
 
         std::fs::write(&source, "pub fn second() {}\n").expect("hinted source change");
-        COMPLETE_SOURCE_FRESHNESS_CHECKS.store(0, Ordering::SeqCst);
         let hinted = BoundIndexPlan::prepare_with_toolchain_resolver(
             &binding,
             BoundIndexRequest::default(),
@@ -1490,29 +1483,33 @@ mod tests {
             hinted.telemetry.files_changed, 1,
             "positive changed-file control"
         );
-        assert_eq!(
-            COMPLETE_SOURCE_FRESHNESS_CHECKS.load(Ordering::SeqCst),
-            0,
+        assert!(
+            !hinted
+                .telemetry
+                .phase_timings
+                .iter()
+                .any(|timing| { timing.label == "reuse complete source and inventory validation" }),
             "a byte-different indexed hint already proves exact reuse impossible"
         );
 
         std::fs::write(&source, "pub fn third() {}\n").expect("unhinted source change");
-        COMPLETE_SOURCE_FRESHNESS_CHECKS.store(0, Ordering::SeqCst);
         let unhinted = BoundIndexPlan::prepare(&binding, BoundIndexRequest::default())
             .expect("prepare unhinted refresh")
             .publish()
             .await
             .expect("publish unhinted refresh");
         assert_eq!(unhinted.telemetry.files_changed, 1);
-        assert_eq!(
-            COMPLETE_SOURCE_FRESHNESS_CHECKS.load(Ordering::SeqCst),
-            1,
+        assert!(
+            unhinted
+                .telemetry
+                .phase_timings
+                .iter()
+                .any(|timing| { timing.label == "reuse complete source and inventory validation" }),
             "positive fallback control: an unhinted operation requires complete verification"
         );
 
         let readme = root.join("README.md");
         std::fs::write(&readme, "non-source watch noise\n").expect("spurious hint fixture");
-        COMPLETE_SOURCE_FRESHNESS_CHECKS.store(0, Ordering::SeqCst);
         let spurious = BoundIndexPlan::prepare_with_toolchain_resolver(
             &binding,
             BoundIndexRequest::default(),
@@ -1527,9 +1524,12 @@ mod tests {
             spurious.telemetry.reused_generation,
             "an unrelated hint must not manufacture a fresh generation"
         );
-        assert_eq!(
-            COMPLETE_SOURCE_FRESHNESS_CHECKS.load(Ordering::SeqCst),
-            1,
+        assert!(
+            spurious
+                .telemetry
+                .phase_timings
+                .iter()
+                .any(|timing| { timing.label == "reuse complete source and inventory validation" }),
             "an inconclusive hint must fall through to complete verification"
         );
     }
@@ -1563,20 +1563,21 @@ mod tests {
             .await
             .expect("publish structural seed");
 
-        COMPLETE_SOURCE_FRESHNESS_CHECKS.store(0, Ordering::SeqCst);
         let exact_structural = BoundIndexPlan::prepare(&binding, BoundIndexRequest::default())
             .expect("prepare exact structural reuse")
             .publish()
             .await
             .expect("reuse structural generation");
         assert!(exact_structural.telemetry.reused_generation);
-        assert_eq!(
-            COMPLETE_SOURCE_FRESHNESS_CHECKS.load(Ordering::SeqCst),
-            1,
+        assert!(
+            exact_structural
+                .telemetry
+                .phase_timings
+                .iter()
+                .any(|timing| { timing.label == "reuse complete source and inventory validation" }),
             "positive control: an otherwise admissible generation still requires complete source freshness"
         );
 
-        COMPLETE_SOURCE_FRESHNESS_CHECKS.store(0, Ordering::SeqCst);
         let semantic = BoundIndexPlan::prepare(
             &binding,
             BoundIndexRequest {
@@ -1592,9 +1593,12 @@ mod tests {
             !semantic.telemetry.reused_generation,
             "positive control: structural evidence cannot satisfy an available Go provider request"
         );
-        assert_eq!(
-            COMPLETE_SOURCE_FRESHNESS_CHECKS.load(Ordering::SeqCst),
-            0,
+        assert!(
+            !semantic
+                .telemetry
+                .phase_timings
+                .iter()
+                .any(|timing| { timing.label == "reuse complete source and inventory validation" }),
             "known-ineligible provider evidence must reject reuse before complete source scanning"
         );
     }

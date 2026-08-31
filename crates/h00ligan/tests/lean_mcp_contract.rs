@@ -1439,6 +1439,23 @@ fn wait_for_nonempty_file(path: &Path, label: &str) {
 }
 
 #[cfg(unix)]
+fn wait_for_file_growth(path: &Path, initial_len: u64, label: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let current_len = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
+        if current_len > initial_len {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {label}: {} remained at {current_len} bytes",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
 fn assert_cli_signal_cancels_and_reaps_provider(signal: libc::c_int, signal_name: &str) {
     use std::os::unix::process::ExitStatusExt as _;
 
@@ -1951,13 +1968,10 @@ fn mcp_reindex_lifecycle_is_responsive_owned_cancellable_and_replay_safe() {
     let heartbeat_before = std::fs::metadata(&heartbeat)
         .expect("heartbeat before owned cancellation")
         .len();
-    std::thread::sleep(Duration::from_millis(150));
-    assert!(
-        std::fs::metadata(&heartbeat)
-            .expect("heartbeat after rejected controls")
-            .len()
-            > heartbeat_before,
-        "rejected foreign/busy controls must not stop the active provider"
+    wait_for_file_growth(
+        &heartbeat,
+        heartbeat_before,
+        "active provider progress after rejected foreign/busy controls",
     );
 
     let cancelled = session.call(

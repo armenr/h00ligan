@@ -4,12 +4,13 @@
 //! therefore either admitted by both operations or rejected by both; adapters
 //! do not get to invent their own language, ignore, or symlink policy.
 
+#[cfg(test)]
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 
@@ -36,60 +37,108 @@ pub enum SourceDiscoveryError {
 }
 
 #[cfg(test)]
-static TEST_DISCOVERY_DELAY_ENABLED: AtomicBool = AtomicBool::new(false);
-#[cfg(test)]
-static TEST_DISCOVERY_ENTRIES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static TEST_MAX_DISCOVERY_ENTRIES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static TEST_DISCOVERY_THREADS: AtomicUsize = AtomicUsize::new(0);
+#[derive(Default)]
+struct TestDiscoveryProbe {
+    threads: usize,
+    delay: bool,
+    in_flight: usize,
+    max_in_flight: usize,
+}
 
 #[cfg(test)]
-struct TestDiscoveryFlightGuard;
+fn test_discovery_probes() -> &'static Mutex<HashMap<PathBuf, TestDiscoveryProbe>> {
+    static PROBES: OnceLock<Mutex<HashMap<PathBuf, TestDiscoveryProbe>>> = OnceLock::new();
+    PROBES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+struct TestDiscoveryFlightGuard {
+    root: Option<PathBuf>,
+}
 
 #[cfg(test)]
 struct TestDiscoveryConfigGuard {
-    previous_delay: bool,
-    previous_threads: usize,
+    root: PathBuf,
 }
 
 #[cfg(test)]
 impl TestDiscoveryConfigGuard {
-    fn parallel_probe() -> Self {
-        let previous_threads = TEST_DISCOVERY_THREADS.swap(4, Ordering::SeqCst);
-        let previous_delay = TEST_DISCOVERY_DELAY_ENABLED.swap(true, Ordering::SeqCst);
-        Self {
-            previous_delay,
-            previous_threads,
-        }
+    fn parallel_probe(root: &Path) -> Self {
+        let root = root.to_path_buf();
+        let previous = test_discovery_probes()
+            .lock()
+            .expect("source-discovery probe state")
+            .insert(
+                root.clone(),
+                TestDiscoveryProbe {
+                    threads: 4,
+                    delay: true,
+                    ..TestDiscoveryProbe::default()
+                },
+            );
+        assert!(previous.is_none(), "duplicate source-discovery probe root");
+        Self { root }
     }
 }
 
 #[cfg(test)]
 impl Drop for TestDiscoveryConfigGuard {
     fn drop(&mut self) {
-        TEST_DISCOVERY_DELAY_ENABLED.store(self.previous_delay, Ordering::SeqCst);
-        TEST_DISCOVERY_THREADS.store(self.previous_threads, Ordering::SeqCst);
+        test_discovery_probes()
+            .lock()
+            .expect("source-discovery probe state")
+            .remove(&self.root);
     }
 }
 
 #[cfg(test)]
 impl TestDiscoveryFlightGuard {
-    fn enter() -> Self {
-        let in_flight = TEST_DISCOVERY_ENTRIES_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
-        TEST_MAX_DISCOVERY_ENTRIES_IN_FLIGHT.fetch_max(in_flight, Ordering::SeqCst);
-        if TEST_DISCOVERY_DELAY_ENABLED.load(Ordering::SeqCst) {
+    fn enter(root: &Path) -> Self {
+        let delay = {
+            let mut probes = test_discovery_probes()
+                .lock()
+                .expect("source-discovery probe state");
+            let Some(probe) = probes.get_mut(root) else {
+                return Self { root: None };
+            };
+            probe.in_flight = probe.in_flight.saturating_add(1);
+            probe.max_in_flight = probe.max_in_flight.max(probe.in_flight);
+            let delay = probe.delay;
+            drop(probes);
+            delay
+        };
+        if delay {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        Self
+        Self {
+            root: Some(root.to_path_buf()),
+        }
     }
 }
 
 #[cfg(test)]
 impl Drop for TestDiscoveryFlightGuard {
     fn drop(&mut self) {
-        TEST_DISCOVERY_ENTRIES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        let Some(root) = &self.root else {
+            return;
+        };
+        let mut probes = test_discovery_probes()
+            .lock()
+            .expect("source-discovery probe state");
+        if let Some(probe) = probes.get_mut(root) {
+            probe.in_flight = probe.in_flight.saturating_sub(1);
+        }
+        drop(probes);
     }
+}
+
+#[cfg(test)]
+fn test_discovery_max_in_flight(root: &Path) -> usize {
+    test_discovery_probes()
+        .lock()
+        .expect("source-discovery probe state")
+        .get(root)
+        .map_or(0, |probe| probe.max_in_flight)
 }
 
 /// Walk `root` using Git/hidden ignore policy and return supported regular
@@ -123,8 +172,12 @@ pub fn discover_source_files_beneath(
     let builder =
         configured_source_walk_builder(workspace_root, search_root, exclusion_patterns, &[])?;
     let observations = Arc::new(Mutex::new(Observations::default()));
+    #[cfg(test)]
+    let probe_root = Arc::new(workspace_root.to_path_buf());
     builder.build_parallel().run(|| {
         let observations = Arc::clone(&observations);
+        #[cfg(test)]
+        let probe_root = Arc::clone(&probe_root);
         Box::new(move |entry| {
             let mut observation = None;
             match entry {
@@ -144,7 +197,7 @@ pub fn discover_source_files_beneath(
                         .is_some_and(|extension| extensions.contains(extension));
                     if supported {
                         #[cfg(test)]
-                        let _flight = TestDiscoveryFlightGuard::enter();
+                        let _flight = TestDiscoveryFlightGuard::enter(&probe_root);
                         if let Some(file_type) = entry.file_type() {
                             if file_type.is_symlink() {
                                 observation = Some((path.to_path_buf(), true));
@@ -240,7 +293,11 @@ fn configured_source_walk_builder(
     let mut builder = ignore::WalkBuilder::new(search_root);
     #[cfg(test)]
     {
-        let threads = TEST_DISCOVERY_THREADS.load(Ordering::SeqCst);
+        let threads = test_discovery_probes()
+            .lock()
+            .expect("source-discovery probe state")
+            .get(workspace_root)
+            .map_or(0, |probe| probe.threads);
         if threads > 0 {
             builder.threads(threads);
         }
@@ -312,16 +369,14 @@ mod tests {
             .expect("source fixture");
         }
 
-        TEST_DISCOVERY_ENTRIES_IN_FLIGHT.store(0, Ordering::SeqCst);
-        TEST_MAX_DISCOVERY_ENTRIES_IN_FLIGHT.store(0, Ordering::SeqCst);
-        let _config = TestDiscoveryConfigGuard::parallel_probe();
+        let _config = TestDiscoveryConfigGuard::parallel_probe(temporary.path());
         let discovered =
             discover_source_files(temporary.path(), &HashSet::from(["rs".to_string()]), &[])
                 .expect("parallel source discovery");
 
         assert_eq!(discovered.len(), 24, "positive source-population control");
         assert!(
-            TEST_MAX_DISCOVERY_ENTRIES_IN_FLIGHT.load(Ordering::SeqCst) > 1,
+            test_discovery_max_in_flight(temporary.path()) > 1,
             "positive multi-thread control must observe overlapping source entries"
         );
     }

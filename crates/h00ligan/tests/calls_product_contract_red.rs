@@ -55,6 +55,12 @@ fn h00ligan() -> Command {
     Command::new(env!("CARGO_BIN_EXE_h00ligan"))
 }
 
+#[cfg(unix)]
+fn canonical_fixture_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|error| panic!("canonicalize fixture path {}: {error}", path.display()))
+}
+
 fn create_source_root(temporary: &TempDir, name: &str, source: &str) -> PathBuf {
     let root = temporary.path().join(name);
     std::fs::create_dir_all(root.join("src")).expect("source directory");
@@ -6704,7 +6710,7 @@ fn shipped_go_calls_distinguishes_missing_module_root_from_provider_failure() {
         std::fs::read_to_string(&provider_executed)
             .expect("go.mod positive control must execute provider")
             .trim(),
-        root.display().to_string(),
+        canonical_fixture_path(&root).display().to_string(),
         "the provider must execute at the discovered Go module root"
     );
     let with_module_json = stdout_json(&with_module);
@@ -7009,7 +7015,7 @@ fn shipped_go_callable_bindings_are_qualified_execution_paths_across_cli_and_mcp
         std::fs::read_to_string(&provider_executed)
             .expect("fixture provider must execute")
             .trim(),
-        root.display().to_string(),
+        canonical_fixture_path(&root).display().to_string(),
         "the provider must execute at the discovered Go module root",
     );
     assert_eq!(
@@ -8862,12 +8868,14 @@ fn every_rust_execution_root_is_rebased_into_one_repository_authority() {
     .expect("detached Cargo manifest");
     let detached_source = "use fixture_pkg::target;\npub fn detached_only() { target(); }\n";
     std::fs::write(detached.join("src/lib.rs"), detached_source).expect("detached source fixture");
+    let canonical_root = canonical_fixture_path(&root);
+    let canonical_detached = canonical_fixture_path(&detached);
 
     let data_dir = temporary.path().join("bundle");
     let provider = install_multiroot_fixture_rust_analyzer(
         temporary.path(),
-        &root,
-        &detached,
+        &canonical_root,
+        &canonical_detached,
         detached_source,
     );
     let indexed = h00ligan()
@@ -8877,8 +8885,8 @@ fn every_rust_execution_root_is_rebased_into_one_repository_authority() {
         .arg(&data_dir)
         .args(["index", "--scip", "--format", "json"])
         .env("PATH", &provider.path)
-        .env("H00_TEST_PROVIDER_ROOT", &root)
-        .env("H00_TEST_PROVIDER_DETACHED", &detached)
+        .env("H00_TEST_PROVIDER_ROOT", &canonical_root)
+        .env("H00_TEST_PROVIDER_DETACHED", &canonical_detached)
         .env("H00_TEST_PROVIDER_ROOT_ARTIFACT", &provider.root_artifact)
         .env(
             "H00_TEST_PROVIDER_DETACHED_ARTIFACT",
@@ -8907,7 +8915,7 @@ fn every_rust_execution_root_is_rebased_into_one_repository_authority() {
         execution_roots
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>(),
-        [root.clone(), detached].into_iter().collect(),
+        [canonical_root, canonical_detached].into_iter().collect(),
         "the root workspace and detached workspace must each be indexed exactly once"
     );
     let index_payload = stdout_json(&indexed);

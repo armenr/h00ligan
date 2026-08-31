@@ -10,7 +10,7 @@ use std::time::SystemTime;
 #[cfg(feature = "code-intel")]
 use rayon::prelude::*;
 #[cfg(all(test, feature = "code-intel"))]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use crate::code_intel_domain::{CapabilityCoverage, CapabilityCoverageStatus};
 use crate::graph::{EdgeKind, EdgeSource, KnowledgeGraph};
@@ -95,59 +95,108 @@ pub enum IndexedSourceFreshnessError {
 }
 
 #[cfg(all(test, feature = "code-intel"))]
-static TEST_HASH_DELAY_ENABLED: AtomicBool = AtomicBool::new(false);
-#[cfg(all(test, feature = "code-intel"))]
-static TEST_HASHES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-#[cfg(all(test, feature = "code-intel"))]
-static TEST_MAX_HASHES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+#[derive(Default)]
+struct TestHashProbe {
+    delay: bool,
+    in_flight: usize,
+    max_in_flight: usize,
+}
 
 #[cfg(all(test, feature = "code-intel"))]
-struct TestHashFlightGuard;
+fn test_hash_probes() -> &'static Mutex<HashMap<PathBuf, TestHashProbe>> {
+    static PROBES: OnceLock<Mutex<HashMap<PathBuf, TestHashProbe>>> = OnceLock::new();
+    PROBES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(all(test, feature = "code-intel"))]
+struct TestHashFlightGuard {
+    root: Option<PathBuf>,
+}
 
 #[cfg(all(test, feature = "code-intel"))]
 struct TestHashDelayGuard {
-    previous: bool,
+    root: PathBuf,
 }
 
 #[cfg(all(test, feature = "code-intel"))]
 impl TestHashDelayGuard {
-    fn enable() -> Self {
-        Self {
-            previous: TEST_HASH_DELAY_ENABLED.swap(true, Ordering::SeqCst),
-        }
+    fn enable(root: &Path) -> Self {
+        let root = root.to_path_buf();
+        let previous = test_hash_probes()
+            .lock()
+            .expect("source-hash probe state")
+            .insert(
+                root.clone(),
+                TestHashProbe {
+                    delay: true,
+                    ..TestHashProbe::default()
+                },
+            );
+        assert!(previous.is_none(), "duplicate source-hash probe root");
+        Self { root }
     }
 }
 
 #[cfg(all(test, feature = "code-intel"))]
 impl Drop for TestHashDelayGuard {
     fn drop(&mut self) {
-        TEST_HASH_DELAY_ENABLED.store(self.previous, Ordering::SeqCst);
+        test_hash_probes()
+            .lock()
+            .expect("source-hash probe state")
+            .remove(&self.root);
     }
 }
 
 #[cfg(all(test, feature = "code-intel"))]
 impl TestHashFlightGuard {
-    fn enter() -> Self {
-        let in_flight = TEST_HASHES_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
-        TEST_MAX_HASHES_IN_FLIGHT.fetch_max(in_flight, Ordering::SeqCst);
-        if TEST_HASH_DELAY_ENABLED.load(Ordering::SeqCst) {
+    fn enter(root: &Path) -> Self {
+        let delay = {
+            let mut probes = test_hash_probes().lock().expect("source-hash probe state");
+            let Some(probe) = probes.get_mut(root) else {
+                return Self { root: None };
+            };
+            probe.in_flight = probe.in_flight.saturating_add(1);
+            probe.max_in_flight = probe.max_in_flight.max(probe.in_flight);
+            let delay = probe.delay;
+            drop(probes);
+            delay
+        };
+        if delay {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        Self
+        Self {
+            root: Some(root.to_path_buf()),
+        }
     }
 }
 
 #[cfg(all(test, feature = "code-intel"))]
 impl Drop for TestHashFlightGuard {
     fn drop(&mut self) {
-        TEST_HASHES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        let Some(root) = &self.root else {
+            return;
+        };
+        let mut probes = test_hash_probes().lock().expect("source-hash probe state");
+        if let Some(probe) = probes.get_mut(root) {
+            probe.in_flight = probe.in_flight.saturating_sub(1);
+        }
+        drop(probes);
     }
 }
 
+#[cfg(all(test, feature = "code-intel"))]
+fn test_hash_max_in_flight(root: &Path) -> usize {
+    test_hash_probes()
+        .lock()
+        .expect("source-hash probe state")
+        .get(root)
+        .map_or(0, |probe| probe.max_in_flight)
+}
+
 #[cfg(feature = "code-intel")]
-fn read_source_digest(path: &Path) -> Result<String, std::io::Error> {
+fn read_source_digest(_root: &Path, path: &Path) -> Result<String, std::io::Error> {
     #[cfg(test)]
-    let _flight = TestHashFlightGuard::enter();
+    let _flight = TestHashFlightGuard::enter(_root);
     let bytes = std::fs::read(path)?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
@@ -377,7 +426,7 @@ pub fn check_indexed_source_freshness(
         .collect::<Vec<_>>()
         .into_par_iter()
         .map(|(relative, path)| {
-            let digest = read_source_digest(&path);
+            let digest = read_source_digest(workspace, &path);
             (relative, path, digest)
         })
         .collect::<Vec<_>>();
@@ -926,9 +975,7 @@ mod tests {
             ));
         }
 
-        TEST_HASHES_IN_FLIGHT.store(0, Ordering::SeqCst);
-        TEST_MAX_HASHES_IN_FLIGHT.store(0, Ordering::SeqCst);
-        let _delay = TestHashDelayGuard::enable();
+        let _delay = TestHashDelayGuard::enable(dir.path());
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(4)
             .build()
@@ -940,7 +987,7 @@ mod tests {
 
         assert_eq!(verdict, StalenessVerdict::Fresh);
         assert!(
-            TEST_MAX_HASHES_IN_FLIGHT.load(Ordering::SeqCst) > 1,
+            test_hash_max_in_flight(dir.path()) > 1,
             "positive multi-thread control must observe overlapping independent file hashes"
         );
     }

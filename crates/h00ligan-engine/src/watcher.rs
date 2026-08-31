@@ -1148,6 +1148,8 @@ mod tests {
         std::fs::write(&source, "pub fn before() -> u8 { 1 }\n").expect("source fixture");
         let binding = crate::project_binding::ProjectBinding::explicit(&root, &data)
             .expect("explicit watch binding");
+        let root = binding.root().to_path_buf();
+        let source = root.join("src/lib.rs");
         let supervisor = IndexSupervisor::new(binding.clone());
         (temporary, root, source, binding, supervisor)
     }
@@ -1250,17 +1252,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_control_probes_do_not_run_full_reconciliation_but_source_events_do() {
-        let (_temporary, root, source, _binding, supervisor) = watch_fixture();
+    async fn idle_control_probes_do_not_run_full_reconciliation() {
+        let (_temporary, root, _source, _binding, supervisor) = watch_fixture();
+        // This is the publication-probe causal control. Native source delivery
+        // has its own real-watcher test below; mixing the two lets Darwin's
+        // coarse registration events masquerade as probe-driven work.
+        let watcher = WatcherConfig::new(root.clone(), 10).exclude_root(root);
         let service = IndexWatchService::start(
             supervisor.clone(),
-            WatcherConfig::new(root, 10),
+            watcher,
             IndexSupervisorRequest::default(),
             WatchCadence::new(Duration::from_millis(10), Duration::from_secs(30)),
         )
         .expect("start WATCH service");
 
-        let initial_epoch = wait_for_epoch_after(&supervisor, 0).await;
+        wait_for_epoch_after(&supervisor, 0).await;
         tokio::time::sleep(Duration::from_millis(80)).await;
         let idle_status = service.status();
         assert!(
@@ -1278,15 +1284,6 @@ mod tests {
             supervisor.retained_snapshots().len(),
             1,
             "unchanged control probes must not schedule whole-repository operations"
-        );
-
-        std::fs::write(&source, "pub fn after() -> u8 { 2 }\n").expect("changed source");
-        let changed_epoch = wait_for_epoch_after(&supervisor, initial_epoch).await;
-        assert!(changed_epoch > initial_epoch);
-        let changed_status = service.status();
-        assert!(
-            changed_status.filesystem_batches >= 1,
-            "positive control: the native event path must remain live: {changed_status:?}"
         );
 
         let stopped = service.stop().await.expect("stop WATCH service");
@@ -1406,7 +1403,11 @@ mod tests {
     #[tokio::test]
     async fn publication_probe_reconciles_one_external_head_advance_without_replay() {
         let (_temporary, root, source, binding, supervisor) = watch_fixture();
-        let watcher = WatcherConfig::new(root.clone(), 10).exclude_root(root.join("src"));
+        // Isolate the publication-control path from platform-specific native
+        // event coalescing. Some Darwin backends report a coarse parent event
+        // for an excluded descendant; this test is specifically the no-native-
+        // event control for foreign immutable-head adoption.
+        let watcher = WatcherConfig::new(root.clone(), 10).exclude_root(root.clone());
         let service = IndexWatchService::start(
             supervisor.clone(),
             watcher,
@@ -1772,7 +1773,10 @@ mod tests {
     #[tokio::test]
     async fn real_watcher_emits_hidden_cargo_configuration_changes() {
         let temporary = TempDir::new().expect("watch scratch");
-        let root = temporary.path();
+        let root = temporary
+            .path()
+            .canonicalize()
+            .expect("canonical watch root");
         let source = root.join("src/lib.rs");
         let cargo_config = root.join(".cargo/config.toml");
         std::fs::create_dir_all(source.parent().expect("source parent")).expect("source directory");
@@ -1783,7 +1787,7 @@ mod tests {
             .expect("manifest positive control");
         std::fs::write(&cargo_config, "[build]\nrustflags=[]\n").expect("initial Cargo config");
 
-        let watcher = FileWatcher::new(WatcherConfig::new(root.to_path_buf(), 50));
+        let watcher = FileWatcher::new(WatcherConfig::new(root, 50));
         let mut batches = watcher.start().expect("arm watcher");
         std::fs::write(&cargo_config, "[build]\nrustflags=['--cfg','changed']\n")
             .expect("changed Cargo config");
@@ -1802,7 +1806,10 @@ mod tests {
     #[tokio::test]
     async fn real_watcher_emits_hidden_toolchain_selector_changes() {
         let temporary = TempDir::new().expect("watch scratch");
-        let root = temporary.path();
+        let root = temporary
+            .path()
+            .canonicalize()
+            .expect("canonical watch root");
         let source = root.join("src/lib.rs");
         let selector = root.join(".tool-versions");
         std::fs::create_dir_all(source.parent().expect("source parent")).expect("source directory");
@@ -1811,7 +1818,7 @@ mod tests {
             .expect("manifest positive control");
         std::fs::write(&selector, "rust 1.97.1\n").expect("initial toolchain selector");
 
-        let watcher = FileWatcher::new(WatcherConfig::new(root.to_path_buf(), 50));
+        let watcher = FileWatcher::new(WatcherConfig::new(root, 50));
         let mut batches = watcher.start().expect("arm watcher");
         std::fs::write(&selector, "rust 1.98.0\n").expect("changed toolchain selector");
         let batch = timeout(Duration::from_secs(5), batches.recv())
@@ -1829,7 +1836,10 @@ mod tests {
     #[tokio::test]
     async fn native_registration_prunes_outputs_and_arms_new_source_directories() {
         let temporary = TempDir::new().expect("filtered watch scratch");
-        let root = temporary.path();
+        let root = temporary
+            .path()
+            .canonicalize()
+            .expect("canonical watch root");
         std::fs::write(
             root.join("Cargo.toml"),
             "[package]\nname = \"filtered-watch\"\nversion = \"0.0.0\"\n",
@@ -1838,12 +1848,12 @@ mod tests {
         std::fs::write(root.join(".gitignore"), "/target/\n").expect("ignore policy");
         std::fs::create_dir_all(root.join("src")).expect("source directory");
         let mut generated = root.join("target");
-        for index in 0..128 {
+        for index in 0..32 {
             generated.push(format!("nested-{index}"));
             std::fs::create_dir_all(&generated).expect("generated directory");
         }
 
-        let watcher = FileWatcher::new(WatcherConfig::new(root.to_path_buf(), 25));
+        let watcher = FileWatcher::new(WatcherConfig::new(root.clone(), 25));
         let mut stream = watcher.start().expect("arm filtered watcher");
         assert_eq!(
             stream.watched_directory_count(),

@@ -1418,6 +1418,11 @@ mod tests {
         std::fs::set_permissions(path, permissions).expect("make tool executable");
     }
 
+    fn canonical_fixture_path(path: PathBuf) -> PathBuf {
+        std::fs::canonicalize(&path)
+            .unwrap_or_else(|error| panic!("canonicalize fixture path {}: {error}", path.display()))
+    }
+
     fn system_resolver(environment: BTreeMap<String, String>) -> SystemToolchainResolver {
         SystemToolchainResolver::from_captured(
             CapturedSystemToolchain {
@@ -1958,6 +1963,11 @@ mod tests {
         ] {
             std::fs::create_dir_all(directory).expect("toolchain fixture directory");
         }
+        let alpha_root = canonical_fixture_path(alpha_root);
+        let beta_root = canonical_fixture_path(beta_root);
+        let launcher_bin = canonical_fixture_path(launcher_bin);
+        let alpha_sysroot = canonical_fixture_path(alpha_sysroot);
+        let beta_sysroot = canonical_fixture_path(beta_sysroot);
 
         write_tool(
             &launcher_bin.join("rustc"),
@@ -2050,6 +2060,11 @@ mod tests {
         ] {
             std::fs::create_dir_all(directory).expect("Go selector fixture directory");
         }
+        let alpha_root = canonical_fixture_path(alpha_root);
+        let beta_root = canonical_fixture_path(beta_root);
+        let launcher_bin = canonical_fixture_path(launcher_bin);
+        let alpha_goroot = canonical_fixture_path(alpha_goroot);
+        let beta_goroot = canonical_fixture_path(beta_goroot);
         write_tool(
             &launcher_bin.join("go"),
             &format!(
