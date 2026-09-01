@@ -1226,7 +1226,9 @@ mod tests {
             "1.97.1",
             crate::code_intel_domain::CapabilityScope::Language {
                 language_id: crate::code_intel_domain::LanguageId::new("rust"),
-                configuration_id: crate::code_intel_domain::ConfigurationId::new("calls-v8"),
+                configuration_id: crate::code_intel_domain::ConfigurationId::new(
+                    crate::code_intel_domain::CALLS_CONFIGURATION_ID,
+                ),
             },
             "f".repeat(64),
         );
@@ -1271,7 +1273,9 @@ mod tests {
                                 crate::code_intel_domain::CapabilityScope::Language {
                                     language_id: crate::code_intel_domain::LanguageId::new("rust"),
                                     configuration_id:
-                                        crate::code_intel_domain::ConfigurationId::new("calls-v8"),
+                                        crate::code_intel_domain::ConfigurationId::new(
+                                            crate::code_intel_domain::CALLS_CONFIGURATION_ID,
+                                        ),
                                 },
                                 "e".repeat(64),
                             ),

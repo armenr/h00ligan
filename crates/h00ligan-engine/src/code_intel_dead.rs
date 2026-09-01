@@ -1,6 +1,6 @@
 //! Authority-qualified dead-code candidates over one immutable generation.
 //!
-//! Dead v1 deliberately separates two populations that the legacy surface
+//! Dead v2 deliberately separates two populations that the earlier surface
 //! conflated. Callable liveness is monotonically reconciled with the canonical
 //! provider Calls graph. Non-callable structural candidates remain visible, but
 //! carry a qualified verdict and never inherit callable or deletion authority.
@@ -15,15 +15,15 @@ use crate::code_intel_callable_liveness::{
     capability_applies_to as callable_liveness_applies_to,
 };
 use crate::code_intel_calls::{
-    ExactCapabilityAuthority, PublishedCallsGraph, assess_calls_capability,
+    ExactCapabilityAuthority, ExecutionRootClass, PublishedCallsGraph, assess_calls_capability,
     required_calls_documents_for_project_unit,
 };
 use crate::code_intel_cursor::{page_window, request_digest};
 use crate::code_intel_domain::{
     AuthorityStatus, CapabilityCoverage, CapabilityCoverageStatus, CapabilityQualification,
-    DomainError, GenerationId, LIVE_INPUT_RESULT_RESERVE_CHARS, LanguageCapabilityCoverage,
-    LanguageId, Page, ProjectInventoryCoverage, ProjectUnitId, RepositoryBinding, UnitGraph,
-    assess_structural_graph_capability,
+    DomainError, ExecutionRootContext, GenerationId, LanguageCapabilityCoverage, LanguageId,
+    MAX_GENERATION_ENGINE_RESULT_CHARS, Page, ProjectInventoryCoverage, ProjectUnitId,
+    RepositoryBinding, UnitGraph, assess_structural_graph_capability,
 };
 use crate::code_intel_inventory::project_unit_graph;
 use crate::code_intel_publication::ResolvedGeneration;
@@ -38,13 +38,12 @@ use crate::structural_ir::{
     SymbolKind, SymbolRole, symbol_is_executable_callable_declaration, symbol_kind_has_role,
 };
 
-pub const DEAD_SCHEMA_VERSION: &str = "h00/code-intel/dead/v1";
+pub const DEAD_SCHEMA_VERSION: &str = "h00/code-intel/dead/v2";
 pub const DEFAULT_DEAD_PAGE_SIZE: usize = 50;
 pub const MAX_DEAD_PAGE_SIZE: usize = 100;
 pub const MAX_DEAD_SYMBOL_BYTES: usize = 4_096;
 pub const MAX_DEAD_FILE_BYTES: usize = 4_096;
 pub const MAX_DEAD_CURSOR_BYTES: usize = 8_192;
-pub const MAX_DEAD_RESULT_CHARS: usize = 28_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeadRequest {
@@ -265,12 +264,16 @@ struct CallableLiveness {
     excluded: BTreeMap<Uuid, Vec<String>>,
     production: BTreeSet<Uuid>,
     tests: BTreeSet<Uuid>,
+    qualified_production: BTreeSet<Uuid>,
+    qualified_tests: BTreeSet<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProjectUnitCallableVerdict {
     LiveProduction,
     LiveTest,
+    QualifiedLiveProduction,
+    QualifiedLiveTest,
     RetainedTest,
     Unreached,
     Unknown,
@@ -290,9 +293,14 @@ pub(crate) struct ProjectUnitCallableLiveness {
 impl ProjectUnitCallableLiveness {
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.items
-            .iter()
-            .all(|item| item.verdict != ProjectUnitCallableVerdict::Unknown)
+        self.items.iter().all(|item| {
+            !matches!(
+                item.verdict,
+                ProjectUnitCallableVerdict::Unknown
+                    | ProjectUnitCallableVerdict::QualifiedLiveProduction
+                    | ProjectUnitCallableVerdict::QualifiedLiveTest
+            )
+        })
     }
 
     #[must_use]
@@ -394,6 +402,7 @@ pub fn query_published_dead(
     if let Some(target) = selected {
         languages.retain(|language| *language == language_id_for_path(&target.file_path));
     }
+    let selected_languages = languages.clone();
 
     let mut liveness = BTreeMap::new();
     let mut missing_liveness_basis = BTreeMap::new();
@@ -594,12 +603,14 @@ pub fn query_published_dead(
     let callable_population_complete = language_authorities
         .iter()
         .all(|language| language.status == DeadEvidenceStatus::Complete);
-    let inventory_complete = generation.project_inventory.coverage
-        == ProjectInventoryCoverage::IndexedSourcePopulationComplete;
-    let structural_complete = structural_coverage
-        .languages
-        .iter()
-        .all(|language| language.status == CapabilityCoverageStatus::Complete);
+    let inventory_coverage = generation
+        .project_inventory
+        .coverage_for_languages(&selected_languages);
+    let inventory_complete =
+        inventory_coverage == ProjectInventoryCoverage::IndexedSourcePopulationComplete;
+    let structural_complete = selected_languages.iter().all(|language| {
+        structural_coverage.language_status(&language.0) == Some(CapabilityCoverageStatus::Complete)
+    });
     let population_complete = callable_population_complete
         && inventory_complete
         && structural_complete
@@ -616,7 +627,7 @@ pub fn query_published_dead(
         callable_liveness: selected_callable_liveness_coverage
             .unwrap_or(callable_liveness_coverage),
         structural_graph: structural_coverage,
-        project_inventory_coverage: generation.project_inventory.coverage,
+        project_inventory_coverage: inventory_coverage,
         reachability_evidence_schema: reachability.schema.clone(),
         callable_population_complete,
         structural_candidates_qualified,
@@ -681,15 +692,15 @@ pub fn query_published_dead(
             .chars()
             .count();
         smallest_result_chars = result_chars;
-        if result_chars <= MAX_DEAD_RESULT_CHARS - LIVE_INPUT_RESULT_RESERVE_CHARS {
+        if result_chars <= MAX_GENERATION_ENGINE_RESULT_CHARS {
             return Ok(result);
         }
     }
-    Err(invalid_request(
-        "limit",
-        format!(
-            "even a one-item Dead page would contain {smallest_result_chars} serialized characters and cannot leave room for required live-input evidence within the {MAX_DEAD_RESULT_CHARS}-character product bound"
-        ),
+    Err(DomainError::result_too_large(
+        "dead",
+        smallest_result_chars,
+        MAX_GENERATION_ENGINE_RESULT_CHARS,
+        "Narrow the symbol, file, or candidate scope; required Dead authority and summary metadata do not fit even when the page limit is one",
     ))
 }
 
@@ -1085,6 +1096,8 @@ fn reconcile_provider_callable_liveness(published: &PublishedCallableLiveness) -
         excluded,
         production,
         tests,
+        qualified_production: BTreeSet::new(),
+        qualified_tests: BTreeSet::new(),
     }
 }
 
@@ -1149,9 +1162,50 @@ fn reconcile_callable_liveness(
             production_seeds.insert(structural.memory_id);
         }
     }
-    let production = forward_reachable(graph, calls, &production_seeds, required_documents);
+    let root_targets = |class, context| {
+        calls
+            .root_invocation_target_ids(class, context)
+            .into_iter()
+            .filter(|node_id| {
+                graph
+                    .node(node_id)
+                    .is_some_and(|node| required_documents.contains(&node.file_path))
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    production_seeds.extend(root_targets(
+        ExecutionRootClass::Production,
+        ExecutionRootContext::ModuleInitialization,
+    ));
+    test_seeds.extend(root_targets(
+        ExecutionRootClass::Test,
+        ExecutionRootContext::ModuleInitialization,
+    ));
+    let qualified_production_seeds = root_targets(
+        ExecutionRootClass::Production,
+        ExecutionRootContext::AnonymousCallable,
+    );
+    let qualified_test_seeds = root_targets(
+        ExecutionRootClass::Test,
+        ExecutionRootContext::AnonymousCallable,
+    );
+
+    let mut production = forward_reachable(graph, calls, &production_seeds, required_documents);
+    let mut qualified_production = forward_reachable(
+        graph,
+        calls,
+        &qualified_production_seeds,
+        required_documents,
+    );
+    qualified_production.retain(|node_id| !production.contains(node_id));
+    production.extend(qualified_production.iter().copied());
+
     let mut tests = forward_reachable(graph, calls, &test_seeds, required_documents);
     tests.retain(|node_id| !production.contains(node_id));
+    let mut qualified_tests =
+        forward_reachable(graph, calls, &qualified_test_seeds, required_documents);
+    qualified_tests.retain(|node_id| !production.contains(node_id) && !tests.contains(node_id));
+    tests.extend(qualified_tests.iter().copied());
     (
         CallableLiveness {
             basis: DeadEvidenceBasis::ProviderCallsReconciled,
@@ -1162,6 +1216,8 @@ fn reconcile_callable_liveness(
             excluded,
             production,
             tests,
+            qualified_production,
+            qualified_tests,
         },
         unjoined_source_callables,
     )
@@ -1175,10 +1231,18 @@ fn project_unit_callable_verdict(
         return ProjectUnitCallableVerdict::Unknown;
     }
     if liveness.production.contains(&node.memory_id) {
-        return ProjectUnitCallableVerdict::LiveProduction;
+        return if liveness.qualified_production.contains(&node.memory_id) {
+            ProjectUnitCallableVerdict::QualifiedLiveProduction
+        } else {
+            ProjectUnitCallableVerdict::LiveProduction
+        };
     }
     if liveness.tests.contains(&node.memory_id) {
-        return ProjectUnitCallableVerdict::LiveTest;
+        return if liveness.qualified_tests.contains(&node.memory_id) {
+            ProjectUnitCallableVerdict::QualifiedLiveTest
+        } else {
+            ProjectUnitCallableVerdict::LiveTest
+        };
     }
     if node.reachability_class == ReachabilityClass::TestOnly && node_is_test_population(node) {
         return ProjectUnitCallableVerdict::RetainedTest;
@@ -1304,40 +1368,70 @@ fn dead_item(
             });
         }
         if language_liveness.production.contains(&node.memory_id) {
-            let reason = match language_liveness.basis {
-                DeadEvidenceBasis::ProviderCallableLiveness => {
-                    "compiler-native whole-program analysis reaches this callable from a retained production or public-API root"
-                }
-                DeadEvidenceBasis::ProviderCallsReconciled
-                | DeadEvidenceBasis::PersistedStructuralReachability => {
-                    "a provider-resolved invocation and callable-value binding path reaches this callable from a retained production root"
-                }
+            let qualified = language_liveness
+                .qualified_production
+                .contains(&node.memory_id);
+            let (status, reason_code, reason) = if qualified {
+                (
+                    DeadEvidenceStatus::Qualified,
+                    "reached_from_anonymous_production_callable",
+                    "a provider-resolved path reaches this callable from an anonymous production callable; the symbol remains conservatively live, but execution depends on that anonymous callable running",
+                )
+            } else {
+                (
+                    DeadEvidenceStatus::Complete,
+                    "reached_from_retained_production_root",
+                    match language_liveness.basis {
+                        DeadEvidenceBasis::ProviderCallableLiveness => {
+                            "compiler-native whole-program analysis reaches this callable from a retained production or public-API root"
+                        }
+                        DeadEvidenceBasis::ProviderCallsReconciled
+                        | DeadEvidenceBasis::PersistedStructuralReachability => {
+                            "a provider-resolved invocation and callable-value binding path reaches this callable from a retained production root"
+                        }
+                    },
+                )
             };
             return Ok(live_item(
                 symbol,
                 persisted,
                 DeadVerdict::LiveProduction,
                 language_liveness.basis,
-                "reached_from_retained_production_root",
+                status,
+                reason_code,
                 reason,
             ));
         }
         if language_liveness.tests.contains(&node.memory_id) {
-            let reason = match language_liveness.basis {
-                DeadEvidenceBasis::ProviderCallableLiveness => {
-                    "compiler-native whole-program analysis reaches this callable from a retained test root"
-                }
-                DeadEvidenceBasis::ProviderCallsReconciled
-                | DeadEvidenceBasis::PersistedStructuralReachability => {
-                    "a provider-resolved invocation and callable-value binding path reaches this callable from a persisted test root"
-                }
+            let qualified = language_liveness.qualified_tests.contains(&node.memory_id);
+            let (status, reason_code, reason) = if qualified {
+                (
+                    DeadEvidenceStatus::Qualified,
+                    "reached_from_anonymous_test_callable",
+                    "a provider-resolved path reaches this callable from an anonymous test callable; the symbol remains conservatively test-live, but execution depends on that anonymous callable running",
+                )
+            } else {
+                (
+                    DeadEvidenceStatus::Complete,
+                    "reached_from_test_root",
+                    match language_liveness.basis {
+                        DeadEvidenceBasis::ProviderCallableLiveness => {
+                            "compiler-native whole-program analysis reaches this callable from a retained test root"
+                        }
+                        DeadEvidenceBasis::ProviderCallsReconciled
+                        | DeadEvidenceBasis::PersistedStructuralReachability => {
+                            "a provider-resolved invocation and callable-value binding path reaches this callable from a persisted test root"
+                        }
+                    },
+                )
             };
             return Ok(live_item(
                 symbol,
                 persisted,
                 DeadVerdict::LiveTest,
                 language_liveness.basis,
-                "reached_from_test_root",
+                status,
+                reason_code,
                 reason,
             ));
         }
@@ -1514,6 +1608,7 @@ fn live_item(
     persisted: ReachabilityClass,
     verdict: DeadVerdict,
     basis: DeadEvidenceBasis,
+    status: DeadEvidenceStatus,
     reason_code: &str,
     reason: &str,
 ) -> DeadItem {
@@ -1525,7 +1620,7 @@ fn live_item(
         reachable_from_retained_root: Some(true),
         recommendation: DeadRecommendation::Keep,
         evidence: DeadItemEvidence {
-            status: DeadEvidenceStatus::Complete,
+            status,
             basis,
             reason_code: reason_code.into(),
             reason: reason.into(),
@@ -1638,4 +1733,86 @@ fn invalid_request(field: &'static str, reason: impl Into<String>) -> DomainErro
 
 const fn invalid_generation(reason: String) -> DomainError {
     DomainError::PublishedGenerationInvalid { reason }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_root_invocation_seeds_callable_liveness_without_a_structural_root() {
+        let fixture = crate::code_intel_calls::tests::fixture_with_production_root_invocation();
+        let calls = PublishedCallsGraph::build(
+            &fixture.graph,
+            &fixture.generation,
+            &LanguageId::new("rust"),
+        )
+        .expect("published Calls graph");
+        let target = fixture.graph.node_by_name("target").expect("target node");
+        let (liveness, unjoined) = reconcile_callable_liveness(
+            &fixture.graph,
+            &calls,
+            &LanguageId::new("rust"),
+            &CallableRootSets::default(),
+            calls.required_source_documents(),
+        );
+
+        assert_eq!(unjoined, 0);
+        assert!(liveness.mapped.contains(&target.memory_id));
+        assert!(
+            liveness.production.contains(&target.memory_id),
+            "an exact production root invocation must retain its structural callee"
+        );
+        assert!(
+            !liveness.qualified_production.contains(&target.memory_id),
+            "module initialization is an unconditional source execution root"
+        );
+        assert!(!liveness.tests.contains(&target.memory_id));
+    }
+
+    #[test]
+    fn anonymous_callable_root_retains_liveness_without_claiming_unconditional_execution() {
+        let fixture = crate::code_intel_calls::tests::fixture_with_root_invocation(
+            ExecutionRootContext::AnonymousCallable,
+        );
+        let calls = PublishedCallsGraph::build(
+            &fixture.graph,
+            &fixture.generation,
+            &LanguageId::new("rust"),
+        )
+        .expect("published Calls graph");
+        let target = fixture.graph.node_by_name("target").expect("target node");
+        let (liveness, unjoined) = reconcile_callable_liveness(
+            &fixture.graph,
+            &calls,
+            &LanguageId::new("rust"),
+            &CallableRootSets::default(),
+            calls.required_source_documents(),
+        );
+
+        assert_eq!(unjoined, 0);
+        assert!(
+            liveness.production.contains(&target.memory_id),
+            "anonymous-callable evidence must conservatively prevent a false-dead claim"
+        );
+        assert!(
+            liveness.qualified_production.contains(&target.memory_id),
+            "positive control: anonymous execution is conditional"
+        );
+        let item = dead_item(
+            &fixture.graph,
+            &fixture.generation,
+            target,
+            &BTreeMap::from([(LanguageId::new("rust"), liveness)]),
+            &BTreeMap::new(),
+        )
+        .expect("qualified Dead item");
+        assert_eq!(item.verdict, DeadVerdict::LiveProduction);
+        assert_eq!(item.recommendation, DeadRecommendation::Keep);
+        assert_eq!(item.evidence.status, DeadEvidenceStatus::Qualified);
+        assert_eq!(
+            item.evidence.reason_code,
+            "reached_from_anonymous_production_callable"
+        );
+    }
 }

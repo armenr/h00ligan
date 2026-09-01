@@ -15,7 +15,10 @@ use super::common::{
     SymbolFacts, code_symbol, node_text, parse_tree_with_recovery_admission, simple_type_target,
     unquoted_name,
 };
-use super::{LanguageExtractor, NamedCallForm, NamedCallSyntax};
+use super::{
+    LanguageExtractor, NamedCallForm, NamedCallSyntax, NamedCallableSyntax,
+    named_declaration_callable_syntax,
+};
 use crate::structural_ir::{
     CodeSymbol, ExtractorError, ExtractorOutput, StructuralCaptureGap, StructuralRelation,
     SymbolKind, Visibility,
@@ -26,6 +29,10 @@ pub struct TypeScriptExtractor;
 impl LanguageExtractor for TypeScriptExtractor {
     fn language(&self) -> &'static str {
         "typescript"
+    }
+
+    fn source_file_is_test(&self, file_path: &str) -> bool {
+        typescript_test_file(file_path)
     }
 
     fn ts_language_for_path(&self, file_path: &str) -> tree_sitter::Language {
@@ -63,6 +70,41 @@ impl LanguageExtractor for TypeScriptExtractor {
         ]
     }
 
+    fn anonymous_callable_declaration_kinds(&self) -> &'static [&'static str] {
+        &[
+            "arrow_function",
+            "function_expression",
+            "generator_function",
+        ]
+    }
+
+    fn named_callable_syntax(&self, name: Node<'_>) -> Option<NamedCallableSyntax> {
+        if let Some(declarator) = name.parent().filter(|node| {
+            node.kind() == "variable_declarator"
+                && node
+                    .child_by_field_name("name")
+                    .is_some_and(|candidate| candidate.byte_range() == name.byte_range())
+        }) && declarator
+            .child_by_field_name("value")
+            .is_some_and(|value| {
+                matches!(
+                    value.kind(),
+                    "arrow_function" | "function_expression" | "generator_function"
+                )
+            })
+        {
+            let declaration = declarator.parent().unwrap_or(declarator);
+            let extent = declaration_extent(declaration);
+            return Some(NamedCallableSyntax {
+                extent: (extent.start_byte(), extent.end_byte()),
+                has_body: true,
+                is_package_function: false,
+                structural_target: typescript_callable_binding_is_structural(declarator),
+            });
+        }
+        named_declaration_callable_syntax(self, name)
+    }
+
     fn named_call_syntax<'tree>(&self, call: Node<'tree>) -> Option<NamedCallSyntax<'tree>> {
         if call.kind() != "call_expression" {
             return None;
@@ -92,6 +134,26 @@ impl LanguageExtractor for TypeScriptExtractor {
     fn extract(&self, source: &str, file_path: &str) -> Result<ExtractorOutput, ExtractorError> {
         extract_typescript_symbols(source, file_path)
     }
+}
+
+fn typescript_callable_binding_is_structural(declarator: Node<'_>) -> bool {
+    let mut ancestor = declarator.parent();
+    while let Some(node) = ancestor {
+        if matches!(
+            node.kind(),
+            "function_declaration"
+                | "generator_function_declaration"
+                | "function_expression"
+                | "generator_function"
+                | "arrow_function"
+                | "method_definition"
+                | "class_static_block"
+        ) {
+            return false;
+        }
+        ancestor = node.parent();
+    }
+    true
 }
 
 fn typescript_call_target(function: Node<'_>) -> Option<NamedCallSyntax<'_>> {
@@ -2028,6 +2090,16 @@ fn typescript_test_file(file_path: &str) -> bool {
         ".spec.mjs",
         ".test.cjs",
         ".spec.cjs",
+        ".e2e.ts",
+        ".e2e.tsx",
+        ".e2e.js",
+        ".e2e.jsx",
+        ".e2e.mjs",
+        ".e2e.cjs",
+        ".stories.ts",
+        ".stories.tsx",
+        ".stories.js",
+        ".stories.jsx",
     ]
     .iter()
     .any(|suffix| file_name.ends_with(suffix))

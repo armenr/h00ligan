@@ -28,6 +28,7 @@ const (
 	h00MaxAttachmentBytes            = h00provider.MaxAttachmentBytes
 	h00MaxTotalAttachmentBytes       = h00provider.MaxTotalAttachmentBytes
 	h00MaxDocumentPaths              = h00provider.MaxDocumentPaths
+	h00MaxSemanticInputPaths         = h00provider.MaxSemanticInputPaths
 	h00MaxOutstandingRequests        = h00provider.MaxOutstandingRequests
 )
 

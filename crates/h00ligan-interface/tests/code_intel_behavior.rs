@@ -179,7 +179,7 @@ async fn type_uses_graph_lines_without_a_memory_backend() {
         .execute("type", serde_json::json!({"symbol": "Widget"}), &ctx)
         .await
         .expect("type result");
-    assert_eq!(result["schema_version"], "h00/code-intel/type/v1");
+    assert_eq!(result["schema_version"], "h00/code-intel/type/v2");
     assert_eq!(result["resolved_type"]["document_path"], "src/lib.rs");
     assert_eq!(result["resolved_type"]["start_line"], 2);
     assert_eq!(result["resolved_type"]["end_line"], 4);

@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use h00ligan_provider_protocol::{
     H00_PYREFLY_IMPLEMENTATION_V1, H00_PYREFLY_LANGUAGE, H00_PYREFLY_PROVIDER_ID,
-    H00_TYPESCRIPT_IMPLEMENTATION_V1, H00_TYPESCRIPT_LANGUAGE, H00_TYPESCRIPT_PROVIDER_ID,
+    H00_TYPESCRIPT_IMPLEMENTATION_V2, H00_TYPESCRIPT_LANGUAGE, H00_TYPESCRIPT_PROVIDER_ID,
     ProviderFrameLimits, ProviderIdentity, ProviderSemanticInputs, ProviderSourceComponent,
     SEMANTIC_PROVIDER_CACHE_DIR_ENV, pyrefly_source_components, sha256_hex,
     typescript_source_components, validate_provider_identity,
@@ -67,7 +67,7 @@ pub(crate) const TYPESCRIPT_WORKSPACE_PROVIDER: WorkspaceSemanticProviderDescrip
         language: H00_TYPESCRIPT_LANGUAGE,
         ecosystem: "node",
         provider_id: H00_TYPESCRIPT_PROVIDER_ID,
-        implementation_version: H00_TYPESCRIPT_IMPLEMENTATION_V1,
+        implementation_version: H00_TYPESCRIPT_IMPLEMENTATION_V2,
         source_components: typescript_source_components,
         operation_label: "persistent TypeScript native",
     };

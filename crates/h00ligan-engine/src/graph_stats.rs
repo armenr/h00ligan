@@ -239,7 +239,9 @@ pub fn compute_graph_stats(graph: &KnowledgeGraph) -> GraphStats {
     let edges = graph.all_edges();
     let mut kind_counts: HashMap<String, usize> = HashMap::new();
     for (_, _, edge) in &edges {
-        *kind_counts.entry(format!("{:?}", edge.kind)).or_default() += 1;
+        *kind_counts
+            .entry(edge.kind.as_str().to_owned())
+            .or_default() += 1;
     }
 
     GraphStats {
@@ -492,6 +494,24 @@ pub const CALLS_QUALIFIED_GUIDANCE: &str = "Calls results are exact within provi
 pub struct CapabilityCoverageGuidance {
     pub action_needed: bool,
     pub message: String,
+}
+
+/// Explain an indexed population that has structural facts but no
+/// authoritative reachability classification.
+///
+/// This is independent of whether the semantic capability census has an
+/// applicable provider scope: loose or auxiliary source must not disappear
+/// merely because it cannot authorize a provider execution root.
+#[must_use]
+pub fn unclassified_population_guidance(
+    unclassified_node_count: usize,
+) -> Option<CapabilityCoverageGuidance> {
+    (unclassified_node_count > 0).then(|| CapabilityCoverageGuidance {
+        action_needed: true,
+        message: format!(
+            "this indexed generation has {unclassified_node_count} unclassified graph node(s); resolve their project ownership or capability evidence, then publish a new semantic generation. Re-running the same unchanged indexing request cannot improve this state"
+        ),
+    })
 }
 
 /// Distinguish an actionable provider/configuration failure from a stable

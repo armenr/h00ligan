@@ -31,7 +31,14 @@ fn call_mcp(
             "jsonrpc": "2.0",
             "id": id,
             "method": "tools/call",
-            "params": {"name": name, "arguments": arguments},
+            "params": {
+                "name": name,
+                "arguments": arguments,
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": h00ligan_interface::mcp::CURRENT_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            },
         })
     )
     .expect("write MCP request");
@@ -540,9 +547,11 @@ fn installed_one_file_cli_and_mcp_share_exact_semantic_authority() {
     );
     assert_eq!(calls["authority"]["status"], "complete", "{calls}");
     assert!(
-        calls["items"]
-            .as_array()
-            .is_some_and(|items| { items.iter().any(|item| item["caller"]["name"] == "caller") }),
+        calls["items"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["origin"]["identity"]["name"] == "caller")
+        }),
         "MCP Calls omitted the known caller: {calls}"
     );
 
@@ -554,6 +563,145 @@ fn installed_one_file_cli_and_mcp_share_exact_semantic_authority() {
     assert!(
         !root.join("target").exists(),
         "provider cache escaped into the project root"
+    );
+}
+
+struct InstalledLinkedWorktreeFixture {
+    root: PathBuf,
+    data_dir: PathBuf,
+}
+
+fn installed_linked_worktree_fixture(
+    temporary: &TempDir,
+    reciprocal_gitdir: bool,
+) -> InstalledLinkedWorktreeFixture {
+    let root = temporary.path().join("worktree");
+    let common_git = temporary.path().join("main/.git");
+    let worktree_git = common_git.join("worktrees/fixture");
+    let branch_ref = common_git.join("refs/heads/fixture");
+    let data_dir = temporary.path().join("data");
+    std::fs::create_dir_all(root.join("src")).expect("source directory");
+    std::fs::create_dir_all(branch_ref.parent().expect("branch-ref parent"))
+        .expect("common refs directory");
+    std::fs::create_dir_all(&worktree_git).expect("worktree git directory");
+    std::fs::write(
+        root.join(".git"),
+        format!("gitdir: {}\n", worktree_git.display()),
+    )
+    .expect("linked-worktree marker");
+    std::fs::write(worktree_git.join("commondir"), "../..\n").expect("common-dir pointer");
+    if reciprocal_gitdir {
+        std::fs::write(
+            worktree_git.join("gitdir"),
+            format!("{}\n", root.join(".git").display()),
+        )
+        .expect("reciprocal worktree pointer");
+    }
+    std::fs::write(worktree_git.join("HEAD"), "ref: refs/heads/fixture\n").expect("worktree HEAD");
+    std::fs::write(&branch_ref, format!("{}\n", "1".repeat(40))).expect("shared branch ref");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"linked-worktree\"\nversion = \"0.1.0\"\nedition = \"2024\"\nbuild = \"build.rs\"\n\n[workspace]\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        root.join("build.rs"),
+        format!(
+            "fn main() {{\n    let branch_ref = std::path::Path::new({:?});\n    println!(\"cargo:rerun-if-changed={{}}\", branch_ref.display());\n}}\n",
+            branch_ref.to_str().expect("UTF-8 branch ref")
+        ),
+    )
+    .expect("build script");
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn target() -> usize { 1 }\npub fn caller() -> usize { target() }\n",
+    )
+    .expect("source");
+
+    InstalledLinkedWorktreeFixture { root, data_dir }
+}
+
+/// FALSIFIER for linked Git worktrees: Cargo build scripts may legitimately
+/// declare the worktree's per-checkout HEAD or the shared common ref as an
+/// input. Those files live outside the checked-out source root. The installed
+/// product must bind them through Git's own reciprocal `.git`/`gitdir` and
+/// `commondir` control plane while refusing unrelated machine-external inputs.
+#[test]
+#[ignore = "requires H00_TEST_H00LIGAN_BINARY and an installed Rust toolchain"]
+fn installed_rust_linked_worktree_git_inputs_remain_complete() {
+    let binary = PathBuf::from(
+        std::env::var_os("H00_TEST_H00LIGAN_BINARY")
+            .expect("H00_TEST_H00LIGAN_BINARY for linked-worktree acceptance"),
+    );
+    let temporary = TempDir::new().expect("linked-worktree scratch workspace");
+    let fixture = installed_linked_worktree_fixture(&temporary, true);
+
+    let indexed = index_with_semantics(&binary, &fixture.root, &fixture.data_dir);
+    assert_eq!(
+        indexed["capabilities"]["calls"]["status"], "complete",
+        "linked-worktree Git inputs must retain Complete Calls authority: {indexed}"
+    );
+    assert!(
+        !fixture.root.join("Cargo.lock").exists(),
+        "indexing wrote Cargo.lock"
+    );
+    assert!(
+        !fixture.root.join("target").exists(),
+        "provider cache escaped into the worktree"
+    );
+}
+
+/// RIGHT-REASON REGRESSION: a repository-controlled `.git` file alone cannot
+/// grant semantic-input authority over an arbitrary external directory. Git's
+/// per-worktree `gitdir` file must point back to that exact repository marker.
+#[test]
+#[ignore = "requires H00_TEST_H00LIGAN_BINARY and an installed Rust toolchain"]
+fn installed_rust_linked_worktree_refuses_nonreciprocal_git_authority() {
+    let binary = PathBuf::from(
+        std::env::var_os("H00_TEST_H00LIGAN_BINARY")
+            .expect("H00_TEST_H00LIGAN_BINARY for linked-worktree refusal"),
+    );
+    let temporary = TempDir::new().expect("forged linked-worktree scratch workspace");
+    let fixture = installed_linked_worktree_fixture(&temporary, false);
+    let output = Command::new(&binary)
+        .args(["--root", fixture.root.to_str().expect("UTF-8 root")])
+        .args([
+            "--data-dir",
+            fixture.data_dir.to_str().expect("UTF-8 data directory"),
+        ])
+        .args([
+            "index",
+            "--scip",
+            "--require-complete-calls",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run installed semantic index against forged Git authority");
+    let diagnostic = format!(
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        !output.status.success(),
+        "a one-way linked-worktree pointer incorrectly earned Complete Calls authority: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("linked-worktree gitdir backpointer"),
+        "refusal did not identify the missing reciprocal authority proof: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("required complete Calls authority was not produced"),
+        "strict indexing did not preserve its typed terminal contract: {diagnostic}"
+    );
+    assert!(
+        !fixture.root.join("Cargo.lock").exists(),
+        "refusal wrote Cargo.lock"
+    );
+    assert!(
+        !fixture.root.join("target").exists(),
+        "refusal leaked provider state into the worktree"
     );
 }
 
@@ -676,9 +824,9 @@ fn installed_typescript_cli_and_mcp_need_no_ambient_toolchain() {
     assert_eq!(calls["generation_id"], generation, "{calls}");
     assert_eq!(calls["authority"]["status"], "complete", "{calls}");
     assert!(
-        calls["items"]
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| item["caller"]["name"] == "caller")),
+        calls["items"].as_array().is_some_and(|items| items
+            .iter()
+            .any(|item| item["origin"]["identity"]["name"] == "caller")),
         "TypeScript Calls omitted the cross-file caller: {calls}"
     );
     stop_mcp(child, stdin);
@@ -706,24 +854,31 @@ fn installed_python_cli_and_mcp_need_no_ambient_toolchain() {
     );
     let temporary = TempDir::new().expect("installed Python MCP scratch workspace");
     let root = temporary.path().join("repo");
+    let execution_root = root.join("apps/agents");
     let data_dir = temporary.path().join("data");
     let process_tmp = temporary.path().join("tmp");
-    std::fs::create_dir_all(root.join("src/fixture")).expect("Python source directory");
+    std::fs::create_dir_all(execution_root.join("src/fixture"))
+        .expect("nested Python source directory");
     std::fs::create_dir_all(&process_tmp).expect("private process temporary directory");
     std::fs::write(
-        root.join("pyproject.toml"),
+        execution_root.join("pyproject.toml"),
         r#"[project]
 name = "installed-python"
 version = "0.1.0"
 
-[tool.pyrefly]
-project_includes = ["src"]
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fixture"]
 "#,
     )
     .expect("Python project manifest");
-    std::fs::write(root.join("src/fixture/__init__.py"), "").expect("Python package marker");
+    std::fs::write(execution_root.join("src/fixture/__init__.py"), "")
+        .expect("Python package marker");
     std::fs::write(
-        root.join("src/fixture/target.py"),
+        execution_root.join("src/fixture/target.py"),
         concat!(
             "class Widget:\n",
             "    def __init__(self, value: int) -> None:\n",
@@ -735,31 +890,53 @@ project_includes = ["src"]
     )
     .expect("Python target source");
     std::fs::write(
-        root.join("src/fixture/caller.py"),
+        execution_root.join("src/fixture/dynamic_pb2.py"),
+        "globals()[\"AuditRecord\"] = type(\"AuditRecord\", (), {})\n",
+    )
+    .expect("Python dynamic runtime module");
+    std::fs::write(
+        execution_root.join("src/fixture/dynamic_pb2.pyi"),
+        concat!(
+            "class AuditRecord:\n",
+            "    def __init__(self, value: str = ...) -> None: ...\n",
+        ),
+    )
+    .expect("Python adjacent stub declaration");
+    std::fs::write(
+        execution_root.join("src/fixture/caller.py"),
         concat!(
             "from fixture.target import Widget, target\n",
+            "from fixture.dynamic_pb2 import AuditRecord\n",
             "\n",
-            "def caller() -> int:\n",
-            "    return target(Widget(40).value)\n",
+            "def caller() -> tuple[int, object]:\n",
+            "    return target(Widget(40).value), AuditRecord(value=\"ok\")\n",
         ),
     )
     .expect("Python caller source");
     let source_before = [
         (
-            "pyproject.toml",
-            std::fs::read(root.join("pyproject.toml")).unwrap(),
+            "apps/agents/pyproject.toml",
+            std::fs::read(execution_root.join("pyproject.toml")).unwrap(),
         ),
         (
-            "src/fixture/__init__.py",
-            std::fs::read(root.join("src/fixture/__init__.py")).unwrap(),
+            "apps/agents/src/fixture/__init__.py",
+            std::fs::read(execution_root.join("src/fixture/__init__.py")).unwrap(),
         ),
         (
-            "src/fixture/target.py",
-            std::fs::read(root.join("src/fixture/target.py")).unwrap(),
+            "apps/agents/src/fixture/target.py",
+            std::fs::read(execution_root.join("src/fixture/target.py")).unwrap(),
         ),
         (
-            "src/fixture/caller.py",
-            std::fs::read(root.join("src/fixture/caller.py")).unwrap(),
+            "apps/agents/src/fixture/dynamic_pb2.py",
+            std::fs::read(execution_root.join("src/fixture/dynamic_pb2.py")).unwrap(),
+        ),
+        (
+            "apps/agents/src/fixture/dynamic_pb2.pyi",
+            std::fs::read(execution_root.join("src/fixture/dynamic_pb2.pyi")).unwrap(),
+        ),
+        (
+            "apps/agents/src/fixture/caller.py",
+            std::fs::read(execution_root.join("src/fixture/caller.py")).unwrap(),
         ),
     ];
 
@@ -827,9 +1004,9 @@ project_includes = ["src"]
     assert_eq!(calls["generation_id"], generation, "{calls}");
     assert_eq!(calls["authority"]["status"], "complete", "{calls}");
     assert!(
-        calls["items"]
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| item["caller"]["name"] == "caller")),
+        calls["items"].as_array().is_some_and(|items| items
+            .iter()
+            .any(|item| item["origin"]["identity"]["name"] == "caller")),
         "Python Calls omitted the cross-file caller: {calls}"
     );
 
@@ -848,10 +1025,35 @@ project_includes = ["src"]
         "{construction}"
     );
     assert!(
-        construction["items"]
-            .as_array()
-            .is_some_and(|items| { items.iter().any(|item| item["caller"]["name"] == "caller") }),
+        construction["items"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["origin"]["identity"]["name"] == "caller")
+        }),
         "Python Calls omitted the cross-file class construction: {construction}"
+    );
+
+    id += 1;
+    let stub_construction_response = call_mcp(
+        &mut stdin,
+        &mut stdout,
+        id,
+        "calls",
+        json!({"symbol": "AuditRecord"}),
+    );
+    let stub_construction = structured_content(
+        &stub_construction_response,
+        "Python adjacent-stub class construction",
+    );
+    assert_eq!(stub_construction["generation_id"], generation);
+    assert_eq!(stub_construction["authority"]["status"], "complete");
+    assert!(
+        stub_construction["items"]
+            .as_array()
+            .is_some_and(|items| items
+                .iter()
+                .any(|item| item["origin"]["identity"]["name"] == "caller")),
+        "Python Calls omitted the adjacent-stub class construction: {stub_construction}"
     );
     stop_mcp(child, stdin);
 
@@ -863,6 +1065,7 @@ project_includes = ["src"]
         );
     }
     assert!(!root.join(".venv").exists());
+    assert!(!execution_root.join(".venv").exists());
     assert!(!root.join("__pycache__").exists());
 }
 
@@ -977,9 +1180,9 @@ fn installed_javascript_jsx_and_pnpm_share_exact_semantic_authority() {
     let calls = structured_content(&calls_response, "JavaScript/JSX calls");
     assert_eq!(calls["authority"]["status"], "complete", "{calls}");
     assert!(
-        calls["items"]
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| item["caller"]["name"] == "render")),
+        calls["items"].as_array().is_some_and(|items| items
+            .iter()
+            .any(|item| item["origin"]["identity"]["name"] == "render")),
         "JavaScript Calls omitted the JSX definition's caller: {calls}"
     );
     stop_mcp(child, stdin);

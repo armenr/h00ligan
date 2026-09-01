@@ -22,12 +22,13 @@ introduced merely to satisfy this decision.
 
 ## Semantic authority breadth
 
-### Managed Rust toolchains
+### Managed compiler toolchains
 
-Structural Rust indexing is self-contained; compiler-backed Rust Calls currently needs a
-repository-compatible Cargo/Rust toolchain. Decide whether h00ligan should detect only, recommend
-installation, or download verified toolchains into product-owned state. The answer must define
-consent, checksums/signatures, offline behavior, version drift, pruning, and rollback.
+Structural indexing is self-contained; compiler-backed Rust and Go Calls currently need a
+repository-compatible Cargo/Rust or Go toolchain, respectively. Decide whether h00ligan should
+detect only, recommend installation, or download verified toolchains into product-owned state.
+The answer must define consent, checksums/signatures, offline behavior, version drift, pruning,
+and rollback.
 
 ### Multiple build configurations
 

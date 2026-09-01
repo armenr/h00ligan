@@ -234,6 +234,9 @@ PROVIDER_BUILDER_FORBIDDEN_FRAGMENTS = (
 )
 
 PYREFLY_BUILDER_REQUIRED_FRAGMENTS = (
+    'default_target="x86_64-unknown-linux-musl"',
+    'default_target="aarch64-unknown-linux-musl"',
+    'target="${requested_target:-$default_target}"',
     'compilation_parent="$cache_root/compilation"',
     'compilation_root="$(mktemp -d "$compilation_parent/build.XXXXXX")"',
     'CARGO_TARGET_DIR="$compilation_root" cargo "+$rust_version" test',
@@ -241,11 +244,18 @@ PYREFLY_BUILDER_REQUIRED_FRAGMENTS = (
     'CARGO_TARGET_DIR="$compilation_root" cargo "+$rust_version" build',
     'rm -rf -- "$compilation_root"',
     'compilation_root=""',
+    'H00LIGAN_CACHE_LOCK_FD',
+    'locked-exec',
+    'verify-lock',
+    'prune_interrupted_cache_roots',
+    'prune_interrupted_invocation',
 )
 
 PYREFLY_BUILDER_FORBIDDEN_FRAGMENTS = (
     'CARGO_TARGET_DIR="$cache_root/tests/$source_key"',
     'build_target="$build_target/$target/$build_key"',
+    'source_lock="$source_root.lock"',
+    "Pyrefly stale source lock",
 )
 
 INSTALLED_GATE_REQUIRED_FRAGMENTS = (
@@ -259,6 +269,7 @@ INSTALLED_GATE_REQUIRED_FRAGMENTS = (
     "installed_go_callable_liveness_distinguishes_callback_dispatch_from_unreached_code",
     "installed_go_callable_liveness_normalizes_build_exclusions",
     "installed_one_file_cli_and_mcp_share_exact_semantic_authority",
+    "installed_rust_linked_worktree_refuses_nonreciprocal_git_authority",
     "installed_python_cli_and_mcp_need_no_ambient_toolchain",
     "installed_one_file",
     '"ps", "-ww", "-axo", "pid=,ppid=,pgid=,lstart=,args="',
@@ -274,6 +285,9 @@ INSTALLED_GATE_REQUIRED_FRAGMENTS = (
     "could not bind the resolved Rust source to its prepared cache",
     'python_compilation_cache="$repo_root/target/portable-cache/python-provider/compilation"',
     "Pyrefly provider retained compiler cache residue",
+    "Pyrefly provider accepted a forged inherited compiler lock",
+    "Pyrefly interrupted-cache residue positive control did not fire",
+    "Pyrefly provider retained interrupted cache residue after replay",
     "repeated Pyrefly provider build did not retain the exact artifact identity",
 )
 

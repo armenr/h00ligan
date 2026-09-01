@@ -12,14 +12,17 @@ use serde::Serialize;
 
 use crate::code_intel_domain::{CapabilityCoverage, GenerationId, RepositoryId};
 use crate::graph::KnowledgeGraph;
-use crate::graph_stats::{StalenessVerdict, compute_graph_stats, compute_reachability_summary};
+use crate::graph_stats::{
+    StalenessVerdict, compute_graph_stats, compute_reachability_summary,
+    unclassified_population_guidance,
+};
 use crate::graph_status::{
     ClassificationCurrencyStatus, ClassificationProvenance, classification_currency_status,
     status_verdict_with_calls_actionability,
 };
 use crate::graph_store::ClassifiedBy;
 
-pub const STATUS_SCHEMA_VERSION: &str = "h00/code-intel/status/v3";
+pub const STATUS_SCHEMA_VERSION: &str = "h00/code-intel/status/v4";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -98,7 +101,11 @@ pub struct StatusReachability {
     pub public_api: usize,
     pub structural: usize,
     pub test_only: usize,
-    pub dead: usize,
+    /// Aggregate dead-code count only when the immutable classification proof
+    /// is current, every callable language has complete Calls authority, no
+    /// node remains unclassified, and the generation is not incremental.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dead: Option<usize>,
     pub orphan: usize,
     pub unclassified: usize,
     pub suspected: usize,
@@ -225,17 +232,55 @@ pub fn status_result(observation: StatusObservation<'_>) -> ExactStatusResult {
             edge_kinds: stats.edge_kinds.into_iter().collect(),
         }
     });
+    let unclassified_node_count = reachability
+        .as_ref()
+        .map_or(0, |summary| summary.unclassified);
+    let calls_complete = observation.calls.all_callable_languages_complete();
+    let dead_authoritative = classification_currency.current == Some(true)
+        && calls_complete
+        && unclassified_node_count == 0
+        && !observation.incremental_drift;
     let reachability = reachability.map(|summary| StatusReachability {
         wired: summary.wired,
         public_api: summary.public_api,
         structural: summary.structural,
         test_only: summary.test_only,
-        dead: summary.dead,
+        dead: dead_authoritative.then_some(summary.dead),
         orphan: summary.orphan,
         unclassified: summary.unclassified,
         suspected: summary.suspected,
         excluded: summary.excluded,
     });
+    let authoritative_dead_requires = reachability.as_ref().and_then(|_| {
+        if dead_authoritative {
+            None
+        } else if unclassified_node_count > 0 {
+            Some(format!(
+                "reachability is unclassified for {unclassified_node_count} graph node{}",
+                if unclassified_node_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ))
+        } else if !calls_complete {
+            Some("complete Calls authority is unavailable".into())
+        } else if observation.incremental_drift {
+            Some("publish a fresh immutable generation".into())
+        } else {
+            Some("classification proof is not current".into())
+        }
+    });
+    let mut action_needed = verdict.action_needed;
+    let mut recommendation = verdict.recommendation;
+    if graph_loaded
+        && let Some(guidance) = unclassified_population_guidance(unclassified_node_count)
+    {
+        action_needed |= guidance.action_needed;
+        recommendation.push(' ');
+        recommendation.push_str(&guidance.message);
+        recommendation.push('.');
+    }
     let publication_state = if load_failed || origin_mismatch {
         PublicationState::Invalid
     } else if observation.generation_id.is_some() {
@@ -263,8 +308,8 @@ pub fn status_result(observation: StatusObservation<'_>) -> ExactStatusResult {
             .indexed_at
             .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs()),
-        action_needed: verdict.action_needed,
-        recommendation: verdict.recommendation,
+        action_needed,
+        recommendation,
         capabilities: StatusCapabilities {
             calls: observation.calls,
             callable_liveness: observation.callable_liveness,
@@ -276,9 +321,7 @@ pub fn status_result(observation: StatusObservation<'_>) -> ExactStatusResult {
         stats,
         reachability,
         index_mode: observation.incremental_drift.then(|| "incremental".into()),
-        authoritative_dead_requires: observation
-            .incremental_drift
-            .then(|| "publish a fresh immutable generation".into()),
+        authoritative_dead_requires,
         load_error: observation.load_error,
         origin_mismatch: observation.origin_mismatch,
     }
@@ -291,6 +334,169 @@ mod tests {
         CapabilityCoverageStatus, CapabilityEvidenceGap, CapabilityStatus,
         LanguageCapabilityCoverage, LanguageId,
     };
+    use crate::graph::{EntryRetainFlags, GraphNode};
+    use crate::reachability::ReachabilityClass;
+    use uuid::Uuid;
+
+    fn graph_with_callable(reachability_class: ReachabilityClass) -> KnowledgeGraph {
+        let mut graph = KnowledgeGraph::new();
+        graph
+            .add_node(GraphNode {
+                memory_id: Uuid::nil(),
+                symbol_name: "entry".into(),
+                kind: "function".into(),
+                file_path: "app.py".into(),
+                content_hash: "fixture".into(),
+                signature: "def entry()".into(),
+                reachability_class,
+                line_start: Some(0),
+                line_end: Some(0),
+                has_body: Some(true),
+                visibility: "public".into(),
+                is_test_only: Some(false),
+                is_test_root: false,
+                has_platform_cfg: false,
+                rustc_flagged_dead: false,
+                entry_retain: EntryRetainFlags::default(),
+                has_uncaptured_items: false,
+                oracle_receipt: None,
+            })
+            .expect("unclassified callable");
+        graph
+    }
+
+    fn graph_with_unclassified_callable() -> KnowledgeGraph {
+        graph_with_callable(ReachabilityClass::Unclassified)
+    }
+
+    /// RIGHT-REASON REGRESSION: a fresh immutable generation is not READY
+    /// merely because a project-inventory defect left its callable population
+    /// outside the semantic capability census. Re-running the same unchanged
+    /// index cannot classify that population, so Status must name the owning
+    /// project/capability seam rather than prescribe a blind indexing loop.
+    #[test]
+    fn fresh_unclassified_generation_is_actionable_without_blind_reindex_guidance() {
+        let graph = graph_with_unclassified_callable();
+        let result = status_result(StatusObservation {
+            root: Path::new("repo"),
+            graph_directory: Path::new("bundle"),
+            root_source: "explicit",
+            graph_source: "cli",
+            generation_id: Some(GenerationId::new("generation")),
+            repository_id: Some(RepositoryId::new("repository")),
+            graph: Some(&graph),
+            graph_exists: true,
+            load_error: None,
+            origin_mismatch: None,
+            freshness: StalenessVerdict::Fresh,
+            indexed_at: None,
+            incremental_drift: false,
+            calls: CapabilityCoverage {
+                capability_id: "calls".into(),
+                status: CapabilityCoverageStatus::NotApplicable,
+                languages: Vec::new(),
+            },
+            callable_liveness: CapabilityCoverage {
+                capability_id: "callable_liveness".into(),
+                status: CapabilityCoverageStatus::NotApplicable,
+                languages: Vec::new(),
+            },
+            classified_by: None,
+            classification_authority_available: false,
+        });
+
+        assert_eq!(
+            result.reachability.as_ref().map(|value| value.unclassified),
+            Some(1),
+            "positive control: one callable is genuinely unclassified"
+        );
+        let machine = serde_json::to_value(&result).expect("serialize exact Status result");
+        assert!(
+            machine["reachability"].get("dead").is_none(),
+            "an unclassified machine result must not expose a numeric aggregate dead fact: {machine}"
+        );
+        assert!(
+            result.action_needed,
+            "an unclassified callable is not READY"
+        );
+        assert!(result.recommendation.contains("project ownership"));
+        assert!(result.recommendation.contains("capability evidence"));
+        assert!(
+            !result.recommendation.contains("run `h00ligan index` first"),
+            "the generation already exists and is fresh"
+        );
+    }
+
+    #[test]
+    fn structured_dead_requires_complete_calls_and_current_classification() {
+        let graph = graph_with_callable(ReachabilityClass::Dead);
+        let classified_by = ClassifiedBy::now();
+        let status = |calls| {
+            status_result(StatusObservation {
+                root: Path::new("repo"),
+                graph_directory: Path::new("bundle"),
+                root_source: "explicit",
+                graph_source: "cli",
+                generation_id: Some(GenerationId::new("generation")),
+                repository_id: Some(RepositoryId::new("repository")),
+                graph: Some(&graph),
+                graph_exists: true,
+                load_error: None,
+                origin_mismatch: None,
+                freshness: StalenessVerdict::Fresh,
+                indexed_at: None,
+                incremental_drift: false,
+                calls,
+                callable_liveness: CapabilityCoverage {
+                    capability_id: "callable_liveness".into(),
+                    status: CapabilityCoverageStatus::NotApplicable,
+                    languages: Vec::new(),
+                },
+                classified_by: Some(&classified_by),
+                classification_authority_available: true,
+            })
+        };
+
+        let partial = status(CapabilityCoverage {
+            capability_id: "calls".into(),
+            status: CapabilityCoverageStatus::Partial,
+            languages: vec![LanguageCapabilityCoverage {
+                language_id: LanguageId::new("rust"),
+                status: CapabilityCoverageStatus::Unavailable,
+                provider_id: None,
+                gaps: Vec::new(),
+                qualifications: Vec::new(),
+            }],
+        });
+        assert_eq!(partial.classification_currency.current, Some(true));
+        assert_eq!(
+            partial.reachability.as_ref().and_then(|value| value.dead),
+            None,
+            "current structural classification cannot replace missing negative Calls authority"
+        );
+        assert_eq!(
+            partial.authoritative_dead_requires.as_deref(),
+            Some("complete Calls authority is unavailable")
+        );
+
+        let complete = status(CapabilityCoverage {
+            capability_id: "calls".into(),
+            status: CapabilityCoverageStatus::Complete,
+            languages: vec![LanguageCapabilityCoverage {
+                language_id: LanguageId::new("rust"),
+                status: CapabilityCoverageStatus::Complete,
+                provider_id: None,
+                gaps: Vec::new(),
+                qualifications: Vec::new(),
+            }],
+        });
+        assert_eq!(
+            complete.reachability.as_ref().and_then(|value| value.dead),
+            Some(1),
+            "complete Calls plus current classification must retain the measured count"
+        );
+        assert!(complete.authoritative_dead_requires.is_none());
+    }
 
     #[test]
     fn unavailable_loose_source_language_is_informational_after_best_effort_indexing() {

@@ -177,13 +177,13 @@ direct forward dependencies from direct dependents crossing one indexed file
 or directory boundary; its authority reports structural, Calls, and project-dependency
 coverage independently. It is not a transitive blast-radius query—use `assess`
 for symbol-level change impact. `overview` returns the
-versioned `h00/code-intel/overview/v2` result: structural project topology is
+versioned `h00/code-intel/overview/v4` result: structural project topology is
 always visible, while per-unit reachability health and mixed Calls/FieldOf
 fan-in are `null` unless that language unit has complete Calls authority. Its
 aggregate dead-code count remains unknown when any callable language is
 uncovered. `health_action_needed` and `health_guidance` distinguish repairable
 provider failures from stable loose-source limitations. `audit` returns the
-versioned `h00/code-intel/audit/v1` result over the same immutable generation.
+versioned `h00/code-intel/audit/v2` result over the same immutable generation.
 Its default `production` scope ranks incoming coupling without letting test
 callers or test-only targets manufacture production hotspots; `conditional`,
 `tests`, and `all` expose the other populations deliberately. Provider Calls,
@@ -270,9 +270,12 @@ Rust, Go, Python, and TypeScript/JavaScript. Users do not install `scip-go`,
 hidden same-executable provider entrypoint. The other providers are
 content-addressed private artifacts materialized beneath the selected data
 directory; they are implementation details, not separately installed products.
-Go, Python, and TypeScript/JavaScript installed-product acceptance runs with no
-ambient language toolchain. Rust semantic loading currently still requires a
-repository-compatible Cargo/Rust toolchain; structural Rust indexing does not.
+Installed-product acceptance for Python and TypeScript/JavaScript runs with no
+ambient language toolchain. Compiler-backed semantic loading for Go and Rust
+currently requires a repository-compatible Go or Cargo/Rust toolchain,
+respectively. h00ligan resolves and fingerprints those project toolchains; it
+does not require a separately installed Go or Rust provider. Structural indexing
+for all four languages does not require those project compiler toolchains.
 
 `h00ligan status` reports provider coverage per language after publication.
 Human indexing output names the active structural/provider/publication phase and

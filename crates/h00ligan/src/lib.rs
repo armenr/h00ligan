@@ -43,6 +43,7 @@ pub mod error;
 pub mod graph_cmd;
 pub mod index_cmd;
 pub mod ligan_cmd;
+mod output;
 pub mod product;
 pub mod runtime;
 pub mod toolchain;

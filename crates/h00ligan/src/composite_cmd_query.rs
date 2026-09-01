@@ -10,21 +10,20 @@ use h00ligan_engine::code_intel_dependencies::{
     ExactDependenciesResult, validate_dependencies_limit, validate_dependencies_path,
 };
 use h00ligan_engine::code_intel_diff::{
-    DEFAULT_DIFF_LIMIT, DiffRequest, ExactDiffResult, query_live_diff, validate_diff_request,
+    DEFAULT_DIFF_LIMIT, DiffRequest, ExactDiffResult, validate_diff_request,
 };
 use h00ligan_engine::code_intel_find::{
     DEFAULT_FIND_PAGE_SIZE, ExactFindResult, FindMode, FindRequest, MAX_FIND_PAGE_SIZE,
     validate_find_request,
 };
 use h00ligan_engine::code_intel_source_search::{
-    DEFAULT_SOURCE_SEARCH_LIMIT, ExactSourceSearchResult, SourceSearchOptions, SourceSearchRequest,
-    bind_source_search_result, validate_source_search_request,
+    DEFAULT_SOURCE_SEARCH_LIMIT, ExactSourceSearchResult, SourceSearchRequest,
+    validate_source_search_request,
 };
 use h00ligan_engine::code_intel_status::{AvailabilityStatus, ExactStatusResult, FreshnessStatus};
 #[cfg(test)]
 use h00ligan_engine::graph_status::status_verdict;
 use h00ligan_engine::project_binding::ProjectBinding;
-use h00ligan_engine::source_search::{SourcePattern, search_registered_source};
 
 use crate::error::LiganError;
 use crate::graph_cmd::load_indexed_graph_snapshot;
@@ -54,11 +53,7 @@ pub async fn run_status(args: StatusArgs, binding: &ProjectBinding) -> Result<()
 
     match format {
         OutputFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&result)
-                    .map_err(|error| LiganError::Config(error.to_string()))?
-            );
+            crate::output::print_machine_json(&result)?;
         }
         OutputFormat::Text => {
             print!("{}", render_status_text(&result));
@@ -127,7 +122,7 @@ fn render_status_text(result: &ExactStatusResult) -> String {
         let _ = writeln!(out);
         for gap in &language.gaps {
             if gap.reason_code != "provider_not_requested" {
-                let _ = writeln!(out, "      {}", gap.reason);
+                let _ = writeln!(out, "      {}: {}", gap.reason_code, gap.reason);
             }
         }
         for qualification in &language.qualifications {
@@ -159,7 +154,7 @@ fn render_status_text(result: &ExactStatusResult) -> String {
             }
             let _ = writeln!(out);
             for gap in &language.gaps {
-                let _ = writeln!(out, "      {}", gap.reason);
+                let _ = writeln!(out, "      {}: {}", gap.reason_code, gap.reason);
             }
             for qualification in &language.qualifications {
                 let _ = writeln!(
@@ -236,12 +231,16 @@ fn render_status_text(result: &ExactStatusResult) -> String {
                 format_count(reachability.structural),
                 format_count(reachability.test_only)
             );
-            if calls.all_callable_languages_complete() {
-                let _ = writeln!(out, "  Dead: {}", format_count(reachability.dead));
+            if let Some(dead) = reachability.dead {
+                let _ = writeln!(out, "  Dead: {}", format_count(dead));
             } else {
                 let _ = writeln!(
                     out,
-                    "  Dead: unknown — complete Calls authority is unavailable"
+                    "  Dead: unknown — {}",
+                    result
+                        .authoritative_dead_requires
+                        .as_deref()
+                        .unwrap_or("authoritative classification evidence is unavailable")
                 );
             }
             if reachability.unclassified > 0 {
@@ -414,39 +413,14 @@ pub async fn run_find(args: FindArgs, binding: &ProjectBinding) -> Result<(), Li
         limit: args.limit,
         cursor: args.cursor,
     };
-    if let Err(error) = validate_find_request(&request) {
-        if format == OutputFormat::Json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&error.envelope())
-                    .map_err(|serialize| LiganError::Config(serialize.to_string()))?
-            );
-        }
-        return Err(error.into());
-    }
+    validate_find_request(&request)?;
     let snapshot = h00ligan_interface::CodeIntelSnapshot::load(binding)
         .await
         .map_err(|error| LiganError::Config(error.to_string()))?;
-    let result = match snapshot.query_find(binding, &request).await {
-        Ok(result) => result,
-        Err(error) => {
-            if format == OutputFormat::Json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&error.envelope())
-                        .map_err(|serialize| LiganError::Config(serialize.to_string()))?
-                );
-            }
-            return Err(error.into());
-        }
-    };
+    let result = snapshot.query_find(binding, &request).await?;
 
     if format == OutputFormat::Json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result)
-                .map_err(|error| LiganError::Config(error.to_string()))?
-        );
+        crate::output::print_machine_json(&result)?;
     } else {
         render_find(&result);
     }
@@ -607,11 +581,7 @@ pub async fn run_deps(args: DepsArgs, binding: &ProjectBinding) -> Result<(), Li
         .await?;
 
     match format {
-        OutputFormat::Json => println!(
-            "{}",
-            serde_json::to_string_pretty(&result)
-                .map_err(|error| LiganError::Config(error.to_string()))?
-        ),
+        OutputFormat::Json => crate::output::print_machine_json(&result)?,
         OutputFormat::Text => print!("{}", render_dependencies_text(&result)),
     }
 
@@ -739,38 +709,14 @@ pub async fn run_diff(args: DiffArgs, binding: &ProjectBinding) -> Result<(), Li
     };
     validate_diff_request(&request)?;
     let format = parse_format(&args.format)?;
-    let (graph, snapshot) = load_indexed_graph_snapshot(binding).await?;
-    let generation = snapshot.immutable_generation().cloned().ok_or_else(|| {
-        LiganError::Config(
-            "diff requires a validated immutable generation; run `h00ligan index`".into(),
-        )
-    })?;
-    let indexed_sources = snapshot.indexed_sources.clone();
-
-    // Extraction and ignore-aware discovery are blocking. Both adapters enter
-    // this same engine use case, which owns admission, observation, authority,
-    // global bounds, and the versioned result.
-    let query_binding = binding.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let indexed_sources = indexed_sources.authority();
-        query_live_diff(
-            &graph,
-            &generation,
-            &query_binding,
-            indexed_sources,
-            request,
-        )
-    })
-    .await
-    .map_err(|error| LiganError::Join(format!("diff task: {error}")))?
-    .map_err(LiganError::Domain)?;
+    let (_graph, snapshot) = load_indexed_graph_snapshot(binding).await?;
+    let result = snapshot
+        .query_diff(binding, &request)
+        .await
+        .map_err(LiganError::Domain)?;
 
     match format {
-        OutputFormat::Json => println!(
-            "{}",
-            serde_json::to_string_pretty(&result)
-                .map_err(|error| LiganError::Config(error.to_string()))?
-        ),
+        OutputFormat::Json => crate::output::print_machine_json(&result)?,
         OutputFormat::Text => print!("{}", render_diff_text(&result)),
     }
 
@@ -898,70 +844,18 @@ pub async fn run_grep_context(
     binding: &ProjectBinding,
 ) -> Result<(), LiganError> {
     let format = parse_format(&args.format)?;
-    let root = binding.root().to_path_buf();
-    let search_root = match args.path.as_deref() {
-        Some(path) => binding.resolve_existing_path(std::path::Path::new(path))?,
-        None => root.clone(),
-    };
-    let relative_path = search_root
-        .strip_prefix(&root)
-        .map_err(|error| LiganError::Config(format!("search path is outside root: {error}")))?
-        .to_string_lossy()
-        .replace('\\', "/");
     let request = SourceSearchRequest {
         pattern: args.pattern,
-        path: if relative_path.is_empty() {
-            ".".into()
-        } else {
-            relative_path
-        },
+        path: args.path.unwrap_or_else(|| ".".into()),
         context_lines: args.context_lines,
         limit: args.limit,
     };
     validate_source_search_request(&request)?;
-    let (graph, snapshot) = load_indexed_graph_snapshot(binding).await?;
-    let generation = snapshot.immutable_generation().ok_or_else(|| {
-        LiganError::Config(
-            "grep-context requires a validated immutable generation; run `h00ligan index`".into(),
-        )
-    })?;
-
-    // Shared in-process, ignore-aware search; no host command dependency.
-    let search_binding = binding.clone();
-    let search_pattern = request.pattern.clone();
-    let search_limit = request.limit;
-    let context_lines = request.context_lines;
-    let search_report = tokio::task::spawn_blocking(move || {
-        search_registered_source(
-            &search_binding,
-            &search_root,
-            SourcePattern::Regex(&search_pattern),
-            SourceSearchOptions {
-                max_matches: search_limit,
-                max_matches_per_file: search_limit,
-                context_lines,
-            },
-        )
-    })
-    .await
-    .map_err(|e| LiganError::Join(format!("grep task: {e}")))?
-    .map_err(|e| LiganError::Config(format!("grep failed: {e}")))?;
-    let indexed_sources = snapshot.indexed_sources.files();
-    let result = bind_source_search_result(
-        &graph,
-        generation,
-        binding,
-        indexed_sources,
-        request,
-        search_report,
-    )?;
+    let (_graph, snapshot) = load_indexed_graph_snapshot(binding).await?;
+    let result = snapshot.query_source_search(binding, &request).await?;
 
     match format {
-        OutputFormat::Json => println!(
-            "{}",
-            serde_json::to_string_pretty(&result)
-                .map_err(|error| LiganError::Config(error.to_string()))?
-        ),
+        OutputFormat::Json => crate::output::print_machine_json(&result)?,
         OutputFormat::Text => print!("{}", render_source_search_text(&result)),
     }
 
@@ -1135,7 +1029,7 @@ mod tests {
             ClassificationCurrencyStatus, ClassificationProvenance,
         };
 
-        let result = ExactStatusResult {
+        let mut result = ExactStatusResult {
             schema_version: h00ligan_engine::code_intel_status::STATUS_SCHEMA_VERSION.into(),
             generation_id: None,
             repository_id: None,
@@ -1198,14 +1092,14 @@ mod tests {
                 public_api: 1_568,
                 structural: 5_689,
                 test_only: 4_605,
-                dead: 3_043,
+                dead: None,
                 orphan: 0,
                 unclassified: 0,
                 suspected: 1_790,
                 excluded: 41,
             }),
             index_mode: None,
-            authoritative_dead_requires: None,
+            authoritative_dead_requires: Some("complete Calls authority is unavailable".into()),
             load_error: None,
             origin_mismatch: None,
         };
@@ -1222,124 +1116,52 @@ mod tests {
         assert!(!text.contains("Dead: 3,043"));
         assert!(text.contains("16,741 nodes · 16,531 edges"));
         assert!(!text.contains("Unix seconds"));
-    }
 
-    // ------------------------------------------------------------------
-    // CI-IND-02 / ADR-0031: shared source-search coverage.
-    // ------------------------------------------------------------------
+        let gap = result.capabilities.calls.languages[0]
+            .gaps
+            .first_mut()
+            .expect("provider gap fixture");
+        gap.reason_code = "provider_health_unresolved_imports".into();
+        gap.reason = "module resolution excluded unresolved imports".into();
+        let typed_failure_text = render_status_text(&result);
+        assert!(typed_failure_text.contains("provider_health_unresolved_imports"));
+        assert!(typed_failure_text.contains("module resolution excluded unresolved imports"));
 
-    /// Test A: requesting context lines yields the neighbouring lines around
-    /// a match (RED on HEAD — `grep_files` had no context parameter and the
-    /// `Searcher` was built with zero context).
-    #[test]
-    fn grep_files_honors_context_lines() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let file = dir.path().join("multi.rs");
-        std::fs::write(
-            &file,
-            "line_one_before\nTARGET_MATCH_HERE\nline_three_after\n",
-        )
-        .expect("write");
-        let binding = ProjectBinding::explicit(dir.path(), &dir.path().join(".test-graph"))
-            .expect("test binding");
+        // Positive control for the independent classification axis: a
+        // callable population can remain unclassified even when the capability
+        // census incorrectly says Calls is not applicable.
+        result.capabilities.calls = CapabilityCoverage {
+            capability_id: "calls".into(),
+            status: CapabilityCoverageStatus::NotApplicable,
+            languages: Vec::new(),
+        };
+        let reachability = result.reachability.as_mut().expect("reachability fixture");
+        reachability.dead = None;
+        reachability.unclassified = 7;
+        result.authoritative_dead_requires =
+            Some("reachability is unclassified for 7 graph nodes".into());
+        let unclassified_text = render_status_text(&result);
+        assert!(unclassified_text.contains("Dead: unknown"));
+        assert!(!unclassified_text.contains("Dead: 0"));
+        assert!(unclassified_text.contains("Unclassified: 7"));
 
-        let report = search_registered_source(
-            &binding,
-            dir.path(),
-            SourcePattern::Regex("TARGET_MATCH_HERE"),
-            SourceSearchOptions {
-                max_matches: 50,
-                max_matches_per_file: 50,
-                context_lines: 1,
-            },
-        )
-        .expect("source search should succeed");
-
-        let texts: Vec<&str> = report
-            .records
-            .iter()
-            .map(|record| record.line_text.as_str())
-            .collect();
-        let joined = texts.join("");
+        result.capabilities.calls = CapabilityCoverage {
+            capability_id: "calls".into(),
+            status: CapabilityCoverageStatus::Complete,
+            languages: vec![LanguageCapabilityCoverage {
+                language_id: LanguageId::new("rust"),
+                status: CapabilityCoverageStatus::Complete,
+                provider_id: Some(ProviderId::new("rust-analyzer-scip")),
+                gaps: Vec::new(),
+                qualifications: Vec::new(),
+            }],
+        };
+        let classified_gap_text = render_status_text(&result);
         assert!(
-            joined.contains("line_one_before"),
-            "context above the match (N-1) should be returned, got: {texts:?}"
+            classified_gap_text
+                .contains("Dead: unknown — reachability is unclassified for 7 graph nodes")
         );
-        assert!(
-            joined.contains("TARGET_MATCH_HERE"),
-            "the matching line should be returned, got: {texts:?}"
-        );
-        assert!(
-            joined.contains("line_three_after"),
-            "context below the match (N+1) should be returned, got: {texts:?}"
-        );
-    }
-
-    /// Test B: the registry's non-Rust language is searched while unrelated
-    /// text formats remain outside this source-aware capability.
-    #[test]
-    fn source_search_includes_go_not_unregistered_text() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("main.go"), "func NEEDLE_VALUE() {}\n").expect("write go");
-        std::fs::write(dir.path().join("README.md"), "# Has NEEDLE_VALUE here\n")
-            .expect("write md");
-        let binding = ProjectBinding::explicit(dir.path(), &dir.path().join(".test-graph"))
-            .expect("test binding");
-
-        let report = search_registered_source(
-            &binding,
-            dir.path(),
-            SourcePattern::Regex("NEEDLE_VALUE"),
-            SourceSearchOptions {
-                max_matches: 50,
-                max_matches_per_file: 50,
-                context_lines: 0,
-            },
-        )
-        .expect("source search");
-
-        let paths: Vec<&str> = report
-            .records
-            .iter()
-            .map(|record| record.file_path.as_str())
-            .collect();
-        assert!(
-            paths.iter().any(|path| path.ends_with("main.go")),
-            "match inside registered Go source should be returned, got: {paths:?}"
-        );
-        assert!(
-            !paths.iter().any(|path| path.ends_with("README.md")),
-            "unregistered prose must not leak into source-aware grep, got: {paths:?}"
-        );
-    }
-
-    /// Test C: a pattern spanning two lines (multiline regex) matches (RED on
-    /// HEAD — the line-oriented sink had no multiline mode, so a cross-line
-    /// pattern matched nothing).
-    #[test]
-    fn grep_files_supports_multiline_pattern() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let file = dir.path().join("span.rs");
-        std::fs::write(&file, "fn start_marker() {\n    end_marker();\n}\n").expect("write");
-        let binding = ProjectBinding::explicit(dir.path(), &dir.path().join(".test-graph"))
-            .expect("test binding");
-
-        let report = search_registered_source(
-            &binding,
-            dir.path(),
-            SourcePattern::Regex("(?s)start_marker.*end_marker"),
-            SourceSearchOptions {
-                max_matches: 50,
-                max_matches_per_file: 50,
-                context_lines: 0,
-            },
-        )
-        .expect("source search");
-
-        assert!(
-            report.matches_returned > 0,
-            "an across-line pattern should produce >= 1 match, got: {report:?}"
-        );
+        assert!(!classified_gap_text.contains("complete Calls authority is unavailable"));
     }
 
     // =======================================================================

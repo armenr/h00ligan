@@ -30,8 +30,8 @@ use crate::code_intel_calls::{
 use crate::code_intel_cancellation::IndexCancellation;
 use crate::code_intel_domain::{
     CALLS_CONFIGURATION_ID, CapabilityCoverageStatus, CapabilityReceipt, CapabilityScope,
-    CapabilityStatus, ConfigurationId, LanguageId, ProjectInventory, ProjectInventoryCoverage,
-    STRUCTURAL_GRAPH_CONFIGURATION_ID, sort_capability_receipts,
+    CapabilityStatus, ConfigurationId, EcosystemId, LanguageId, ProjectInventory,
+    ProjectInventoryCoverage, STRUCTURAL_GRAPH_CONFIGURATION_ID, sort_capability_receipts,
 };
 use crate::code_intel_inventory::{
     InventorySource, build_project_inventory, go_execution_root_inventory_fingerprints,
@@ -1481,6 +1481,7 @@ async fn run_persistent_semantic_provider_lane(
             if cancellation.is_cancelled() {
                 return Err(IndexPipelineError::Cancelled);
             }
+            let failure = error.immutable_failure_evidence();
             let provider_duration = provider_started.elapsed();
             let refresh_timings = record_semantic_provider_activity(
                 &mut outcome.refreshes,
@@ -1519,10 +1520,8 @@ async fn run_persistent_semantic_provider_lane(
                         configuration_id: ConfigurationId::new(CALLS_CONFIGURATION_ID),
                     },
                     None,
-                    "provider_failed_or_unavailable",
-                    format!(
-                        "the persistent h00ligan {language} provider failed its authority or health contract; weaker one-shot authority was refused"
-                    ),
+                    failure.reason_code,
+                    failure.reason,
                 ),
                 payload: None,
             });
@@ -2432,8 +2431,8 @@ fn go_cross_process_reuse_is_bounded(
     inventory: &ProjectInventory,
     toolchains: &BTreeMap<PathBuf, ResolvedToolchain>,
 ) -> bool {
-    if inventory.coverage != ProjectInventoryCoverage::IndexedSourcePopulationComplete
-        || !inventory.issues.is_empty()
+    if inventory.coverage_for_provider(&LanguageId::new("go"), &EcosystemId::new("go"))
+        != ProjectInventoryCoverage::IndexedSourcePopulationComplete
         || toolchains.is_empty()
     {
         return false;
@@ -5313,6 +5312,202 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[derive(Debug, Clone, Copy)]
+    enum ProviderFailureFixture {
+        UnresolvedImports,
+        SemanticInputPopulationExceeded,
+    }
+
+    struct FailingPersistentProvider {
+        failure: ProviderFailureFixture,
+    }
+
+    #[async_trait::async_trait]
+    impl PersistentSemanticProvider for FailingPersistentProvider {
+        fn language(&self) -> &'static str {
+            "rust"
+        }
+
+        fn ecosystem(&self) -> &'static str {
+            "cargo"
+        }
+
+        fn provider_id(&self) -> &str {
+            "h00-test-semantic-provider"
+        }
+
+        fn operation_label(&self) -> &'static str {
+            "test semantic provider"
+        }
+
+        fn set_session_jobs(&mut self, _jobs: Option<usize>) {}
+
+        fn take_last_activity(
+            &mut self,
+        ) -> Option<crate::code_intel_semantic_provider_coordinator::SemanticProviderActivityRecord>
+        {
+            None
+        }
+
+        fn active_cache_directories(&self) -> BTreeSet<PathBuf> {
+            BTreeSet::new()
+        }
+
+        async fn authorize_and_hydrate_exact_generation_reuse(
+            &mut self,
+            _repository_root: &std::path::Path,
+            _inventory: &ProjectInventory,
+            _indexed_sources: &[IndexedSourceEvidence],
+            _provider_payloads: &[crate::code_intel_payload::NormalizedProviderPayload],
+            _prior_bases: &[CanonicalSemanticBasis],
+            _cancellation: &IndexCancellation,
+        ) -> bool {
+            false
+        }
+
+        async fn reuse_exact_canonical_basis(
+            &mut self,
+            _repository_root: &std::path::Path,
+            _inventory: &ProjectInventory,
+            _indexed_sources: &[IndexedSourceEvidence],
+            _prior_bases: &[CanonicalSemanticBasis],
+            _cancellation: &IndexCancellation,
+        ) -> Option<ScipArtifactSetNormalization> {
+            None
+        }
+
+        async fn refresh(
+            &mut self,
+            _repository_root: &std::path::Path,
+            _execution_roots: &[PathBuf],
+            _indexed_sources: &[IndexedSourceEvidence],
+            _inventory: &ProjectInventory,
+            _cancellation: &IndexCancellation,
+        ) -> Result<
+            ScipArtifactSetNormalization,
+            crate::code_intel_semantic_provider_coordinator::SemanticProviderError,
+        > {
+            use crate::code_intel_semantic_provider_coordinator::SemanticProviderError;
+
+            match self.failure {
+                ProviderFailureFixture::UnresolvedImports => {
+                    Err(SemanticProviderError::IncompleteHealth {
+                        operation: "open-session",
+                        health: h00ligan_provider_protocol::ProviderHealthEvidence {
+                            components: std::collections::BTreeMap::from([
+                                (
+                                    "module_resolution".into(),
+                                    h00ligan_provider_protocol::ProviderComponentHealth::Failed,
+                                ),
+                                (
+                                    "type_checking".into(),
+                                    h00ligan_provider_protocol::ProviderComponentHealth::Healthy,
+                                ),
+                            ]),
+                            diagnostics_complete: false,
+                            degradation_reasons: vec!["unresolved_imports".into()],
+                        },
+                    })
+                }
+                ProviderFailureFixture::SemanticInputPopulationExceeded => {
+                    Err(SemanticProviderError::Rejected {
+                        operation: "open-session",
+                        code: "semantic_input_population_exceeded".into(),
+                        message: "semantic-input population exceeds the negotiated bound".into(),
+                    })
+                }
+            }
+        }
+
+        fn mark_publication_committed(&mut self) {}
+
+        async fn reset(&mut self) {}
+    }
+
+    async fn persistent_provider_failure_receipt(
+        failure: ProviderFailureFixture,
+    ) -> CapabilityReceipt {
+        let repository = TempDir::new().expect("provider failure repository");
+        fs::create_dir_all(repository.path().join("src")).expect("source directory");
+        fs::write(
+            repository.path().join("Cargo.toml"),
+            "[package]\nname = \"provider-failure\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("Cargo manifest");
+        fs::write(repository.path().join("src/lib.rs"), "pub fn entry() {}\n")
+            .expect("Rust source");
+        let inventory = build_project_inventory(
+            repository.path(),
+            &[InventorySource::new("src/lib.rs", "rust")],
+        );
+        assert_eq!(
+            semantic_provider_execution_roots(&inventory, "rust", "cargo").len(),
+            1,
+            "positive control: the fixture must exercise one admitted provider root"
+        );
+
+        let outcome = run_persistent_semantic_provider_lane(
+            &mut FailingPersistentProvider { failure },
+            repository.path(),
+            &inventory,
+            &[],
+            &[],
+            &IndexCancellation::new(),
+            &None,
+        )
+        .await
+        .expect("provider failure becomes unavailable capability evidence");
+        outcome
+            .failure
+            .expect("failed provider lane evidence")
+            .receipt
+    }
+
+    /// RIGHT-REASON REGRESSION: provider health terminals already contain a
+    /// typed degradation cause. The immutable receipt must preserve it instead
+    /// of replacing every failure with one generic label.
+    #[tokio::test]
+    async fn persistent_provider_health_failure_receipt_preserves_typed_terminal_cause() {
+        let unresolved =
+            persistent_provider_failure_receipt(ProviderFailureFixture::UnresolvedImports).await;
+        assert_eq!(
+            unresolved.reason_code.as_deref(),
+            Some("provider_health_unresolved_imports")
+        );
+        assert!(
+            unresolved
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("module_resolution")
+                    && reason.contains("unresolved_imports")),
+            "the persisted reason must retain the bounded health diagnosis: {:?}",
+            unresolved.reason
+        );
+    }
+
+    /// RIGHT-REASON REGRESSION: a provider rejection's validated machine code
+    /// and bounded detail are distinct from a health failure and must survive
+    /// immutable publication as distinct evidence.
+    #[tokio::test]
+    async fn persistent_provider_rejection_receipt_preserves_typed_terminal_cause() {
+        let oversized = persistent_provider_failure_receipt(
+            ProviderFailureFixture::SemanticInputPopulationExceeded,
+        )
+        .await;
+        assert_eq!(
+            oversized.reason_code.as_deref(),
+            Some("provider_rejected_semantic_input_population_exceeded")
+        );
+        assert!(
+            oversized
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("negotiated bound")),
+            "the provider's bounded rejection detail must survive publication: {:?}",
+            oversized.reason
+        );
+    }
 
     #[test]
     fn semantic_normalizer_timings_are_an_exact_component_partition() {

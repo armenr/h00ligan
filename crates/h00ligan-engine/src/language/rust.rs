@@ -24,6 +24,10 @@ impl LanguageExtractor for RustExtractor {
         "rust"
     }
 
+    fn source_file_is_test(&self, file_path: &str) -> bool {
+        crate::extractor::file_is_test(file_path)
+    }
+
     fn ts_language_for_path(&self, _file_path: &str) -> tree_sitter::Language {
         // THE registry grammar binding — the one structural `tree_sitter_rust`
         // site. The extractor parse (site 1) and the DRY-detection parse
@@ -33,6 +37,10 @@ impl LanguageExtractor for RustExtractor {
 
     fn named_callable_declaration_kinds(&self) -> &'static [&'static str] {
         &["function_item", "function_signature_item"]
+    }
+
+    fn anonymous_callable_declaration_kinds(&self) -> &'static [&'static str] {
+        &["closure_expression"]
     }
 
     fn named_call_syntax<'tree>(&self, call: Node<'tree>) -> Option<NamedCallSyntax<'tree>> {

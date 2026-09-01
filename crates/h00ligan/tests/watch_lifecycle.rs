@@ -2454,7 +2454,10 @@ fn run_workspace_provider_watch_conformance(case: WorkspaceProviderWatchConforma
         "stale targetA call survived"
     );
     assert_eq!(calls_items(&watch_b).len(), 1, "fresh targetB call missing");
-    assert_eq!(calls_items(&watch_b)[0]["caller"]["name"], "caller");
+    assert_eq!(
+        calls_items(&watch_b)[0]["origin"]["identity"]["name"],
+        "caller"
+    );
 
     let (baseline_a, baseline_b) = workspace_provider_full_baseline_calls(
         case,
@@ -2862,7 +2865,10 @@ fn installed_go_watch_body_edit_reuses_one_session_with_full_baseline_parity() {
         "stale targetA call survived"
     );
     assert_eq!(calls_items(&watch_b).len(), 1, "fresh targetB call missing");
-    assert_eq!(calls_items(&watch_b)[0]["caller"]["name"], "caller");
+    assert_eq!(
+        calls_items(&watch_b)[0]["origin"]["identity"]["name"],
+        "caller"
+    );
 
     // Independent full rebuild: this is both the semantic parity oracle and a
     // non-vacuity control proving the counted batch provider still fires.
@@ -2908,8 +2914,8 @@ fn installed_go_watch_body_edit_reuses_one_session_with_full_baseline_parity() {
         "retained-session targetB result differs from a fresh full embedded-provider generation"
     );
     assert_ne!(
-        calls_items(&watch_b)[0]["caller"]["symbol_id"],
-        calls_items(&baseline_b)[0]["caller"]["symbol_id"],
+        calls_items(&watch_b)[0]["origin"]["identity"]["symbol_id"],
+        calls_items(&baseline_b)[0]["origin"]["identity"]["symbol_id"],
         "positive control: public exact selectors must remain bound to their distinct immutable generations"
     );
     for result in [&watch_a, &watch_b] {
@@ -3151,7 +3157,10 @@ fn installed_go_build_variant_is_explicitly_qualified() {
         1,
         "covered caller remains useful"
     );
-    assert_eq!(calls_items(&calls)[0]["caller"]["name"], "caller");
+    assert_eq!(
+        calls_items(&calls)[0]["origin"]["identity"]["name"],
+        "caller"
+    );
     assert!(
         calls["authority"]["coverage_exclusions"]
             .as_array()
@@ -4760,8 +4769,8 @@ fn installed_one_file_refuses_weaker_rust_fallback_after_health_failure() {
         "an unavailable capability must not present a provider as active authority"
     );
     assert_eq!(
-        rust["gaps"][0]["reason_code"],
-        "provider_failed_or_unavailable"
+        rust["gaps"][0]["reason_code"], "provider_health_build_scripts",
+        "the installed status boundary must retain the exact failed provider-health component"
     );
     let degraded_generation =
         resolve_generation(&degraded_data, &root).expect("resolve degraded generation receipt");

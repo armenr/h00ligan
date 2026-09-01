@@ -30,6 +30,7 @@ scratch_root="$owned_tmp_root/acceptance"
 mkdir "$scratch_root"
 process_baseline=""
 process_reconciled=0
+python_interrupted_cache_controls=()
 cleanup() {
     local status=$?
     if [[ "$process_reconciled" == 0 && -n "$process_baseline" && -f "$process_baseline" && -n "${binary:-}" ]]; then
@@ -39,6 +40,10 @@ cleanup() {
             status=1
         fi
     fi
+    local interrupted
+    for interrupted in "${python_interrupted_cache_controls[@]}"; do
+        [[ ! -e "$interrupted" && ! -L "$interrupted" ]] || rm -rf -- "$interrupted"
+    done
     [[ -n "${owned_tmp_root:-}" && -d "$owned_tmp_root" ]] && rm -rf -- "$owned_tmp_root"
     rmdir -- "$test_tmp_parent" 2>/dev/null || true
     trap - EXIT HUP INT TERM
@@ -243,6 +248,47 @@ python_compilation_before="$(directory_logical_bytes "$python_compilation_cache"
     echo "Pyrefly provider retained compiler cache residue before replay: $python_compilation_before bytes" >&2
     exit 1
 }
+python_forged_lock_log="$scratch_root/pyrefly-forged-lock.log"
+if H00LIGAN_CACHE_LOCK_FD=999999 \
+    "$repo_root/scripts/build-h00-pyrefly-semantic-provider.sh" \
+    --target "$target" --prepare-only >"$python_forged_lock_log" 2>&1; then
+    echo "Pyrefly provider accepted a forged inherited compiler lock" >&2
+    exit 1
+fi
+grep -Fq "cache lock descriptor is not open" "$python_forged_lock_log" || {
+    echo "Pyrefly forged-lock refusal did not fire for the intended reason" >&2
+    exit 1
+}
+python_source_root="$(printf '%s\n' "$provider_details" | sed -n 's/^H00_PYREFLY_SOURCE_ROOT=//p')"
+[[ -d "$python_source_root" && ! -L "$python_source_root" ]] || {
+    echo "installed h00ligan gate lacks the exact Pyrefly source root" >&2
+    exit 1
+}
+python_cache_root="$repo_root/target/portable-cache/python-provider"
+for template in \
+    "$python_cache_root/invocations/invocation.interrupted-control.XXXXXX" \
+    "$python_cache_root/candidates/source.interrupted-control.XXXXXX" \
+    "$python_cache_root/candidates/adapter.interrupted-control.XXXXXX" \
+    "$python_compilation_cache/build.interrupted-control.XXXXXX" \
+    "$python_cache_root/artifacts/$target/artifact.interrupted-control.XXXXXX"; do
+    interrupted="$(mktemp -d "$template")"
+    printf 'interrupted-provider-output\n' > "$interrupted/payload"
+    python_interrupted_cache_controls+=("$interrupted")
+done
+python_interrupted_archive="$(mktemp "$python_cache_root/archives/pyrefly-1.2.0.tar.gz.download.interrupted-control.XXXXXX")"
+printf 'interrupted-download\n' > "$python_interrupted_archive"
+python_interrupted_cache_controls+=("$python_interrupted_archive")
+for interrupted in "${python_interrupted_cache_controls[@]}"; do
+    [[ -e "$interrupted" || -L "$interrupted" ]] || {
+        echo "Pyrefly interrupted-cache residue positive control did not fire: $interrupted" >&2
+        exit 1
+    }
+done
+python_stale_compilation_bytes="$(directory_logical_bytes "$python_compilation_cache")"
+((python_stale_compilation_bytes > 0)) || {
+    echo "Pyrefly interrupted compiler-root positive control did not fire" >&2
+    exit 1
+}
 python_repeat_details="$(
     "$repo_root/scripts/build-h00-pyrefly-semantic-provider.sh" \
         --target "$target" --machine
@@ -252,6 +298,13 @@ python_compilation_after="$(directory_logical_bytes "$python_compilation_cache")
     echo "Pyrefly provider retained compiler cache residue after replay: $python_compilation_after bytes" >&2
     exit 1
 }
+for interrupted in "${python_interrupted_cache_controls[@]}"; do
+    [[ ! -e "$interrupted" && ! -L "$interrupted" ]] || {
+        echo "Pyrefly provider retained interrupted cache residue after replay: $interrupted" >&2
+        exit 1
+    }
+done
+python_interrupted_cache_controls=()
 python_expected_sha256="$(printf '%s\n' "$provider_details" | sed -n 's/^H00_PYREFLY_PROVIDER_BINARY_SHA256=//p')"
 python_repeated_sha256="$(printf '%s\n' "$python_repeat_details" | sed -n 's/^H00_PYREFLY_PROVIDER_BINARY_SHA256=//p')"
 [[ "$python_expected_sha256" =~ ^[0-9a-f]{64}$ \
@@ -313,6 +366,16 @@ cargo test --locked --offline -p h00ligan \
 cargo test --locked --offline -p h00ligan \
     --test installed_one_file_mcp \
     installed_one_file_cli_and_mcp_share_exact_semantic_authority -- \
+    --exact --ignored --nocapture --test-threads=1
+
+cargo test --locked --offline -p h00ligan \
+    --test installed_one_file_mcp \
+    installed_rust_linked_worktree_git_inputs_remain_complete -- \
+    --exact --ignored --nocapture --test-threads=1
+
+cargo test --locked --offline -p h00ligan \
+    --test installed_one_file_mcp \
+    installed_rust_linked_worktree_refuses_nonreciprocal_git_authority -- \
     --exact --ignored --nocapture --test-threads=1
 
 cargo test --locked --offline -p h00ligan \

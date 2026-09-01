@@ -242,6 +242,26 @@ pub enum EdgeKind {
 }
 
 impl EdgeKind {
+    /// Stable machine label for public graph statistics and projections.
+    ///
+    /// Debug formatting is deliberately not a serialization contract: adding
+    /// fields or changing diagnostics must not rename machine-readable keys.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Calls => "calls",
+            Self::Implements => "implements",
+            Self::Contains => "contains",
+            Self::References => "references",
+            Self::DependsOn => "depends_on",
+            Self::Extends => "extends",
+            Self::TypeOf => "type_of",
+            Self::FieldOf => "field_of",
+            Self::HasImpl => "has_impl",
+            Self::RelatedTo => "related_to",
+        }
+    }
+
     /// Whether this relationship contributes to observed incoming coupling.
     ///
     /// Calls and field ownership answer different questions and must remain
@@ -1472,6 +1492,25 @@ mod tests {
     use super::*;
     use crate::reachability::ReachabilityClass;
     use std::assert_matches;
+
+    #[test]
+    fn edge_kind_machine_labels_are_explicit_and_complete() {
+        let labels = [
+            (EdgeKind::Calls, "calls"),
+            (EdgeKind::Implements, "implements"),
+            (EdgeKind::Contains, "contains"),
+            (EdgeKind::References, "references"),
+            (EdgeKind::DependsOn, "depends_on"),
+            (EdgeKind::Extends, "extends"),
+            (EdgeKind::TypeOf, "type_of"),
+            (EdgeKind::FieldOf, "field_of"),
+            (EdgeKind::HasImpl, "has_impl"),
+            (EdgeKind::RelatedTo, "related_to"),
+        ];
+        for (kind, expected) in labels {
+            assert_eq!(kind.as_str(), expected);
+        }
+    }
 
     fn make_node(name: &str, file: &str) -> GraphNode {
         GraphNode {

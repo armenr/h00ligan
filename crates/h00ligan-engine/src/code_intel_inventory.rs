@@ -23,11 +23,41 @@ use crate::code_intel_domain::{
     AnalysisContextMembershipKind, AnalysisContextRelationship, AnalysisContextRelationshipKind,
     DocumentMembership, DocumentMembershipKind, EcosystemId, LanguageId, ProjectInput,
     ProjectInputRole, ProjectInventory, ProjectInventoryCoverage, ProjectInventoryIssue,
-    ProjectTopology, ProjectUnit, ProjectUnitDependency, ProjectUnitDependencyGap,
-    ProjectUnitDependencyGraph, ProjectUnitDependencyGraphCoverage, ProjectUnitId, ProjectUnitKind,
-    ProjectUnitRelationship, ProjectUnitRelationshipKind, UnitGraph, UnitGraphCoverage,
+    ProjectInventoryIssueScope, ProjectTopology, ProjectUnit, ProjectUnitDependency,
+    ProjectUnitDependencyGap, ProjectUnitDependencyGraph, ProjectUnitDependencyGraphCoverage,
+    ProjectUnitId, ProjectUnitKind, ProjectUnitRelationship, ProjectUnitRelationshipKind,
+    UnitGraph, UnitGraphCoverage,
 };
 use crate::code_intel_project_inputs::{ProjectInputCandidate, ProjectInputCandidatePath};
+
+macro_rules! project_inventory_issue {
+    ($($field:ident: $value:expr),+ $(,)?) => {
+        ProjectInventoryIssue {
+            scope: ProjectInventoryIssueScope::Repository,
+            $($field: $value),+
+        }
+    };
+}
+
+fn language_inventory_issue(
+    mut issue: ProjectInventoryIssue,
+    language_id: LanguageId,
+) -> ProjectInventoryIssue {
+    issue.scope = ProjectInventoryIssueScope::Language { language_id };
+    issue
+}
+
+fn ecosystem_inventory_issue(
+    mut issue: ProjectInventoryIssue,
+    language_id: LanguageId,
+    ecosystem_id: EcosystemId,
+) -> ProjectInventoryIssue {
+    issue.scope = ProjectInventoryIssueScope::Ecosystem {
+        language_id,
+        ecosystem_id,
+    };
+    issue
+}
 
 #[cfg(test)]
 thread_local! {
@@ -205,9 +235,9 @@ fn max_project_inputs_in_flight(root: &Path) -> usize {
         .unwrap_or(0)
 }
 
-pub const PROJECT_INVENTORY_SCHEMA_VERSION: &str = "h00/code-intel/project-inventory/v8";
+pub const PROJECT_INVENTORY_SCHEMA_VERSION: &str = "h00/code-intel/project-inventory/v9";
 const SEMANTIC_PROVIDER_INVENTORY_SCHEMA_VERSION: &str =
-    "h00/code-intel/semantic-provider-inventory/v4";
+    "h00/code-intel/semantic-provider-inventory/v5";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectInventoryError {
@@ -232,10 +262,9 @@ struct SemanticProviderInventoryProjection {
     project_topology: ProjectTopology,
     analysis_context_graphs: Vec<AnalysisContextGraph>,
     inputs: Vec<ProjectInput>,
-    /// Inventory issues are conservatively global because their current
-    /// persisted shape has no language coordinate. A malformed unrelated
-    /// language may therefore force recertification, but ordinary unrelated
-    /// units and inputs cannot impersonate provider input drift.
+    /// Only repository-wide or provider-scoped issues participate in this
+    /// provider identity. Unrelated-language failures remain visible in the
+    /// complete generation inventory without invalidating this projection.
     issues: Vec<ProjectInventoryIssue>,
 }
 
@@ -264,6 +293,16 @@ struct ProjectInventoryFragment {
     issues: BTreeSet<ProjectInventoryIssue>,
 }
 
+/// How one language's compiler-backed provider partitions project owners into
+/// independently solved sessions. Package-manager workspace membership remains
+/// immutable inventory in either mode; it is not proof that the compiler
+/// understands that workspace format as an analysis root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticProviderSessionPartition {
+    Workspace,
+    ProjectUnit,
+}
+
 /// Language-owned project topology for one exact indexed source population.
 ///
 /// Syntax registration and project-system registration are deliberately
@@ -273,6 +312,10 @@ struct ProjectInventoryFragment {
 /// of another central language switch.
 trait ProjectInventoryAdapter: Sync {
     fn language(&self) -> &'static str;
+
+    fn ecosystem(&self) -> &'static str;
+
+    fn semantic_provider_session_partition(&self) -> SemanticProviderSessionPartition;
 
     fn discover(
         &self,
@@ -466,17 +509,20 @@ pub fn build_project_inventory(root: &Path, sources: &[InventorySource]) -> Proj
 
     for source in sources {
         if !safe_relative_path(&source.document_path) {
-            issues.insert(ProjectInventoryIssue {
-                code: "unsafe_document_path".into(),
-                path: source.document_path.clone(),
-                detail: "indexed document path must be repository-relative without traversal"
-                    .into(),
-            });
+            issues.insert(language_inventory_issue(
+                project_inventory_issue! {
+                    code: "unsafe_document_path".into(),
+                    path: source.document_path.clone(),
+                    detail: "indexed document path must be repository-relative without traversal"
+                        .into(),
+                },
+                source.language_id.clone(),
+            ));
             continue;
         }
         match source_population.get(&source.document_path) {
             Some(language) if language != &source.language_id => {
-                issues.insert(ProjectInventoryIssue {
+                issues.insert(project_inventory_issue! {
                     code: "conflicting_document_language".into(),
                     path: source.document_path.clone(),
                     detail: format!(
@@ -502,10 +548,28 @@ pub fn build_project_inventory(root: &Path, sources: &[InventorySource]) -> Proj
             .insert(document_path, language_id);
     }
     for (language_id, language_sources) in sources_by_language {
-        let fragment = project_inventory_adapter(&language_id.0).map_or_else(
+        let adapter = project_inventory_adapter(&language_id.0);
+        let mut fragment = adapter.map_or_else(
             || unregistered_project_inventory_fragment(&language_sources),
             |adapter| adapter.discover(root, &language_sources),
         );
+        let issue_scope = adapter.map_or_else(
+            || ProjectInventoryIssueScope::Language {
+                language_id: language_id.clone(),
+            },
+            |adapter| ProjectInventoryIssueScope::Ecosystem {
+                language_id: language_id.clone(),
+                ecosystem_id: EcosystemId::new(adapter.ecosystem()),
+            },
+        );
+        fragment.issues = fragment
+            .issues
+            .into_iter()
+            .map(|mut issue| {
+                issue.scope = issue_scope.clone();
+                issue
+            })
+            .collect();
         let ProjectInventoryFragment {
             units: fragment_units,
             memberships: fragment_memberships,
@@ -519,17 +583,21 @@ pub fn build_project_inventory(root: &Path, sources: &[InventorySource]) -> Proj
                 .get(&unit.project_unit_id)
                 .is_some_and(|existing| existing != &unit)
             {
-                issues.insert(ProjectInventoryIssue {
-                    code: "conflicting_project_unit".into(),
-                    path: unit
-                        .manifest_path
-                        .clone()
-                        .unwrap_or_else(|| unit.root_path.clone()),
-                    detail: format!(
-                        "project unit {} was produced with conflicting definitions",
-                        unit.project_unit_id.0
-                    ),
-                });
+                issues.insert(ecosystem_inventory_issue(
+                    project_inventory_issue! {
+                        code: "conflicting_project_unit".into(),
+                        path: unit
+                            .manifest_path
+                            .clone()
+                            .unwrap_or_else(|| unit.root_path.clone()),
+                        detail: format!(
+                            "project unit {} was produced with conflicting definitions",
+                            unit.project_unit_id.0
+                        ),
+                    },
+                    unit.language_id.clone(),
+                    unit.ecosystem_id.clone(),
+                ));
                 continue;
             }
             units.insert(unit.project_unit_id.clone(), unit);
@@ -631,6 +699,9 @@ pub(crate) fn semantic_provider_unit_execution_roots(
     language: &str,
     ecosystem: &str,
 ) -> BTreeMap<ProjectUnitId, PathBuf> {
+    let session_partition = project_inventory_adapter(language)
+        .map(ProjectInventoryAdapter::semantic_provider_session_partition)
+        .unwrap_or(SemanticProviderSessionPartition::ProjectUnit);
     let units = inventory
         .project_topology
         .units
@@ -671,7 +742,7 @@ pub(crate) fn semantic_provider_unit_execution_roots(
         if owner.ecosystem_id.0 != ecosystem
             || !matches!(
                 owner.kind,
-                ProjectUnitKind::Package | ProjectUnitKind::Module
+                ProjectUnitKind::Package | ProjectUnitKind::Module | ProjectUnitKind::Application
             )
         {
             continue;
@@ -685,7 +756,9 @@ pub(crate) fn semantic_provider_unit_execution_roots(
             })
             .copied()
             .collect::<Vec<_>>();
-        let root = if !exact_containing_workspaces.is_empty() {
+        let root = if session_partition == SemanticProviderSessionPartition::ProjectUnit {
+            owner.root_path.as_str()
+        } else if !exact_containing_workspaces.is_empty() {
             let exact_ids = exact_containing_workspaces
                 .iter()
                 .map(|workspace| &workspace.project_unit_id)
@@ -1076,6 +1149,23 @@ pub fn semantic_provider_inventory_fingerprint(
         ));
     }
     let normalized = normalize_and_validate_inventory(inventory)?;
+    let selected_language = LanguageId::new(language);
+    let selected_ecosystem = EcosystemId::new(ecosystem);
+    let selected_issues = normalized
+        .issues
+        .iter()
+        .filter(|issue| {
+            issue
+                .scope
+                .applies_to_provider(&selected_language, &selected_ecosystem)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let selected_coverage = if selected_issues.is_empty() {
+        ProjectInventoryCoverage::IndexedSourcePopulationComplete
+    } else {
+        ProjectInventoryCoverage::IndexedSourcePopulationPartial
+    };
     let selected_units = normalized
         .project_topology
         .units
@@ -1092,9 +1182,9 @@ pub fn semantic_provider_inventory_fingerprint(
         .collect::<BTreeSet<_>>();
     let projection = SemanticProviderInventoryProjection {
         schema_version: SEMANTIC_PROVIDER_INVENTORY_SCHEMA_VERSION.into(),
-        language_id: LanguageId::new(language),
-        ecosystem_id: EcosystemId::new(ecosystem),
-        coverage: normalized.coverage,
+        language_id: selected_language,
+        ecosystem_id: selected_ecosystem,
+        coverage: selected_coverage,
         project_topology: ProjectTopology {
             units: selected_units,
             memberships: normalized
@@ -1140,7 +1230,7 @@ pub fn semantic_provider_inventory_fingerprint(
             .into_iter()
             .filter(|input| input.language_id.0 == language && input.ecosystem_id.0 == ecosystem)
             .collect(),
-        issues: normalized.issues,
+        issues: selected_issues,
     };
     let digest = Sha256::digest(serde_json::to_vec(&projection)?);
     Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
@@ -1434,6 +1524,19 @@ fn normalize_and_validate_inventory(
 
     for issue in &normalized.issues {
         validate_label("inventory issue code", &issue.code)?;
+        match &issue.scope {
+            ProjectInventoryIssueScope::Repository => {}
+            ProjectInventoryIssueScope::Language { language_id } => {
+                validate_label("inventory issue language ID", &language_id.0)?;
+            }
+            ProjectInventoryIssueScope::Ecosystem {
+                language_id,
+                ecosystem_id,
+            } => {
+                validate_label("inventory issue language ID", &language_id.0)?;
+                validate_label("inventory issue ecosystem ID", &ecosystem_id.0)?;
+            }
+        }
         if issue.path.trim().is_empty() || issue.detail.trim().is_empty() {
             return Err(ProjectInventoryError::Invalid(
                 "inventory issue path and detail must not be empty".into(),
@@ -1889,6 +1992,19 @@ pub fn project_unit_graph(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    let selected_languages = memberships
+        .iter()
+        .map(|membership| membership.language_id.clone())
+        .collect::<BTreeSet<_>>();
+    let scoped_inventory_complete = if selected_languages.is_empty() {
+        inventory.coverage == ProjectInventoryCoverage::IndexedSourcePopulationComplete
+    } else {
+        inventory.issues.iter().all(|issue| {
+            selected_languages
+                .iter()
+                .all(|language| !issue.scope.applies_to_language(language))
+        })
+    };
     let mut unit_ids = memberships
         .iter()
         .map(|membership| membership.project_unit_id.clone())
@@ -1907,13 +2023,10 @@ pub fn project_unit_graph(
     }
 
     UnitGraph {
-        coverage: match inventory.coverage {
-            ProjectInventoryCoverage::IndexedSourcePopulationComplete => {
-                UnitGraphCoverage::IndexedGenerationQueryProjection
-            }
-            ProjectInventoryCoverage::IndexedSourcePopulationPartial => {
-                UnitGraphCoverage::IndexedGenerationPartialQueryProjection
-            }
+        coverage: if scoped_inventory_complete {
+            UnitGraphCoverage::IndexedGenerationQueryProjection
+        } else {
+            UnitGraphCoverage::IndexedGenerationPartialQueryProjection
         },
         units: inventory
             .project_topology
@@ -2006,11 +2119,15 @@ fn expand_project_input_candidates(
                     Ok(entries) => entries,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(error) => {
-                        issues.insert(ProjectInventoryIssue {
-                            code: "project_input_directory_unreadable".into(),
-                            path: path_label(directory),
-                            detail: error.to_string(),
-                        });
+                        issues.insert(ecosystem_inventory_issue(
+                            project_inventory_issue! {
+                                code: "project_input_directory_unreadable".into(),
+                                path: path_label(directory),
+                                detail: error.to_string(),
+                            },
+                            candidate.language_id.clone(),
+                            EcosystemId::new(candidate.ecosystem),
+                        ));
                         continue;
                     }
                 };
@@ -2018,11 +2135,15 @@ fn expand_project_input_candidates(
                     let entry = match entry {
                         Ok(entry) => entry,
                         Err(error) => {
-                            issues.insert(ProjectInventoryIssue {
-                                code: "project_input_directory_unreadable".into(),
-                                path: path_label(directory),
-                                detail: error.to_string(),
-                            });
+                            issues.insert(ecosystem_inventory_issue(
+                                project_inventory_issue! {
+                                    code: "project_input_directory_unreadable".into(),
+                                    path: path_label(directory),
+                                    detail: error.to_string(),
+                                },
+                                candidate.language_id.clone(),
+                                EcosystemId::new(candidate.ecosystem),
+                            ));
                             continue;
                         }
                     };
@@ -2138,7 +2259,11 @@ fn capture_project_input_observation(
             });
         }
         ProjectInputFileObservation::Issue(issue) => {
-            issues.insert(issue.clone());
+            issues.insert(ecosystem_inventory_issue(
+                issue.clone(),
+                language_id.clone(),
+                EcosystemId::new(ecosystem),
+            ));
         }
     }
 }
@@ -2153,7 +2278,7 @@ fn observe_project_input_file(root: &Path, relative_path: &Path) -> ProjectInput
             return ProjectInputFileObservation::Missing;
         }
         Err(error) => {
-            return ProjectInputFileObservation::Issue(ProjectInventoryIssue {
+            return ProjectInputFileObservation::Issue(project_inventory_issue! {
                 code: "project_input_unreadable".into(),
                 path: path_label(relative_path),
                 detail: error.to_string(),
@@ -2161,7 +2286,7 @@ fn observe_project_input_file(root: &Path, relative_path: &Path) -> ProjectInput
         }
     };
     if !metadata.file_type().is_file() {
-        return ProjectInputFileObservation::Issue(ProjectInventoryIssue {
+        return ProjectInputFileObservation::Issue(project_inventory_issue! {
             code: "project_input_unsafe".into(),
             path: path_label(relative_path),
             detail: "project inputs must be regular repository-local files".into(),
@@ -2170,7 +2295,7 @@ fn observe_project_input_file(root: &Path, relative_path: &Path) -> ProjectInput
     let bytes = match std::fs::read(&absolute) {
         Ok(bytes) => bytes,
         Err(error) => {
-            return ProjectInputFileObservation::Issue(ProjectInventoryIssue {
+            return ProjectInputFileObservation::Issue(project_inventory_issue! {
                 code: "project_input_unreadable".into(),
                 path: path_label(relative_path),
                 detail: error.to_string(),
@@ -2360,7 +2485,7 @@ fn unregistered_project_inventory_fragment(
 ) -> ProjectInventoryFragment {
     let mut fragment = ProjectInventoryFragment::default();
     for (document_path, language_id) in sources {
-        fragment.issues.insert(ProjectInventoryIssue {
+        fragment.issues.insert(project_inventory_issue! {
             code: "inventory_provider_unavailable".into(),
             path: document_path.clone(),
             detail: format!(
@@ -2409,6 +2534,14 @@ fn unavailable_dependency_graph(
 impl ProjectInventoryAdapter for RustProjectInventoryAdapter {
     fn language(&self) -> &'static str {
         "rust"
+    }
+
+    fn ecosystem(&self) -> &'static str {
+        "cargo"
+    }
+
+    fn semantic_provider_session_partition(&self) -> SemanticProviderSessionPartition {
+        SemanticProviderSessionPartition::Workspace
     }
 
     fn discover(
@@ -2470,6 +2603,14 @@ impl ProjectInventoryAdapter for GoProjectInventoryAdapter {
         "go"
     }
 
+    fn ecosystem(&self) -> &'static str {
+        "go"
+    }
+
+    fn semantic_provider_session_partition(&self) -> SemanticProviderSessionPartition {
+        SemanticProviderSessionPartition::Workspace
+    }
+
     fn discover(
         &self,
         root: &Path,
@@ -2510,6 +2651,14 @@ impl ProjectInventoryAdapter for GoProjectInventoryAdapter {
 impl ProjectInventoryAdapter for PythonProjectInventoryAdapter {
     fn language(&self) -> &'static str {
         "python"
+    }
+
+    fn ecosystem(&self) -> &'static str {
+        "python"
+    }
+
+    fn semantic_provider_session_partition(&self) -> SemanticProviderSessionPartition {
+        SemanticProviderSessionPartition::ProjectUnit
     }
 
     fn discover(
@@ -2572,6 +2721,14 @@ impl ProjectInventoryAdapter for PythonProjectInventoryAdapter {
 impl ProjectInventoryAdapter for TypeScriptProjectInventoryAdapter {
     fn language(&self) -> &'static str {
         "typescript"
+    }
+
+    fn ecosystem(&self) -> &'static str {
+        "node"
+    }
+
+    fn semantic_provider_session_partition(&self) -> SemanticProviderSessionPartition {
+        SemanticProviderSessionPartition::Workspace
     }
 
     fn discover(
@@ -2677,7 +2834,7 @@ fn discover_rust_manifest(
     let manifest = match toml::from_str::<toml::Value>(&contents) {
         Ok(manifest) => manifest,
         Err(error) => {
-            issues.insert(ProjectInventoryIssue {
+            issues.insert(project_inventory_issue! {
                 code: "manifest_invalid".into(),
                 path: label,
                 detail: error.to_string(),
@@ -2723,7 +2880,7 @@ fn discover_rust_manifest(
         ));
     }
     if candidates.is_empty() {
-        issues.insert(ProjectInventoryIssue {
+        issues.insert(project_inventory_issue! {
             code: "manifest_shape_unclassified".into(),
             path: label,
             detail: "Cargo.toml defines neither [workspace] nor [package]".into(),
@@ -2882,10 +3039,10 @@ fn discover_python_directory(
                                 ));
                             }
                             Err(detail) => {
-                                issues.insert(ProjectInventoryIssue {
+                                issues.insert(project_inventory_issue! {
                                     code: "manifest_invalid".into(),
                                     path: path_label(&pyproject_path),
-                                    detail,
+                                    detail: detail,
                                 });
                             }
                         }
@@ -2906,7 +3063,7 @@ fn discover_python_directory(
                     candidates
                 }
                 Err(error) => {
-                    issues.insert(ProjectInventoryIssue {
+                    issues.insert(project_inventory_issue! {
                         code: "manifest_invalid".into(),
                         path: path_label(&pyproject_path),
                         detail: error.to_string(),
@@ -2962,7 +3119,18 @@ fn discover_python_fallback_candidates(
 
     let pipfile_path = directory.join("Pipfile");
     match read_project_manifest(root, &pipfile_path, issues) {
-        ProjectManifestObservation::Content(_) => return Vec::new(),
+        ProjectManifestObservation::Content(_) => {
+            return vec![ProjectTopologyCandidate::unit(
+                project_unit(
+                    language_id,
+                    "python",
+                    ProjectUnitKind::Application,
+                    directory,
+                    Some(&pipfile_path),
+                ),
+                CandidateOwnership::PathContained,
+            )];
+        }
         ProjectManifestObservation::Unusable => {
             return vec![ProjectTopologyCandidate::ownership_barrier(directory)];
         }
@@ -2970,9 +3138,19 @@ fn discover_python_fallback_candidates(
     }
 
     match canonical_requirements_manifest(root, directory, issues) {
-        RequirementsManifestObservation::Selected | RequirementsManifestObservation::Missing => {
-            Vec::new()
+        RequirementsManifestObservation::Selected(manifest_path) => {
+            vec![ProjectTopologyCandidate::unit(
+                project_unit(
+                    language_id,
+                    "python",
+                    ProjectUnitKind::Application,
+                    directory,
+                    Some(&manifest_path),
+                ),
+                CandidateOwnership::PathContained,
+            )]
         }
+        RequirementsManifestObservation::Missing => Vec::new(),
         RequirementsManifestObservation::Unusable => {
             vec![ProjectTopologyCandidate::ownership_barrier(directory)]
         }
@@ -3052,7 +3230,7 @@ fn python_pyright_configuration_from_value(
         ),
         Ok(_) => {
             let detail = "Pyright configuration must be an object".to_string();
-            issues.insert(ProjectInventoryIssue {
+            issues.insert(project_inventory_issue! {
                 code: "project_configuration_invalid".into(),
                 path: path_label(configuration_path),
                 detail: detail.clone(),
@@ -3068,7 +3246,7 @@ fn python_pyright_configuration_from_value(
             )
         }
         Err(detail) => {
-            issues.insert(ProjectInventoryIssue {
+            issues.insert(project_inventory_issue! {
                 code: "project_configuration_invalid".into(),
                 path: path_label(configuration_path),
                 detail: detail.clone(),
@@ -3361,7 +3539,7 @@ fn read_project_manifest(
     match std::fs::symlink_metadata(&absolute) {
         Ok(metadata) if metadata.file_type().is_file() => {}
         Ok(_) => {
-            issues.insert(ProjectInventoryIssue {
+            issues.insert(project_inventory_issue! {
                 code: "manifest_unsafe".into(),
                 path: path_label(manifest_path),
                 detail: "project controls must be regular repository-local files".into(),
@@ -3372,7 +3550,7 @@ fn read_project_manifest(
             return ProjectManifestObservation::Missing;
         }
         Err(error) => {
-            issues.insert(ProjectInventoryIssue {
+            issues.insert(project_inventory_issue! {
                 code: "manifest_unreadable".into(),
                 path: path_label(manifest_path),
                 detail: error.to_string(),
@@ -3387,7 +3565,7 @@ fn read_project_manifest(
             ProjectManifestObservation::Content(contents)
         }
         Err(error) => {
-            issues.insert(ProjectInventoryIssue {
+            issues.insert(project_inventory_issue! {
                 code: "manifest_unreadable".into(),
                 path: path_label(manifest_path),
                 detail: error.to_string(),
@@ -3399,7 +3577,7 @@ fn read_project_manifest(
 
 enum RequirementsManifestObservation {
     Missing,
-    Selected,
+    Selected(PathBuf),
     Unusable,
 }
 
@@ -3414,7 +3592,7 @@ fn canonical_requirements_manifest(
             return RequirementsManifestObservation::Missing;
         }
         Err(error) => {
-            issues.insert(ProjectInventoryIssue {
+            issues.insert(project_inventory_issue! {
                 code: "manifest_directory_unreadable".into(),
                 path: path_label(directory),
                 detail: error.to_string(),
@@ -3428,7 +3606,7 @@ fn canonical_requirements_manifest(
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                issues.insert(ProjectInventoryIssue {
+                issues.insert(project_inventory_issue! {
                     code: "manifest_directory_unreadable".into(),
                     path: path_label(directory),
                     detail: error.to_string(),
@@ -3446,7 +3624,7 @@ fn canonical_requirements_manifest(
                 ProjectManifestObservation::Content(_) => candidates.push(path),
                 ProjectManifestObservation::Unusable => unusable = true,
                 ProjectManifestObservation::Missing => {
-                    issues.insert(ProjectInventoryIssue {
+                    issues.insert(project_inventory_issue! {
                         code: "manifest_changed_during_observation".into(),
                         path: path_label(&path),
                         detail: "requirements control disappeared during inventory observation"
@@ -3472,8 +3650,8 @@ fn canonical_requirements_manifest(
     candidates
         .into_iter()
         .next()
-        .map_or(RequirementsManifestObservation::Missing, |_| {
-            RequirementsManifestObservation::Selected
+        .map_or(RequirementsManifestObservation::Missing, |path| {
+            RequirementsManifestObservation::Selected(path)
         })
 }
 
@@ -3547,7 +3725,7 @@ fn attach_exact_workspace_memberships(
             .filter(|workspace| workspace.includes_package(Path::new(&package.root_path)))
             .collect::<Vec<_>>();
         if memberships.len() > 1 {
-            fragment.issues.insert(ProjectInventoryIssue {
+            fragment.issues.insert(project_inventory_issue! {
                 code: ambiguity_code.into(),
                 path: package
                     .manifest_path
@@ -3638,10 +3816,10 @@ fn discover_typescript_directory(
                     ));
                 }
                 Err(detail) => {
-                    issues.insert(ProjectInventoryIssue {
+                    issues.insert(project_inventory_issue! {
                         code: "manifest_invalid".into(),
                         path: path_label(&workspace_path),
-                        detail,
+                        detail: detail,
                     });
                 }
             }
@@ -3669,7 +3847,7 @@ fn discover_typescript_directory(
                     ));
                 }
                 Ok(_) => {
-                    issues.insert(ProjectInventoryIssue {
+                    issues.insert(project_inventory_issue! {
                         code: "manifest_invalid".into(),
                         path: path_label(&package_path),
                         detail: "package.json must be an object and name, when present, must be a string"
@@ -3678,7 +3856,7 @@ fn discover_typescript_directory(
                     candidates.push(ProjectTopologyCandidate::ownership_barrier(directory));
                 }
                 Err(error) => {
-                    issues.insert(ProjectInventoryIssue {
+                    issues.insert(project_inventory_issue! {
                         code: "manifest_invalid".into(),
                         path: path_label(&package_path),
                         detail: error.to_string(),
@@ -3718,7 +3896,7 @@ fn discover_typescript_configurations(
             return (Vec::new(), Vec::new());
         }
         Err(error) => {
-            issues.insert(ProjectInventoryIssue {
+            issues.insert(project_inventory_issue! {
                 code: "project_configuration_directory_unreadable".into(),
                 path: path_label(directory),
                 detail: error.to_string(),
@@ -3740,7 +3918,7 @@ fn discover_typescript_configurations(
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                issues.insert(ProjectInventoryIssue {
+                issues.insert(project_inventory_issue! {
                     code: "project_configuration_directory_unreadable".into(),
                     path: path_label(directory),
                     detail: error.to_string(),
@@ -3775,7 +3953,7 @@ fn discover_typescript_configurations(
                     }
                     Ok(_) => {
                         let detail = "TypeScript configuration must be a JSONC object".to_string();
-                        issues.insert(ProjectInventoryIssue {
+                        issues.insert(project_inventory_issue! {
                             code: "project_configuration_invalid".into(),
                             path: path_label(&configuration_path),
                             detail: detail.clone(),
@@ -3789,7 +3967,7 @@ fn discover_typescript_configurations(
                     }
                     Err(error) => {
                         let detail = error.to_string();
-                        issues.insert(ProjectInventoryIssue {
+                        issues.insert(project_inventory_issue! {
                             code: "project_configuration_invalid".into(),
                             path: path_label(&configuration_path),
                             detail: detail.clone(),
@@ -3806,7 +3984,7 @@ fn discover_typescript_configurations(
             ProjectManifestObservation::Missing => {
                 let detail =
                     "TypeScript configuration disappeared during inventory observation".to_string();
-                issues.insert(ProjectInventoryIssue {
+                issues.insert(project_inventory_issue! {
                     code: "project_configuration_changed_during_observation".into(),
                     path: path_label(&configuration_path),
                     detail: detail.clone(),
@@ -4612,6 +4790,7 @@ const fn unit_kind_label(kind: ProjectUnitKind) -> &'static str {
         ProjectUnitKind::Workspace => "workspace",
         ProjectUnitKind::Package => "package",
         ProjectUnitKind::Module => "module",
+        ProjectUnitKind::Application => "application",
         ProjectUnitKind::LooseSources => "loose_sources",
         ProjectUnitKind::AuxiliarySources => "auxiliary_sources",
     }
@@ -4827,6 +5006,19 @@ fn python_project_unit_dependencies(
             ));
             continue;
         };
+        if unit.kind == ProjectUnitKind::Application {
+            if project_unit_ids.len() > 1 {
+                gaps.insert(dependency_gap(
+                    "python_application_local_dependency_resolution_unavailable",
+                    Some(project_unit_id.clone()),
+                    unit.manifest_path
+                        .as_deref()
+                        .unwrap_or("<missing-manifest>"),
+                    "requirements/Pipfile local dependency resolution is not yet authoritative across multiple Python project units",
+                ));
+            }
+            continue;
+        }
         if unit.kind != ProjectUnitKind::Package {
             gaps.insert(dependency_gap(
                 "python_dependency_unit_not_package",
@@ -6880,6 +7072,40 @@ mod tests {
             go,
             "Rust-only input drift must not perturb Go provider authority"
         );
+
+        std::fs::remove_file(root.join("go/go.mod")).expect("remove valid Go manifest");
+        std::fs::create_dir(root.join("go/go.mod")).expect("unsafe Go manifest fixture");
+        let go_issue = build_project_inventory(
+            root,
+            &[
+                InventorySource::new("rust/src/lib.rs", "rust"),
+                InventorySource::new("go/main.go", "go"),
+            ],
+        );
+        assert_eq!(
+            go_issue.coverage,
+            ProjectInventoryCoverage::IndexedSourcePopulationPartial,
+            "positive control: the Go-only manifest failure must enter inventory authority"
+        );
+        assert!(
+            go_issue
+                .issues
+                .iter()
+                .any(|issue| issue.path == "go/go.mod"),
+            "positive control: the exact Go issue must be populated"
+        );
+        assert_eq!(
+            semantic_provider_inventory_fingerprint(&go_issue, "rust", "cargo")
+                .expect("Rust provider inventory after Go-only failure"),
+            rust,
+            "an unrelated Go inventory failure must not invalidate Rust provider authority"
+        );
+        assert_ne!(
+            semantic_provider_inventory_fingerprint(&go_issue, "go", "go")
+                .expect("Go provider inventory after its own failure"),
+            go,
+            "positive control: Go provider authority must retain its own inventory failure"
+        );
     }
 
     #[test]
@@ -6940,12 +7166,13 @@ mod tests {
         assert_eq!(projection.relationships.len(), 1);
     }
 
-    /// FALSIFIER for the old flat domain: `requirements.txt` constrains an
-    /// environment but does not identify a physical Python package, exact
-    /// import root, or interpreter context. It must remain an observed input
-    /// while source ownership and analysis authority stay honestly separate.
+    /// FALSIFIER for the old flat domain: `requirements.txt` does not define a
+    /// distributable Python package, but a repository-root requirements
+    /// application is still one physical provider execution unit. Demoting its
+    /// source to loose files prevents the Python provider from establishing
+    /// any semantic authority at all.
     #[test]
-    fn python_requirements_control_is_not_a_physical_project_unit() {
+    fn python_requirements_application_is_a_semantic_provider_unit() {
         let temporary = TempDir::new().expect("requirements Python repository");
         let root = temporary.path();
         std::fs::create_dir_all(root.join("app")).expect("application package");
@@ -6970,8 +7197,23 @@ mod tests {
             panic!("requirements-only source population must have one physical owner");
         };
         assert_eq!(owner.language_id, LanguageId::new("python"));
-        assert_eq!(owner.kind, ProjectUnitKind::LooseSources);
-        assert!(owner.manifest_path.is_none());
+        assert_eq!(owner.kind, ProjectUnitKind::Application);
+        assert_eq!(owner.manifest_path.as_deref(), Some("requirements.txt"));
+        let application_membership = inventory
+            .project_topology
+            .memberships
+            .iter()
+            .find(|membership| membership.document_path == "app/service.py")
+            .expect("application source membership");
+        assert!(
+            inventory.is_semantic_source_owner(application_membership),
+            "requirements-backed application source must be eligible for exact semantic ownership"
+        );
+        assert_eq!(
+            semantic_provider_execution_roots(&inventory, "python", "python"),
+            vec![PathBuf::new()],
+            "the repository application must schedule one root-scoped Python provider"
+        );
         let owned_documents = inventory
             .project_topology
             .memberships
@@ -6986,10 +7228,20 @@ mod tests {
             owned_documents,
             BTreeSet::from(["app/service.py", "tests/test_service.py"])
         );
-        assert!(
-            inventory.project_topology.dependency_graphs.is_empty(),
-            "environment controls cannot manufacture physical dependency authority"
+        let [dependency_graph] = inventory.project_topology.dependency_graphs.as_slice() else {
+            panic!("one exact application-unit dependency graph expected");
+        };
+        assert_eq!(
+            dependency_graph.coverage,
+            ProjectUnitDependencyGraphCoverage::Complete,
+            "a one-unit application population has no possible inter-unit dependency edge"
         );
+        assert_eq!(
+            dependency_graph.project_unit_ids,
+            vec![owner.project_unit_id.clone()]
+        );
+        assert!(dependency_graph.dependencies.is_empty());
+        assert!(dependency_graph.gaps.is_empty());
         assert!(inventory.inputs.iter().any(|input| {
             input.path == "requirements.txt"
                 && input.language_id == LanguageId::new("python")
@@ -7008,6 +7260,39 @@ mod tests {
                 .iter()
                 .any(|gap| { gap.reason_code == "python_analysis_context_resolution_unavailable" })
         );
+    }
+
+    #[test]
+    fn python_pipfile_application_is_a_semantic_provider_unit() {
+        let temporary = TempDir::new().expect("Pipfile Python repository");
+        let root = temporary.path();
+        std::fs::create_dir_all(root.join("service")).expect("application source directory");
+        std::fs::write(
+            root.join("Pipfile"),
+            "[[source]]\nurl = \"https://pypi.org/simple\"\n[packages]\nfastapi = \"*\"\n",
+        )
+        .expect("Pipfile manifest");
+
+        let inventory =
+            build_project_inventory(root, &[InventorySource::new("service/main.py", "python")]);
+        let [owner] = inventory.project_topology.units.as_slice() else {
+            panic!("Pipfile source population must have one application owner");
+        };
+        assert_eq!(owner.kind, ProjectUnitKind::Application);
+        assert_eq!(owner.manifest_path.as_deref(), Some("Pipfile"));
+        assert_eq!(
+            semantic_provider_execution_roots(&inventory, "python", "python"),
+            vec![PathBuf::new()]
+        );
+        let [dependency_graph] = inventory.project_topology.dependency_graphs.as_slice() else {
+            panic!("one exact application-unit dependency graph expected");
+        };
+        assert_eq!(
+            dependency_graph.coverage,
+            ProjectUnitDependencyGraphCoverage::Complete
+        );
+        assert!(dependency_graph.dependencies.is_empty());
+        assert!(dependency_graph.gaps.is_empty());
     }
 
     /// FALSIFIER from the clean uv/polyglot corpus: the root pyproject is a
@@ -7165,8 +7450,8 @@ mod tests {
             semantic_provider_unit_execution_roots(&inventory, "python", "python");
         assert_eq!(
             execution_roots.get(&package.project_unit_id),
-            Some(&PathBuf::new()),
-            "declared member runs from the uv workspace root"
+            Some(&PathBuf::from("apps/agents")),
+            "uv membership is inventory and invalidation context, but Pyrefly must solve the member from its own import root"
         );
         assert_eq!(
             execution_roots.get(&excluded.project_unit_id),

@@ -912,7 +912,7 @@ mod tests {
             protocol: SEMANTIC_PROVIDER_PROTOCOL.into(),
             provider_id: H00_RUST_ANALYZER_PROVIDER_ID.into(),
             language: H00_RUST_ANALYZER_LANGUAGE.into(),
-            implementation_version: H00_RUST_ANALYZER_IMPLEMENTATION_V5.into(),
+            implementation_version: H00_RUST_ANALYZER_IMPLEMENTATION_V6.into(),
             source_components: rust_analyzer_source_components(),
             patch_sha256: digest('a'),
             executable_sha256: digest('b'),
@@ -1271,7 +1271,7 @@ mod tests {
         assert_eq!(snapshot.provider_id(), H00_RUST_ANALYZER_PROVIDER_ID);
         assert_eq!(
             snapshot.executed_provider_version(),
-            H00_RUST_ANALYZER_IMPLEMENTATION_V5
+            H00_RUST_ANALYZER_IMPLEMENTATION_V6
         );
         assert_eq!(snapshot.identity_sha256().len(), 64);
     }
@@ -1315,7 +1315,7 @@ mod tests {
             protocol: SEMANTIC_PROVIDER_PROTOCOL.into(),
             provider_id: H00_TYPESCRIPT_PROVIDER_ID.into(),
             language: H00_TYPESCRIPT_LANGUAGE.into(),
-            implementation_version: H00_TYPESCRIPT_IMPLEMENTATION_V1.into(),
+            implementation_version: H00_TYPESCRIPT_IMPLEMENTATION_V2.into(),
             source_components: typescript_source_components(),
             patch_sha256: digest('7'),
             executable_sha256: digest('8'),

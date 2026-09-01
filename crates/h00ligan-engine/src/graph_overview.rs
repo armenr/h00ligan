@@ -75,7 +75,7 @@ pub struct OverviewData {
     /// Count of nodes whose reachability has NOT been classified (WU-0003 /
     /// CL-REACH-08). A non-zero value means the graph was not (re)classified —
     /// `dead_code_count` is then NOT trustworthy as a clean signal, and the
-    /// caller MUST surface an `UNCLASSIFIED — run index first` banner rather than
+    /// caller MUST surface an indexed-but-unclassified warning rather than
     /// reporting a false-clean `dead=0`. `0` on a fully-classified graph.
     pub unclassified_count: usize,
 }
@@ -84,8 +84,9 @@ impl OverviewData {
     /// Whether the UNCLASSIFIED banner must be shown (any node is unclassified).
     ///
     /// WU-0003 / CL-REACH-08: when this is `true`, a `dead=0` report is a
-    /// false-clean — the classifier never ran. Callers print
-    /// `UNCLASSIFIED — run index first`.
+    /// false-clean. Callers explain that the indexed generation lacks
+    /// authoritative reachability and direct the user to the owning project or
+    /// capability gap instead of prescribing a blind reindex.
     pub const fn needs_unclassified_banner(&self) -> bool {
         self.unclassified_count > 0
     }
@@ -170,6 +171,7 @@ pub fn project_unit_label(unit: &ProjectUnit) -> String {
         ProjectUnitKind::Workspace => "repository workspace".into(),
         ProjectUnitKind::Package => "repository package".into(),
         ProjectUnitKind::Module => "repository module".into(),
+        ProjectUnitKind::Application => "repository application".into(),
         ProjectUnitKind::LooseSources => format!("{} loose sources", unit.language_id),
         ProjectUnitKind::AuxiliarySources => {
             format!("{} auxiliary sources", unit.language_id)

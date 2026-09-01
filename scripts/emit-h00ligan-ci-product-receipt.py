@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 
 
-SCHEMA = "h00ligan/ci-product-terminal/v2"
+SCHEMA = "h00ligan/ci-product-terminal/v3"
 SOURCE_PREFLIGHT_SCHEMA = "h00ligan/ci-product-source-preflight/v1"
 DEFAULT_SOURCE_PREFLIGHT = Path(".h00ligan/gates/ci-product-source-preflight.json")
 SOURCE_TREE_VECTOR_SHA256 = (
@@ -239,8 +239,9 @@ def derive(
         raise ReceiptError("portable binary size differs from its build receipt")
     if product_source.get("schema") != PRODUCT_SOURCE_SCHEMA:
         raise ReceiptError("product-source receipt schema changed")
-    if product_source.get("source_dirty") is not False:
-        raise ReceiptError("product-source receipt is not a closed snapshot")
+    source_dirty = product_source.get("source_dirty")
+    if not isinstance(source_dirty, bool):
+        raise ReceiptError("product-source receipt has invalid Git state")
     if build.get("product_source_receipt_sha256") != product_source_sha256:
         raise ReceiptError("portable build names another product-source receipt")
 
@@ -283,6 +284,7 @@ def derive(
         "build_receipt_sha256": build_sha256,
         "product_source_receipt_sha256": product_source_sha256,
         "schema": SCHEMA,
+        "source_dirty": source_dirty,
         "source_preflight_receipt_sha256": sha256(source_preflight_raw),
         "source_tree_sha256": source_preflight["source_tree_sha256"],
     }
@@ -329,10 +331,12 @@ def resolve_product(repo_root: Path) -> tuple[Path, Path, Path]:
 
 
 class Fixture:
-    def __init__(self) -> None:
+    def __init__(self, *, source_dirty: bool = False) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        (self.root / "Cargo.toml").write_text("[workspace]\nmembers = []\n", encoding="utf-8")
+        (self.root / "Cargo.toml").write_text(
+            "[workspace]\nmembers = []\n", encoding="utf-8"
+        )
         artifact = self.root / "target/artifacts/native/key"
         artifact.mkdir(parents=True)
         self.binary = artifact / "h00ligan"
@@ -343,7 +347,7 @@ class Fixture:
             json.dumps(
                 {
                     "schema": PRODUCT_SOURCE_SCHEMA,
-                    "source_dirty": False,
+                    "source_dirty": source_dirty,
                     "source_key": "11" * 32,
                 },
                 sort_keys=True,
@@ -401,6 +405,24 @@ class Fixture:
         self.source_preflight = self.root / DEFAULT_SOURCE_PREFLIGHT
         write_source_preflight(self.root, self.source_preflight)
 
+    def rebind_product_source(self) -> None:
+        product_source_sha256 = sha256(self.product_source.read_bytes())
+        build = json.loads(self.build.read_text(encoding="utf-8"))
+        build["product_source_receipt_sha256"] = product_source_sha256
+        self.build.write_text(
+            json.dumps(build, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        benchmark = json.loads(self.benchmark.read_text(encoding="utf-8"))
+        benchmark["artifact"]["product_source_receipt_sha256"] = (
+            product_source_sha256
+        )
+        benchmark["artifact"]["receipt_sha256"] = sha256(self.build.read_bytes())
+        self.benchmark.write_text(
+            json.dumps(benchmark, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
     def derive(self) -> dict[str, object]:
         return derive(
             self.root,
@@ -427,15 +449,32 @@ def self_test() -> int:
     known = Fixture()
     try:
         receipt = known.derive()
-        if receipt.get("schema") != SCHEMA or len(str(receipt.get("binary_sha256"))) != 64:
+        if (
+            receipt.get("schema") != SCHEMA
+            or receipt.get("source_dirty") is not False
+            or len(str(receipt.get("binary_sha256"))) != 64
+        ):
             raise AssertionError("known-positive terminal receipt is vacuous")
     finally:
         known.close()
+
+    # RIGHT-REASON REGRESSION: an uncommitted tree is still a closed product
+    # snapshot when the immutable product-source receipt and the start/end
+    # source-tree digest bind its exact bytes. Git cleanliness is release
+    # policy, not content identity.
+    dirty = Fixture(source_dirty=True)
+    try:
+        receipt = dirty.derive()
+        if receipt.get("source_dirty") is not True:
+            raise AssertionError("dirty exact-snapshot positive control is vacuous")
+    finally:
+        dirty.close()
 
     cases = (
         "binary",
         "build",
         "source",
+        "source_state",
         "source_tree",
         "preflight",
         "benchmark",
@@ -453,6 +492,14 @@ def self_test() -> int:
                 fixture.build.write_text(json.dumps(document), encoding="utf-8")
             elif case == "source":
                 fixture.product_source.write_bytes(fixture.product_source.read_bytes() + b" ")
+            elif case == "source_state":
+                document = json.loads(fixture.product_source.read_text(encoding="utf-8"))
+                document["source_dirty"] = "unknown"
+                fixture.product_source.write_text(
+                    json.dumps(document, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                fixture.rebind_product_source()
             elif case == "source_tree":
                 source = fixture.root / "Cargo.toml"
                 source.write_bytes(source.read_bytes() + b"# post-preflight drift\n")

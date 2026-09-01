@@ -83,6 +83,156 @@ func TestCompilerTraceCoalescesMissingCandidatesAtMembershipOwner(t *testing.T) 
 	}
 }
 
+// RIGHT-REASON REGRESSION: a bounded source unit may resolve more exact
+// dependency/configuration inputs than it contains source documents. Reusing
+// the document cap here rejected ordinary compiler evidence from real repos.
+func TestSemanticInputManifestHasIndependentPopulationBound(t *testing.T) {
+	t.Parallel()
+	if h00MaxSemanticInputPaths <= h00MaxDocumentPaths {
+		t.Fatal("semantic inputs still reuse the source-document population bound")
+	}
+	inputs := h00SemanticInputs{
+		SchemaVersion: h00ProviderSemanticInputsSchema,
+		Coverage:      "complete",
+		Paths:         make([]h00SemanticPathInput, 0, h00MaxDocumentPaths+1),
+		Environment:   []h00SemanticEnvironmentInput{},
+		Issues:        []h00SemanticInputIssue{},
+	}
+	identity := h00SHA256([]byte("dependency declaration"))
+	for index := range h00MaxDocumentPaths + 1 {
+		inputs.Paths = append(inputs.Paths, h00SemanticPathInput{
+			Root:           "repository",
+			Path:           fmt.Sprintf("node_modules/pkg-%05d/index.d.ts", index),
+			Kind:           "file",
+			IdentitySHA256: identity,
+			EntryCount:     1,
+			ByteLength:     1,
+		})
+	}
+	if _, err := h00SemanticInputsSHA256(inputs); err != nil {
+		t.Fatalf("bounded compiler inputs above the document cap were rejected: %v", err)
+	}
+}
+
+// RIGHT-REASON REGRESSION: TypeScript's raw module-resolution cache records a
+// failed file probe even when an admitted ambient declaration intentionally
+// supplies the module. Authority must follow the compiler diagnostic for the
+// owning document, not reinterpret that internal probe as an unresolved import.
+func TestAmbientModuleDoesNotDegradeResolutionHealth(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	writeTypeScriptFixture(t, root, "package.json", `{"name":"@fixture/ambient","version":"1.0.0","type":"module"}`)
+	writeTypeScriptFixture(t, root, "tsconfig.json", `{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true
+  },
+  "include": ["src/**/*"]
+}`)
+	declaration := "declare module \"*.css\" { const value: string; export default value; }\n"
+	usage := "import styles from \"./style.css\";\nexport const className: string = styles;\n"
+	writeTypeScriptFixture(t, root, "src/styles.d.ts", declaration)
+	writeTypeScriptFixture(t, root, "src/usage.ts", usage)
+	writeTypeScriptFixture(t, root, "src/style.css", ".fixture {}\n")
+	sources := map[string]h00SourceIdentity{
+		"src/styles.d.ts": testTypeScriptSource("src/styles.d.ts", declaration),
+		"src/usage.ts":    testTypeScriptSource("src/usage.ts", usage),
+	}
+	engine, err := h00StartTypeScriptEngine(ctx, root, root, "", sources)
+	if err != nil {
+		t.Fatalf("start ambient-module compiler: %v", err)
+	}
+	t.Cleanup(engine.close)
+
+	absolute := filepath.Join(root, "src/usage.ts")
+	languageService, err := engine.session.GetLanguageService(ctx, h00TypeScriptURI(absolute))
+	if err != nil {
+		t.Fatalf("load ambient-module project: %v", err)
+	}
+	program := languageService.GetProgram()
+	if program == nil {
+		t.Fatal("ambient-module project has no compiler program")
+	}
+	file := program.GetSourceFile(absolute)
+	if file == nil {
+		t.Fatal("ambient-module project omitted its usage document")
+	}
+	rawUnresolved := false
+	for key, resolution := range program.GetResolvedModules()[file.Path()] {
+		if key.Name == "./style.css" && !resolution.IsResolved() {
+			rawUnresolved = true
+			break
+		}
+	}
+	if !rawUnresolved {
+		t.Fatal("positive control: compiler raw cache did not retain the failed CSS file probe")
+	}
+	for _, diagnostic := range program.GetSemanticDiagnostics(ctx, file) {
+		if moduleReference, missing := h00TypeScriptUnresolvedModuleReference(diagnostic); missing {
+			t.Fatalf("ambient declaration did not satisfy compiler diagnostics for %q", moduleReference)
+		}
+	}
+
+	_, _, health, err := engine.authorityEvidence(ctx)
+	if err != nil {
+		t.Fatalf("observe ambient-module authority: %v", err)
+	}
+	if !health.DiagnosticsComplete || health.Components["module_resolution"] != "healthy" ||
+		len(health.DegradationReasons) != 0 {
+		t.Fatalf("ambient module falsely degraded resolution authority: %+v", health)
+	}
+}
+
+// RIGHT-REASON REGRESSION: a top-level destructuring binding is a declaration
+// name, but its BindingPattern parent is not a text-bearing named container.
+// Asking Node.Text for that compiler-owned AST kind panics during SCIP export.
+func TestNativeCompilerExportsTopLevelDestructuringBindings(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	writeTypeScriptFixture(t, root, "package.json", `{"name":"@fixture/destructuring","version":"1.0.0","type":"module"}`)
+	writeTypeScriptFixture(t, root, "tsconfig.json", `{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true
+  },
+  "include": ["src/**/*.ts"]
+}`)
+	source := `export const viewports = [["desktop", 1440]] as const;
+for (const [viewportName, viewportWidth] of viewports) {
+  void viewportName;
+  void viewportWidth;
+}
+`
+	writeTypeScriptFixture(t, root, "src/viewport.ts", source)
+	sources := map[string]h00SourceIdentity{
+		"src/viewport.ts": testTypeScriptSource("src/viewport.ts", source),
+	}
+	engine, err := h00StartTypeScriptEngine(ctx, root, root, "", sources)
+	if err != nil {
+		t.Fatalf("start destructuring compiler: %v", err)
+	}
+	t.Cleanup(engine.close)
+	documents, err := engine.exportDocuments(ctx, []string{"src/viewport.ts"})
+	if err != nil {
+		t.Fatalf("export top-level destructuring bindings: %v", err)
+	}
+	if len(documents) != 1 {
+		t.Fatalf("expected one exact document, got %d", len(documents))
+	}
+	for _, spelling := range []string{"viewportName", "viewportWidth"} {
+		definition := uniqueOccurrence(t, documents[0], source, spelling, true)
+		if definition.Symbol == "" {
+			t.Fatalf("destructured definition %q has no symbol identity", spelling)
+		}
+	}
+}
+
 // RIGHT-REASON REGRESSION: the TypeScript provider must derive cross-file
 // identity from the native compiler graph. Text matching cannot distinguish a
 // local Unicode declaration from the same spelling in an external library,

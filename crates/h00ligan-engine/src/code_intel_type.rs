@@ -10,10 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::code_intel_cursor::{page_window, request_digest};
 use crate::code_intel_domain::{
-    AuthorityStatus, CapabilityScope, ConfigurationId, DomainError, GenerationId, LanguageId,
-    MAX_TYPE_PAGE_SIZE, Page, ProjectInventory, ProjectInventoryCoverage, ProjectUnitId,
-    ProviderId, RepositoryBinding, STRUCTURAL_GRAPH_CONFIGURATION_ID, TypeRequest,
-    capability_resolution_domain_error, resolve_capability_provider,
+    AuthorityStatus, CapabilityCoverage, CapabilityCoverageStatus, ConfigurationId, DomainError,
+    GenerationId, LanguageId, MAX_GENERATION_ENGINE_RESULT_CHARS, MAX_TYPE_PAGE_SIZE, Page,
+    ProjectInventory, ProjectInventoryCoverage, ProjectUnitId, RepositoryBinding,
+    STRUCTURAL_GRAPH_CONFIGURATION_ID, TypeRequest, assess_structural_graph_language_capability,
 };
 use crate::code_intel_inventory::project_unit_graph;
 use crate::code_intel_publication::ResolvedGeneration;
@@ -24,7 +24,7 @@ use crate::graph_query::collect_type_children;
 use crate::project_binding::ProjectBinding;
 use crate::structural_ir::{SymbolRole, symbol_kind_has_role};
 
-const TYPE_SCHEMA_VERSION: &str = "h00/code-intel/type/v1";
+const TYPE_SCHEMA_VERSION: &str = "h00/code-intel/type/v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,14 +32,13 @@ pub enum StructuralTypePopulation {
     IndexedTypeMembers,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StructuralAuthority {
     pub status: AuthorityStatus,
     pub population: StructuralTypePopulation,
-    pub provider_id: ProviderId,
-    pub provider_version: String,
-    pub scopes: Vec<CapabilityScope>,
-    pub input_fingerprints: Vec<String>,
+    pub structural_graph: CapabilityCoverage,
+    pub project_inventory_coverage: ProjectInventoryCoverage,
+    pub population_complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,7 +94,7 @@ pub struct TypeMemberTotals {
     pub implementors: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExactTypeResult {
     pub schema_version: String,
     pub capability: String,
@@ -134,76 +133,111 @@ pub fn query_published_type(
             ),
         });
     }
-    let required_scopes = required_structural_scopes(type_node)?;
-    let provider = resolve_capability_provider(
+    let type_language = selected_structural_language(type_node)?;
+    let structural_graph = assess_structural_graph_language_capability(
+        graph,
         &generation.manifest.receipts,
-        "structural_graph",
-        &required_scopes,
-        None,
-    )
-    .map_err(|error| {
-        capability_resolution_domain_error("structural_graph", error, &generation.manifest.receipts)
-    })?;
+        &generation.project_inventory,
+        &type_language,
+    )?;
 
     let members = canonical_members(collect_members(graph, type_node, generation)?)?;
 
     let totals = member_totals(&members);
     let generation_id = generation.manifest.generation_id.clone();
     let request_digest = type_request_digest(request);
-    let window = page_window(
-        "type",
-        &generation_id,
-        &request_digest,
-        request.cursor.as_deref(),
-        request.limit,
-        members.len(),
-    )?;
-    let items = members[window.range.clone()].to_vec();
-
-    let mut projected_documents = items
-        .iter()
-        .filter(|item| item.symbol.source_backed)
-        .map(|item| item.symbol.document_path.as_str())
-        .collect::<Vec<_>>();
-    projected_documents.push(&resolved_type.document_path);
-    let unit_graph = project_unit_graph(&generation.project_inventory, projected_documents);
-    let mut input_fingerprints = provider
-        .receipts
-        .iter()
-        .filter_map(|receipt| receipt.input_fingerprint.clone())
-        .collect::<Vec<_>>();
-    input_fingerprints.sort();
-    input_fingerprints.dedup();
-    let mut warnings = Vec::new();
-    if generation.project_inventory.coverage
-        == ProjectInventoryCoverage::IndexedSourcePopulationPartial
-    {
-        warnings.push(format!(
+    let inventory_coverage = generation
+        .project_inventory
+        .coverage_for_language(&type_language);
+    let inventory_issues = generation
+        .project_inventory
+        .issues_for_language(&type_language);
+    let mut base_warnings = Vec::new();
+    if inventory_coverage == ProjectInventoryCoverage::IndexedSourcePopulationPartial {
+        base_warnings.push(format!(
             "Project inventory is partial and reports {} issue(s); Type authority is limited to the indexed structural population.",
-            generation.project_inventory.issues.len()
+            inventory_issues.len()
         ));
     }
+    if structural_graph.status != CapabilityCoverageStatus::Complete {
+        base_warnings.push(
+            "Type members are exact within the published structural graph, but totals and missing-member conclusions are incomplete for the selected language."
+                .into(),
+        );
+    }
+    let population_complete = inventory_coverage
+        == ProjectInventoryCoverage::IndexedSourcePopulationComplete
+        && structural_graph.status == CapabilityCoverageStatus::Complete;
 
-    Ok(ExactTypeResult {
-        schema_version: TYPE_SCHEMA_VERSION.into(),
-        capability: "structural_graph".into(),
-        generation_id,
-        repository: repository_binding(binding, generation),
-        unit_graph,
-        resolved_type,
-        authority: StructuralAuthority {
-            status: AuthorityStatus::Complete,
-            population: StructuralTypePopulation::IndexedTypeMembers,
-            provider_id: provider.provider_id,
-            provider_version: provider.provider_version,
-            scopes: provider.required_scopes,
-            input_fingerprints,
-        },
-        items,
-        totals,
-        page: window.page,
-        warnings,
-    })
+    let authority_status = if population_complete {
+        AuthorityStatus::Complete
+    } else {
+        AuthorityStatus::Qualified
+    };
+    let mut smallest_result_chars = 0;
+    for effective_limit in (1..=request.limit).rev() {
+        let window = page_window(
+            "type",
+            &generation_id,
+            &request_digest,
+            request.cursor.as_deref(),
+            effective_limit,
+            members.len(),
+        )?;
+        let items = members[window.range.clone()].to_vec();
+        let mut projected_documents = items
+            .iter()
+            .filter(|item| item.symbol.source_backed)
+            .map(|item| item.symbol.document_path.as_str())
+            .collect::<Vec<_>>();
+        projected_documents.push(&resolved_type.document_path);
+        let mut warnings = base_warnings.clone();
+        if effective_limit < request.limit && window.page.returned == effective_limit {
+            warnings.push(format!(
+                "serialized-result bounds reduced this page from the requested ceiling of {} to {effective_limit} type members",
+                request.limit
+            ));
+        }
+        let result = ExactTypeResult {
+            schema_version: TYPE_SCHEMA_VERSION.into(),
+            capability: "structural_graph".into(),
+            generation_id: generation_id.clone(),
+            repository: repository_binding(binding, generation),
+            unit_graph: project_unit_graph(&generation.project_inventory, projected_documents),
+            resolved_type: resolved_type.clone(),
+            authority: StructuralAuthority {
+                status: authority_status.clone(),
+                population: StructuralTypePopulation::IndexedTypeMembers,
+                structural_graph: structural_graph.clone(),
+                project_inventory_coverage: inventory_coverage,
+                population_complete,
+            },
+            items,
+            totals: totals.clone(),
+            page: window.page,
+            warnings,
+        };
+        let result_chars = serde_json::to_string(&result)
+            .map_err(|error| DomainError::PublishedGenerationInvalid {
+                reason: format!("serialize Type result for size validation: {error}"),
+            })?
+            .chars()
+            .count();
+        smallest_result_chars = if smallest_result_chars == 0 {
+            result_chars
+        } else {
+            smallest_result_chars.min(result_chars)
+        };
+        if result_chars <= MAX_GENERATION_ENGINE_RESULT_CHARS {
+            return Ok(result);
+        }
+    }
+    Err(DomainError::result_too_large(
+        "type",
+        smallest_result_chars,
+        MAX_GENERATION_ENGINE_RESULT_CHARS,
+        "Narrow the symbol/file scope; required Type identity, authority, and unit metadata do not fit even when the page limit is one",
+    ))
 }
 
 pub(crate) fn type_request_digest(request: &TypeRequest) -> String {
@@ -216,22 +250,8 @@ pub(crate) fn type_request_digest(request: &TypeRequest) -> String {
     )
 }
 
-fn required_structural_scopes(type_node: &GraphNode) -> Result<Vec<CapabilityScope>, DomainError> {
-    let language_id = language_id_for_path(&type_node.file_path);
-    if language_id.0 == "unknown" {
-        return Err(DomainError::CapabilityUnavailable {
-            capability: "structural_graph".into(),
-            reason: "the selected type's structural language is unknown".into(),
-            scopes: vec![CapabilityScope::Repository {
-                configuration_id: ConfigurationId::new(STRUCTURAL_GRAPH_CONFIGURATION_ID),
-            }],
-            evidence: Vec::new(),
-        });
-    }
-    Ok(vec![CapabilityScope::Language {
-        language_id,
-        configuration_id: ConfigurationId::new(STRUCTURAL_GRAPH_CONFIGURATION_ID),
-    }])
+fn selected_structural_language(type_node: &GraphNode) -> Result<LanguageId, DomainError> {
+    Ok(language_id_for_path(&type_node.file_path))
 }
 
 fn resolve_type<'a>(
@@ -538,7 +558,8 @@ mod tests {
 
     use super::*;
     use crate::code_intel_domain::{
-        CapabilityReceipt, ProjectInventory, RepositoryId, TypeRequest,
+        CapabilityReceipt, CapabilityScope, ProjectInventory, ProjectInventoryCoverage,
+        RepositoryId, TypeRequest,
     };
     use crate::code_intel_publication::{GenerationManifest, PublicationHead, PublicationHeadBody};
     use crate::graph::{EdgeScope, GraphEdge, SourceSpan};
@@ -655,7 +676,7 @@ mod tests {
             "a".repeat(64),
         );
         let manifest = GenerationManifest {
-            schema_version: "h00/code-intel/generation/v6".into(),
+            schema_version: crate::code_intel_publication::GENERATION_SCHEMA_VERSION.into(),
             generation_id: generation_id.clone(),
             repository_id: repository_id.clone(),
             parent_generation_id: None,
@@ -883,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_structural_authority_and_non_type_targets_fail_closed() {
+    fn partial_structural_authority_qualifies_observed_type_while_non_types_fail_closed() {
         let mut graph = KnowledgeGraph::new();
         add_node(&mut graph, node("not_a_type", "function", 0));
         let non_type = fixture(graph);
@@ -912,24 +933,55 @@ mod tests {
             "source_extraction_failed",
             "one Rust source file could not be extracted",
         )];
-        let error = query_published_type(
+        let result = query_published_type(
             &fixture.graph,
             &fixture.generation,
             &fixture.binding,
             &TypeRequest::new("PartialType"),
         )
-        .expect_err("partial structural evidence cannot authorize Type");
-        match error {
-            DomainError::CapabilityUnavailable {
-                capability,
-                evidence,
+        .expect("partial structural evidence retains observed Type facts");
+        assert_eq!(result.resolved_type.name, "PartialType");
+        assert_eq!(result.authority.status, AuthorityStatus::Qualified);
+        assert!(!result.authority.population_complete);
+        assert_eq!(
+            result.authority.structural_graph.status,
+            CapabilityCoverageStatus::Partial
+        );
+        assert_eq!(
+            result.authority.structural_graph.languages[0].gaps[0].reason_code,
+            "source_extraction_failed"
+        );
+        assert!(result.warnings.iter().any(|warning| {
+            warning.contains("totals and missing-member conclusions are incomplete")
+        }));
+    }
+
+    #[test]
+    fn irreducible_type_metadata_returns_the_typed_product_bound() {
+        let mut graph = KnowledgeGraph::new();
+        let mut oversized = node("OversizedType", "struct", 0);
+        oversized.signature = "x".repeat(MAX_GENERATION_ENGINE_RESULT_CHARS + 1_024);
+        add_node(&mut graph, oversized);
+        let fixture = fixture(graph);
+        let mut request = TypeRequest::new("OversizedType");
+        request.limit = 1;
+
+        let error = query_published_type(
+            &fixture.graph,
+            &fixture.generation,
+            &fixture.binding,
+            &request,
+        )
+        .expect_err("required metadata larger than the engine envelope must fail closed");
+        assert!(matches!(
+            error,
+            DomainError::ResultTooLarge {
+                operation: "type",
+                actual_chars,
+                max_chars: MAX_GENERATION_ENGINE_RESULT_CHARS,
                 ..
-            } => {
-                assert_eq!(capability, "structural_graph");
-                assert_eq!(evidence[0].reason_code, "source_extraction_failed");
-            }
-            other => panic!("unexpected error: {other}"),
-        }
+            } if actual_chars > MAX_GENERATION_ENGINE_RESULT_CHARS
+        ));
     }
 
     #[test]
@@ -957,6 +1009,18 @@ mod tests {
                 "unrelated_go_extraction_failed",
                 "the unrelated Go population is unavailable",
             ));
+        let inventory = std::sync::Arc::make_mut(&mut fixture.generation.project_inventory);
+        inventory.coverage = ProjectInventoryCoverage::IndexedSourcePopulationPartial;
+        inventory
+            .issues
+            .push(crate::code_intel_domain::ProjectInventoryIssue {
+                scope: crate::code_intel_domain::ProjectInventoryIssueScope::Language {
+                    language_id: LanguageId::new("go"),
+                },
+                code: "go_manifest_unavailable".into(),
+                path: "go/go.mod".into(),
+                detail: "unrelated Go inventory issue control".into(),
+            });
 
         let result = query_published_type(
             &fixture.graph,
@@ -966,11 +1030,64 @@ mod tests {
         )
         .expect("unrelated language gaps must not poison exact Rust Type authority");
         assert_eq!(result.authority.status, AuthorityStatus::Complete);
-        assert_eq!(result.authority.scopes.len(), 1);
-        assert!(matches!(
-            &result.authority.scopes[0],
-            CapabilityScope::Language { language_id, .. } if language_id.0 == "rust"
-        ));
+        assert!(result.authority.population_complete);
+        assert_eq!(result.authority.structural_graph.languages.len(), 1);
+        assert_eq!(
+            result.authority.structural_graph.languages[0].language_id.0,
+            "rust"
+        );
+        assert_eq!(
+            result.authority.structural_graph.status,
+            CapabilityCoverageStatus::Complete
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("Project inventory is partial")),
+            "unrelated Go inventory issues must not qualify Rust Type: {result:?}"
+        );
+    }
+
+    #[test]
+    fn selected_language_inventory_issue_qualifies_type_authority() {
+        let mut graph = KnowledgeGraph::new();
+        add_node(&mut graph, node("RustType", "struct", 0));
+        let mut fixture = fixture(graph);
+        let inventory = std::sync::Arc::make_mut(&mut fixture.generation.project_inventory);
+        inventory.coverage = ProjectInventoryCoverage::IndexedSourcePopulationPartial;
+        inventory
+            .issues
+            .push(crate::code_intel_domain::ProjectInventoryIssue {
+                scope: crate::code_intel_domain::ProjectInventoryIssueScope::Language {
+                    language_id: LanguageId::new("rust"),
+                },
+                code: "rust_manifest_unavailable".into(),
+                path: "Cargo.toml".into(),
+                detail: "affected Rust inventory issue control".into(),
+            });
+
+        let result = query_published_type(
+            &fixture.graph,
+            &fixture.generation,
+            &fixture.binding,
+            &TypeRequest::new("RustType"),
+        )
+        .expect("partial inventory retains bounded structural Type evidence");
+
+        assert_eq!(result.authority.status, AuthorityStatus::Qualified);
+        assert!(!result.authority.population_complete);
+        assert_eq!(
+            result.authority.project_inventory_coverage,
+            ProjectInventoryCoverage::IndexedSourcePopulationPartial
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Project inventory is partial")),
+            "the qualified result must disclose its selected-language inventory gap: {result:?}"
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@
 use serde_json::{Value, json};
 
 use h00ligan_engine::code_intel_diff::{
-    DEFAULT_DIFF_LIMIT, DiffRequest, MAX_DIFF_LIMIT, query_live_diff, validate_diff_request,
+    DEFAULT_DIFF_LIMIT, DiffRequest, MAX_DIFF_LIMIT, validate_diff_request,
 };
 use h00ligan_engine::code_intel_find::{
     DEFAULT_FIND_PAGE_SIZE, FindMode, FindRequest, MAX_FIND_CURSOR_BYTES, MAX_FIND_KIND_BYTES,
@@ -16,12 +16,10 @@ use h00ligan_engine::code_intel_find::{
 };
 use h00ligan_engine::code_intel_source_search::{
     DEFAULT_SOURCE_SEARCH_LIMIT, MAX_SOURCE_SEARCH_CONTEXT_LINES, MAX_SOURCE_SEARCH_LIMIT,
-    SourceSearchOptions, SourceSearchRequest, bind_source_search_result,
-    validate_source_search_request,
+    SourceSearchRequest, validate_source_search_request,
 };
-use h00ligan_engine::source_search::{SourcePattern, search_registered_source};
 
-use super::code_intel::{code_intel_domain_error, optional_usize, require_graph};
+use super::code_intel::{code_intel_domain_error, optional_usize};
 use crate::tool_api::{CodeIntelAccess, CodeIntelHandler};
 use crate::{CodeIntelContext, ToolDefinition, ToolError};
 
@@ -328,24 +326,10 @@ impl CodeIntelHandler for DiffHandler {
         validate_diff_request(&request).map_err(code_intel_domain_error)?;
 
         let snapshot = ctx.snapshot();
-        let binding = ctx.binding().clone();
-        let graph = require_graph(ctx, &snapshot)?;
-        let generation = snapshot.immutable_generation().cloned().ok_or_else(|| {
-            ToolError::ExecutionFailed(
-                "diff requires a validated immutable generation; run reindex/init".into(),
-            )
-        })?;
-        let indexed_sources = snapshot.indexed_sources.clone();
-
-        // Extraction and ignore-aware discovery are blocking. Both adapters
-        // enter the same engine use case and serialize its exact DTO.
-        let result = tokio::task::spawn_blocking(move || {
-            let indexed_sources = indexed_sources.authority();
-            query_live_diff(&graph, &generation, &binding, indexed_sources, request)
-        })
-        .await
-        .map_err(|error| ToolError::ExecutionFailed(format!("diff task join: {error}")))?
-        .map_err(code_intel_domain_error)?;
+        let result = snapshot
+            .query_diff(ctx.binding(), &request)
+            .await
+            .map_err(code_intel_domain_error)?;
 
         serde_json::to_value(result)
             .map_err(|error| ToolError::ExecutionFailed(format!("serialize diff result: {error}")))
@@ -415,70 +399,18 @@ impl CodeIntelHandler for GrepContextHandler {
         let limit = optional_usize(&input, "limit", DEFAULT_SOURCE_SEARCH_LIMIT)?;
         let context_lines = optional_usize(&input, "context_lines", 0)?;
 
-        let working_dir = ctx.binding().root().to_path_buf();
-        let search_root = match search_path.as_deref() {
-            Some(path) => ctx
-                .binding()
-                .resolve_existing_path(std::path::Path::new(path))
-                .map_err(|error| ToolError::PathBlocked(error.to_string()))?,
-            None => working_dir.clone(),
-        };
-        let relative_path = search_root
-            .strip_prefix(&working_dir)
-            .map_err(|error| ToolError::PathBlocked(error.to_string()))?
-            .to_string_lossy()
-            .replace('\\', "/");
         let request = SourceSearchRequest {
             pattern,
-            path: if relative_path.is_empty() {
-                ".".into()
-            } else {
-                relative_path
-            },
+            path: search_path.unwrap_or_else(|| ".".into()),
             context_lines,
             limit,
         };
         validate_source_search_request(&request).map_err(code_intel_domain_error)?;
         let snapshot = ctx.snapshot();
-        let graph = require_graph(ctx, &snapshot)?;
-        let generation = snapshot.immutable_generation().ok_or_else(|| {
-            ToolError::ExecutionFailed(
-                "grep_context requires a validated immutable generation".into(),
-            )
-        })?;
-
-        // The shared in-process search is blocking filesystem work.
-        let search_report = {
-            let search_binding = ctx.binding().clone();
-            let pattern_clone = request.pattern.clone();
-            let limit = request.limit;
-            let context_lines = request.context_lines;
-            tokio::task::spawn_blocking(move || {
-                search_registered_source(
-                    &search_binding,
-                    &search_root,
-                    SourcePattern::Regex(&pattern_clone),
-                    SourceSearchOptions {
-                        max_matches: limit,
-                        max_matches_per_file: limit,
-                        context_lines,
-                    },
-                )
-            })
+        let result = snapshot
+            .query_source_search(ctx.binding(), &request)
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("grep task join: {e}")))?
-            .map_err(ToolError::ExecutionFailed)?
-        };
-        let indexed_sources = snapshot.indexed_sources.files();
-        let result = bind_source_search_result(
-            &graph,
-            generation,
-            ctx.binding(),
-            indexed_sources,
-            request,
-            search_report,
-        )
-        .map_err(code_intel_domain_error)?;
+            .map_err(code_intel_domain_error)?;
         serde_json::to_value(result).map_err(|error| {
             ToolError::ExecutionFailed(format!("serialize source-search result: {error}"))
         })

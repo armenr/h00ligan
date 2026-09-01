@@ -181,7 +181,7 @@ fn t_r3_find_glob_handler() {
             .expect("serialize Find result")
             .chars()
             .count()
-            <= h00ligan_engine::code_intel_find::MAX_FIND_RESULT_CHARS,
+            <= h00ligan_engine::code_intel_domain::MAX_CODE_INTEL_RESULT_CHARS,
         "Find must enforce its product bound before transport: {json}"
     );
     if returned < count {
@@ -277,7 +277,7 @@ fn t_r5_inspect_structure() {
         )
     });
 
-    assert_eq!(json["schema_version"], "h00/code-intel/inspect/v2");
+    assert_eq!(json["schema_version"], "h00/code-intel/inspect/v3");
     assert!(
         matches!(
             json["source"]["status"].as_str(),

@@ -20,7 +20,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use h00ligan_provider_protocol::{
     ProviderFrameLimits, ProviderSemanticInputCoverage, ProviderSemanticPathKind,
-    provider_semantic_paths_are_current,
+    ProviderSemanticPathRoot, provider_semantic_paths_are_current,
+    resolve_provider_semantic_path_location,
 };
 
 use crate::code_intel_payload::NormalizedProviderPayload;
@@ -129,6 +130,8 @@ pub enum WatcherError {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct DeclaredWatchInput {
+    root: ProviderSemanticPathRoot,
+    authority_root: PathBuf,
     path: PathBuf,
     kind: ProviderSemanticPathKind,
 }
@@ -277,13 +280,19 @@ fn add_declared_input_directories(
     desired: &mut BTreeSet<PathBuf>,
 ) -> Result<(), WatcherError> {
     for input in declared_inputs {
-        if !input.path.is_absolute() || !input.path.starts_with(&config.root) {
+        if !input.path.is_absolute()
+            || !input.path.starts_with(&input.authority_root)
+            || (input.root == ProviderSemanticPathRoot::Repository
+                && input.authority_root != config.root)
+        {
             return Err(WatcherError::InvalidSemanticInput(format!(
-                "path escapes repository root: {}",
+                "path escapes its declared authority root: {}",
                 input.path.display()
             )));
         }
-        if is_generated_or_excluded(config, &input.path) {
+        if input.root == ProviderSemanticPathRoot::Repository
+            && is_generated_or_excluded(config, &input.path)
+        {
             return Err(WatcherError::InvalidSemanticInput(format!(
                 "path overlaps a generated or excluded root: {}",
                 input.path.display()
@@ -303,7 +312,7 @@ fn add_declared_input_directories(
 
         let mut candidate = input.path.parent();
         while let Some(directory) = candidate {
-            if !directory.starts_with(&config.root) {
+            if !directory.starts_with(&input.authority_root) {
                 break;
             }
             if is_plain_directory(directory) {
@@ -642,7 +651,7 @@ fn classify_path_with_declared_inputs(
     if crate::code_intel_project_inputs::is_project_control_path(path) {
         return Some(WatchHintReason::Filesystem);
     }
-    if declared_inputs.iter().any(|input| {
+    if let Some(input) = declared_inputs.iter().find(|input| {
         input.path == path
             || (input.kind == ProviderSemanticPathKind::Directory && path.starts_with(&input.path))
             || (input.kind == ProviderSemanticPathKind::DirectoryListing
@@ -656,7 +665,11 @@ fn classify_path_with_declared_inputs(
                         | EventKind::Any
                 ))
     }) {
-        return Some(WatchHintReason::Filesystem);
+        return Some(if input.root == ProviderSemanticPathRoot::Repository {
+            WatchHintReason::Filesystem
+        } else {
+            WatchHintReason::GitState
+        });
     }
     if path
         .strip_prefix(&config.root)
@@ -687,27 +700,13 @@ fn declared_watch_inputs(
     let mut inputs = BTreeSet::new();
     for payload in payloads {
         for input in &payload.payload().semantic_inputs().paths {
-            let relative = Path::new(&input.path);
-            let is_root_listing =
-                input.path == "." && input.kind == ProviderSemanticPathKind::DirectoryListing;
-            if (!is_root_listing && relative.is_absolute())
-                || relative.components().any(|component| {
-                    !matches!(component, std::path::Component::Normal(_))
-                        && !(is_root_listing && matches!(component, std::path::Component::CurDir))
-                })
-            {
-                return Err(WatcherError::InvalidSemanticInput(input.path.clone()));
-            }
-            let path = if is_root_listing {
-                repository_root.to_path_buf()
-            } else {
-                repository_root.join(relative)
-            };
-            if !path.starts_with(repository_root) {
-                return Err(WatcherError::InvalidSemanticInput(input.path.clone()));
-            }
+            let location =
+                resolve_provider_semantic_path_location(repository_root, input.root, &input.path)
+                    .map_err(|_| WatcherError::InvalidSemanticInput(input.path.clone()))?;
             inputs.insert(DeclaredWatchInput {
-                path,
+                root: input.root,
+                authority_root: location.authority_root,
+                path: location.absolute_path,
                 kind: input.kind,
             });
         }
@@ -860,12 +859,37 @@ impl IndexWatchService {
                         };
                         let inputs = match declared_watch_inputs(
                             &repository_root,
-                            &published.publication.provider_payloads,
+                            &published.provider_payloads,
                         ) {
                             Ok(inputs) => inputs,
                             Err(error) => {
-                                task_status.lock().last_error = Some(error.to_string());
-                                break;
+                                let semantic_error = error.to_string();
+                                if let Err(population_error) =
+                                    population.replace(BTreeSet::new()).await
+                                {
+                                    task_status.lock().last_error = Some(format!(
+                                        "{semantic_error}; repository-root fallback failed: {population_error}"
+                                    ));
+                                    break;
+                                }
+                                match task_supervisor.request_periodic_reconciliation() {
+                                    Ok(observation) => {
+                                        let schedule = task_supervisor.schedule_snapshot();
+                                        let mut current = task_status.lock();
+                                        current.integrity_reconciliations += 1;
+                                        current.desired_epoch = observation.desired_epoch;
+                                        current.published_epoch = schedule.published_epoch;
+                                        current.active_trigger = schedule.active_trigger;
+                                        current.last_error = Some(semantic_error);
+                                    }
+                                    Err(supervisor_error) => {
+                                        task_status.lock().last_error = Some(format!(
+                                            "{semantic_error}; reconciliation failed: {supervisor_error}"
+                                        ));
+                                        break;
+                                    }
+                                }
+                                continue;
                             }
                         };
                         if let Err(error) = population.replace(inputs.clone()).await {
@@ -880,7 +904,7 @@ impl IndexWatchService {
                         // could have been received yet.
                         if !complete_semantic_paths_are_current(
                             &repository_root,
-                            &published.publication.provider_payloads,
+                            &published.provider_payloads,
                         )
                         .unwrap_or(false)
                         {
@@ -900,6 +924,13 @@ impl IndexWatchService {
                                 }
                             }
                         }
+
+                        // Successfully resolving, registering, and
+                        // re-observing the published semantic population is
+                        // the recovery witness for an earlier transient root
+                        // error. Keep status about the current service state,
+                        // not a topology condition that no longer exists.
+                        task_status.lock().last_error = None;
                     }
                     batch = batches.recv() => {
                         let Some(batch) = batch else {
@@ -1341,7 +1372,11 @@ mod tests {
     #[tokio::test]
     async fn deep_integrity_reconciliation_recovers_a_deliberately_hidden_source_event() {
         let (_temporary, root, source, _binding, supervisor) = watch_fixture();
-        let watcher = WatcherConfig::new(root.clone(), 10).exclude_root(root.join("src"));
+        // Isolate the byte-exact reconciliation lane from platform-specific
+        // native delivery. Darwin can report a coarse parent event even when
+        // the changed descendant directory itself is excluded, so excluding
+        // only `src` does not prove that recovery was reconciliation-driven.
+        let watcher = WatcherConfig::new(root.clone(), 10).exclude_root(root.clone());
         let service = IndexWatchService::start(
             supervisor.clone(),
             watcher,
@@ -1464,6 +1499,145 @@ mod tests {
         service.stop().await.expect("stop WATCH service");
     }
 
+    /// FALSIFIER: a linked worktree can be moved or repaired through a short
+    /// interval where its reciprocal Git addressing files are inconsistent.
+    /// That uncertainty must schedule fail-closed reconciliation without
+    /// terminating the long-lived WATCH service.
+    #[tokio::test]
+    async fn transient_git_semantic_root_failure_reconciles_without_stopping_watch() {
+        let temporary = TempDir::new().expect("linked-worktree WATCH scratch");
+        let root = temporary.path().join("worktree");
+        let data = temporary.path().join("data");
+        let common_git = temporary.path().join("main/.git");
+        let worktree_git = common_git.join("worktrees/fixture");
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        std::fs::create_dir_all(&data).expect("data directory");
+        std::fs::create_dir_all(&worktree_git).expect("worktree gitdir");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"watch-git-root\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        )
+        .expect("manifest fixture");
+        std::fs::write(root.join("src/lib.rs"), "pub fn control() {}\n").expect("source fixture");
+        std::fs::write(
+            root.join(".git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .expect("linked-worktree marker");
+        std::fs::write(worktree_git.join("commondir"), "../..\n").expect("commondir");
+        std::fs::write(worktree_git.join("HEAD"), "ref: refs/heads/fixture\n")
+            .expect("per-worktree HEAD");
+        std::fs::write(
+            worktree_git.join("gitdir"),
+            format!("{}\n", root.join(".git").display()),
+        )
+        .expect("reciprocal worktree pointer");
+
+        let coordinates = BTreeSet::from([
+            h00ligan_provider_protocol::classify_provider_semantic_input_path(
+                &root,
+                &worktree_git.join("HEAD"),
+            )
+            .expect("classify exact per-worktree control"),
+        ]);
+        let semantic_inputs =
+            h00ligan_provider_protocol::capture_provider_semantic_inputs_at_coordinates(
+                &root,
+                &coordinates,
+                &BTreeSet::new(),
+                &ProviderFrameLimits::default(),
+            )
+            .expect("capture exact linked-worktree authority");
+        assert!(
+            semantic_inputs
+                .paths
+                .iter()
+                .any(|input| input.path == "commondir"),
+            "positive addressing-population control"
+        );
+        let receipt = crate::code_intel_domain::CapabilityReceipt::complete(
+            "calls",
+            "watch-git-fixture",
+            "1.0.0",
+            crate::code_intel_domain::CapabilityScope::Language {
+                language_id: crate::code_intel_domain::LanguageId::new("rust"),
+                configuration_id: crate::code_intel_domain::ConfigurationId::new("default"),
+            },
+            "a".repeat(64),
+        );
+        let mut payload = crate::code_intel_payload::CallsProviderPayload::new(receipt);
+        payload.semantic_inputs = semantic_inputs;
+        let payload = crate::code_intel_payload::normalize_provider_payload_typed(
+            &crate::code_intel_payload::ProviderPayload::Calls(payload),
+        )
+        .expect("normalized WATCH authority fixture");
+
+        let binding = crate::project_binding::ProjectBinding::explicit(&root, &data)
+            .expect("explicit watch binding");
+        let supervisor = IndexSupervisor::new(binding);
+        let service = IndexWatchService::start(
+            supervisor.clone(),
+            WatcherConfig::new(root.clone(), 10),
+            IndexSupervisorRequest::default(),
+            WatchCadence::new(Duration::from_secs(30), Duration::from_secs(30)),
+        )
+        .expect("start WATCH service");
+        let initial_epoch = wait_for_epoch_after(&supervisor, 0).await;
+
+        std::fs::write(worktree_git.join("commondir"), ".\n")
+            .expect("temporary non-linked topology");
+        supervisor.replace_watch_publication_for_test(vec![payload.clone()]);
+        let observed = timeout(Duration::from_secs(10), async {
+            loop {
+                let status = service.status();
+                if status.last_error.is_some() {
+                    return status;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("WATCH did not observe invalid transient Git authority");
+        assert!(
+            observed.running,
+            "transient root uncertainty must not terminate WATCH: {observed:?}"
+        );
+        assert!(
+            observed.desired_epoch > initial_epoch,
+            "transient root uncertainty must schedule authoritative reconciliation: {observed:?}"
+        );
+
+        std::fs::write(worktree_git.join("commondir"), "../..\n")
+            .expect("restore linked-worktree topology");
+        supervisor.replace_watch_publication_for_test(vec![payload]);
+        let recovered = timeout(Duration::from_secs(10), async {
+            loop {
+                let status = service.status();
+                if status.last_error.is_none() {
+                    return status;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "WATCH did not recover after linked-worktree authority was restored: {:?}",
+                service.status()
+            )
+        });
+        assert!(
+            recovered.running,
+            "restored semantic-root authority must leave WATCH operational: {recovered:?}"
+        );
+        assert!(
+            recovered.desired_epoch >= observed.desired_epoch,
+            "recovery must not roll scheduling authority backward: observed={observed:?} recovered={recovered:?}"
+        );
+        service.stop().await.expect("stop WATCH service");
+        supervisor.shutdown_and_wait().await;
+    }
+
     #[test]
     fn relevant_inputs_cover_current_and_planned_core_languages() {
         for path in [
@@ -1574,6 +1748,8 @@ mod tests {
         std::fs::write(&selector, "a\n").expect("declared semantic input");
         let config = WatcherConfig::new(root, 25);
         let declared = BTreeSet::from([DeclaredWatchInput {
+            root: ProviderSemanticPathRoot::Repository,
+            authority_root: config.root.clone(),
             path: selector.clone(),
             kind: ProviderSemanticPathKind::File,
         }]);
@@ -1609,6 +1785,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn typed_git_semantic_inputs_watch_only_their_proven_external_root() {
+        let temporary = TempDir::new().expect("Git-input watcher scratch");
+        let root = temporary.path().join("repo");
+        let common = temporary.path().join("main/.git");
+        let refs = common.join("refs/heads");
+        let branch = refs.join("fixture");
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        std::fs::create_dir_all(&refs).expect("Git common refs");
+        std::fs::write(root.join("src/lib.rs"), "pub fn control() {}\n")
+            .expect("source positive control");
+        std::fs::write(&branch, "1111111111111111111111111111111111111111\n").expect("shared ref");
+        let config = WatcherConfig::new(root, 25);
+        let declared = BTreeSet::from([DeclaredWatchInput {
+            root: ProviderSemanticPathRoot::GitCommon,
+            authority_root: common.clone(),
+            path: branch.clone(),
+            kind: ProviderSemanticPathKind::File,
+        }]);
+
+        let desired = desired_watch_directories_with_inputs(&config, &declared)
+            .expect("typed external Git watch population");
+        assert!(desired.contains(&refs), "shared ref parent must be watched");
+        let modify = EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Content,
+        ));
+        assert_eq!(
+            classify_path_with_declared_inputs(&config, &declared, &modify, &branch),
+            Some(WatchHintReason::GitState)
+        );
+
+        let unrelated = temporary.path().join("unrelated");
+        std::fs::create_dir_all(&unrelated).expect("outside negative root");
+        let forged = BTreeSet::from([DeclaredWatchInput {
+            root: ProviderSemanticPathRoot::GitCommon,
+            authority_root: common,
+            path: unrelated.join("secret"),
+            kind: ProviderSemanticPathKind::File,
+        }]);
+        assert!(
+            desired_watch_directories_with_inputs(&config, &forged).is_err(),
+            "a typed root must not authorize a path outside that exact root"
+        );
+    }
+
     /// A compiler access trace owns immediate directory membership, not every
     /// descendant byte. WATCH must therefore register exactly that directory
     /// and classify create/remove hints without recursively expanding it.
@@ -1624,6 +1845,8 @@ mod tests {
             .expect("source positive control");
         let config = WatcherConfig::new(root, 25);
         let declared = BTreeSet::from([DeclaredWatchInput {
+            root: ProviderSemanticPathRoot::Repository,
+            authority_root: config.root.clone(),
             path: listing.clone(),
             kind: ProviderSemanticPathKind::DirectoryListing,
         }]);

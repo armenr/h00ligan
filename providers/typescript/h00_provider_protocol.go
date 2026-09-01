@@ -13,7 +13,7 @@ const (
 	h00ProviderProtocol              = h00provider.Protocol
 	h00ProviderID                    = "h00-typescript-native-scip"
 	h00ProviderLanguage              = "typescript"
-	h00ProviderImplementationVersion = "typescript-native-7.0.2+scip-v0.9.0/h00-semantic-provider-v1"
+	h00ProviderImplementationVersion = "typescript-native-7.0.2+scip-v0.9.0/independent-semantic-input-bound/h00-semantic-provider-v2"
 	h00TypescriptVersion             = "7.0.2"
 	h00TypescriptRevision            = "2bd066d87f5bafd315be9f40889d0a60b9e58e0b"
 	h00ScipBindingsVersion           = "v0.9.0"
@@ -21,6 +21,7 @@ const (
 	h00ResolvedToolchainSHA256Env    = "H00_RESOLVED_TOOLCHAIN_SHA256"
 	h00ProviderSemanticInputsSchema  = h00provider.SemanticInputsSchema
 	h00MaxDocumentPaths              = h00provider.MaxDocumentPaths
+	h00MaxSemanticInputPaths         = h00provider.MaxSemanticInputPaths
 )
 
 var h00ProviderPatchSHA256 string

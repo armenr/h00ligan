@@ -7,7 +7,20 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use crate::tool_api::{admit_code_intel_access, reject_bound_project_switch};
 use crate::{ToolDefinition, ToolError};
 
-pub const MAX_TOOL_RESULT_CHARS: usize = 30_000;
+/// Final ceiling for one assembled MCP tool response.
+///
+/// Legacy MCP embeds the complete typed JSON value inside a JSON string. In
+/// the worst case every character in a domain-bounded value needs one extra
+/// escape character, so this transport envelope must accommodate twice the
+/// code-intelligence value ceiling plus response metadata.
+pub const MAX_TOOL_RESULT_CHARS: usize = 64 * 1_024;
+#[cfg(feature = "code-intel")]
+const _: () = assert!(
+    MAX_TOOL_RESULT_CHARS
+        >= 2 * h00ligan_engine::code_intel_domain::MAX_CODE_INTEL_RESULT_CHARS + 2_048
+);
+const STRUCTURED_CONTENT_NOTICE: &str =
+    "Full typed h00ligan result is available in structuredContent.";
 const MAX_IN_FLIGHT_REQUESTS: u64 = 32;
 pub const CURRENT_PROTOCOL_VERSION: &str = "2026-07-28";
 pub const LATEST_LEGACY_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -378,6 +391,33 @@ impl JsonRpcResponse {
         }
         self
     }
+
+    fn bound_tool_call(self, current: bool, identity: McpServerIdentity<'_>) -> Self {
+        let actual_chars = serde_json::to_string(&self)
+            .map_or(usize::MAX, |serialized| serialized.chars().count());
+        if actual_chars <= MAX_TOOL_RESULT_CHARS {
+            return self;
+        }
+
+        // The cap belongs to the assembled transport result. Measuring only
+        // structuredContent misses JSON-string escaping in legacy text and,
+        // historically, counted the same payload twice. Refuse atomically;
+        // never emit a prefix that looks like an authoritative typed result.
+        let id = self.id;
+        let mut bounded = Self::success(
+            id,
+            tool_call_result(result_too_large_value(actual_chars), true, current),
+        );
+        if current {
+            bounded = bounded.into_current("tools/call", identity);
+        }
+        debug_assert!(
+            serde_json::to_string(&bounded)
+                .is_ok_and(|serialized| serialized.chars().count() <= MAX_TOOL_RESULT_CHARS),
+            "assembled result-too-large response must obey the final character cap"
+        );
+        bounded
+    }
 }
 
 /// Run the line-delimited MCP transport on stdin/stdout.
@@ -701,11 +741,16 @@ async fn dispatch_request(
                 }).collect::<Vec<_>>()
             }),
         ),
-        "tools/call" => handle_call(id, params, dispatcher).await,
+        "tools/call" => handle_call(id, params, dispatcher, current).await,
         _ => JsonRpcResponse::error(id, -32601, "method not found"),
     };
-    if current {
+    let response = if current {
         response.into_current(method, identity)
+    } else {
+        response
+    };
+    if method == "tools/call" {
+        response.bound_tool_call(current, identity)
     } else {
         response
     }
@@ -715,6 +760,7 @@ async fn handle_call(
     id: serde_json::Value,
     params: Option<serde_json::Value>,
     dispatcher: &dyn McpToolDispatcher,
+    current: bool,
 ) -> JsonRpcResponse {
     let Some(params) = params else {
         return JsonRpcResponse::error(id, -32602, "missing tools/call params");
@@ -737,21 +783,7 @@ async fn handle_call(
         return JsonRpcResponse::error(id, -32602, error.to_string());
     }
     match dispatcher.execute(name, input).await {
-        Ok(value) => {
-            let BoundedResult {
-                value: bounded,
-                exceeded,
-            } = bound_result(value);
-            let text = serde_json::to_string(&bounded).unwrap_or_else(|_| "null".into());
-            let mut result = serde_json::json!({
-                "content": [{"type": "text", "text": text}],
-                "structuredContent": bounded,
-            });
-            if exceeded {
-                result["isError"] = serde_json::Value::Bool(true);
-            }
-            JsonRpcResponse::success(id, result)
-        }
+        Ok(value) => JsonRpcResponse::success(id, tool_call_result(value, false, current)),
         Err(ToolError::InvalidInput(message)) => {
             JsonRpcResponse::error(id, -32602, format!("Invalid input: {message}"))
         }
@@ -764,61 +796,42 @@ async fn handle_call(
             let error_value = serde_json::json!({
                 "error": error.structured_error_details(message),
             });
-            let bounded = bound_result(error_value).value;
-            let text = serde_json::to_string(&bounded)
-                .unwrap_or_else(|_| "{\"error\":{\"kind\":\"serialization\"}}".into());
-            JsonRpcResponse::success(
-                id,
-                serde_json::json!({
-                    "content": [{"type": "text", "text": text}],
-                    "structuredContent": bounded,
-                    "isError": true
-                }),
-            )
+            JsonRpcResponse::success(id, tool_call_result(error_value, true, current))
         }
     }
 }
 
-struct BoundedResult {
-    value: serde_json::Value,
-    exceeded: bool,
+fn tool_call_result(value: serde_json::Value, is_error: bool, current: bool) -> serde_json::Value {
+    let text = if current && !is_error {
+        STRUCTURED_CONTENT_NOTICE.into()
+    } else {
+        serde_json::to_string(&value)
+            .unwrap_or_else(|_| "{\"error\":{\"code\":\"serialization_failed\"}}".into())
+    };
+    let mut result = serde_json::json!({
+        "content": [{"type": "text", "text": text}],
+    });
+    if current {
+        result["structuredContent"] = value;
+    }
+    if is_error {
+        result["isError"] = serde_json::Value::Bool(true);
+    }
+    result
 }
 
-fn bound_result(value: serde_json::Value) -> BoundedResult {
-    let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "null".into());
-    let original_chars = serialized.chars().count();
-    if original_chars <= MAX_TOOL_RESULT_CHARS {
-        return BoundedResult {
-            value,
-            exceeded: false,
-        };
-    }
-
-    // A JSON prefix is not a smaller version of a typed result: it destroys
-    // paging and can make a partial DTO look authoritative. Refuse the result
-    // with a bounded machine-readable error instead. Page-shaped operations can
-    // be retried with a lower limit; future domain-native byte budgeting can
-    // avoid the retry without weakening this honesty boundary.
-    let bounded = serde_json::json!({
+fn result_too_large_value(actual_chars: usize) -> serde_json::Value {
+    serde_json::json!({
         "error": {
             "code": "result_too_large",
             "message": format!(
-                "tool result is {original_chars} characters; maximum is {MAX_TOOL_RESULT_CHARS}"
+                "assembled tool response is {actual_chars} characters; maximum is {MAX_TOOL_RESULT_CHARS}"
             ),
-            "actual_chars": original_chars,
+            "actual_chars": actual_chars,
             "max_chars": MAX_TOOL_RESULT_CHARS,
             "remedy": "Narrow the query, lower its page limit, or request fewer sections."
         }
-    });
-    debug_assert!(
-        serde_json::to_string(&bounded)
-            .is_ok_and(|text| text.chars().count() <= MAX_TOOL_RESULT_CHARS),
-        "result-too-large envelope must obey the final serialized character cap"
-    );
-    BoundedResult {
-        value: bounded,
-        exceeded: true,
-    }
+    })
 }
 
 async fn write_response<W: AsyncWrite + Unpin>(
@@ -1275,7 +1288,11 @@ mod tests {
                     "method": "tools/call",
                     "params": {
                         "name": "status",
-                        "arguments": {"panic": should_panic}
+                        "arguments": {"panic": should_panic},
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": CURRENT_PROTOCOL_VERSION,
+                            "io.modelcontextprotocol/clientCapabilities": {}
+                        }
                     }
                 });
                 client_write
@@ -1320,15 +1337,18 @@ mod tests {
         );
     }
 
-    async fn call_static(dispatcher: &StaticDispatcher) -> serde_json::Value {
+    async fn call_static(dispatcher: &StaticDispatcher, current: bool) -> serde_json::Value {
         serde_json::to_value(
-            handle_call(
+            dispatch_request(
                 serde_json::json!(1),
+                "tools/call",
                 Some(serde_json::json!({
                     "name": "calls",
                     "arguments": {}
                 })),
                 dispatcher,
+                McpServerIdentity::new("transport-probe", "0.0.0"),
+                current,
             )
             .await,
         )
@@ -1336,26 +1356,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn structured_content_and_text_fallback_are_identical_for_success_and_domain_error() {
-        let success = call_static(&StaticDispatcher::new(StaticOutcome::Success(
-            serde_json::json!({
+    async fn current_results_carry_one_full_structured_payload_and_typed_errors_remain_readable() {
+        let success = call_static(
+            &StaticDispatcher::new(StaticOutcome::Success(serde_json::json!({
                 "schema_version": "h00/code-intel/calls/v1",
                 "capability": "calls",
                 "items": []
-            }),
-        )))
+            }))),
+            true,
+        )
         .await;
         let success_result = &success["result"];
-        let success_text: serde_json::Value = serde_json::from_str(
-            success_result["content"][0]["text"]
-                .as_str()
-                .expect("success text fallback"),
-        )
-        .expect("success text JSON");
-        assert_eq!(success_text, success_result["structuredContent"]);
+        assert_eq!(
+            success_result["content"][0]["text"],
+            STRUCTURED_CONTENT_NOTICE
+        );
+        assert_eq!(
+            success_result["structuredContent"]["schema_version"],
+            "h00/code-intel/calls/v1"
+        );
         assert!(success_result.get("isError").is_none());
 
-        let error = call_static(&StaticDispatcher::new(StaticOutcome::DomainError)).await;
+        let error = call_static(&StaticDispatcher::new(StaticOutcome::DomainError), true).await;
         let error_result = &error["result"];
         let error_text: serde_json::Value = serde_json::from_str(
             error_result["content"][0]["text"]
@@ -1372,14 +1394,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_results_carry_one_full_json_text_payload_without_duplication() {
+        let response = call_static(
+            &StaticDispatcher::new(StaticOutcome::Success(serde_json::json!({
+                "schema_version": "h00/code-intel/calls/v1",
+                "items": [{"callee": "target"}]
+            }))),
+            false,
+        )
+        .await;
+        let result = &response["result"];
+        assert!(result.get("structuredContent").is_none());
+        let payload: serde_json::Value = serde_json::from_str(
+            result["content"][0]["text"]
+                .as_str()
+                .expect("legacy JSON text payload"),
+        )
+        .expect("legacy text must contain the complete typed value");
+        assert_eq!(payload["items"][0]["callee"], "target");
+    }
+
+    #[tokio::test]
     async fn oversized_calls_result_is_a_typed_error_not_a_truncated_dto_prefix() {
-        let response = call_static(&StaticDispatcher::new(StaticOutcome::Success(
-            serde_json::json!({
+        let response = call_static(
+            &StaticDispatcher::new(StaticOutcome::Success(serde_json::json!({
                 "schema_version": "h00/code-intel/calls/v1",
                 "capability": "calls",
                 "items": [{"context": "x".repeat(MAX_TOOL_RESULT_CHARS + 1_000)}]
-            }),
-        )))
+            }))),
+            true,
+        )
         .await;
         let result = &response["result"];
         assert_eq!(result["isError"], true);
@@ -1400,28 +1444,90 @@ mod tests {
 
     #[test]
     fn over_cap_values_become_typed_errors_within_the_final_character_cap() {
-        let bounded = bound_result(serde_json::json!({"body": "x".repeat(31_000)}));
-        assert!(bounded.exceeded);
-        assert_eq!(bounded.value["error"]["code"], "result_too_large");
-        assert!(bounded.value.get("prefix").is_none());
-        assert!(bounded.value["error"]["actual_chars"].as_u64().unwrap() > 30_000);
-        let serialized = serde_json::to_string(&bounded.value).expect("bounded result JSON");
+        let identity = McpServerIdentity::new("transport-probe", "0.0.0");
+        let response = JsonRpcResponse::success(
+            serde_json::json!(1),
+            tool_call_result(
+                serde_json::json!({"body": "x".repeat(MAX_TOOL_RESULT_CHARS + 1_000)}),
+                false,
+                true,
+            ),
+        )
+        .into_current("tools/call", identity)
+        .bound_tool_call(true, identity);
+        let value = serde_json::to_value(&response).expect("bounded response value");
+        assert_eq!(
+            value["result"]["structuredContent"]["error"]["code"],
+            "result_too_large"
+        );
+        assert!(value["result"]["structuredContent"].get("prefix").is_none());
+        assert!(
+            value["result"]["structuredContent"]["error"]["actual_chars"]
+                .as_u64()
+                .unwrap()
+                > u64::try_from(MAX_TOOL_RESULT_CHARS).expect("transport limit fits u64")
+        );
+        let serialized = serde_json::to_string(&response).expect("bounded response JSON");
         assert!(
             serialized.chars().count() <= MAX_TOOL_RESULT_CHARS,
-            "the serialized MCP text payload must obey the advertised cap; got {}",
+            "the assembled MCP response must obey the advertised cap; got {}",
             serialized.chars().count()
         );
     }
 
     #[test]
+    fn domain_bounded_legacy_escaped_value_survives_the_transport_envelope() {
+        let identity = McpServerIdentity::new("transport-probe", "0.0.0");
+        let body = "\\".repeat(13_000);
+        let value = serde_json::json!({"body": body});
+        assert!(
+            serde_json::to_string(&value)
+                .expect("domain value JSON")
+                .chars()
+                .count()
+                <= h00ligan_engine::code_intel_domain::MAX_CODE_INTEL_RESULT_CHARS,
+            "known-positive control: the typed value must fit the domain envelope"
+        );
+        let response = JsonRpcResponse::success(
+            serde_json::json!(1),
+            tool_call_result(value.clone(), false, false),
+        )
+        .bound_tool_call(false, identity);
+        let response_value = serde_json::to_value(&response).expect("bounded escaped response");
+        assert_ne!(response_value["result"]["isError"], true);
+        let text: serde_json::Value = serde_json::from_str(
+            response_value["result"]["content"][0]["text"]
+                .as_str()
+                .expect("complete legacy result text"),
+        )
+        .expect("complete typed legacy JSON");
+        assert_eq!(text, value);
+    }
+
+    #[test]
     fn escaping_overhead_is_included_in_the_final_character_cap() {
-        let bounded = bound_result(serde_json::json!({"body": "\\".repeat(31_000)}));
-        assert!(bounded.exceeded);
-        let serialized =
-            serde_json::to_string(&bounded.value).expect("bounded escaped result JSON");
+        let identity = McpServerIdentity::new("transport-probe", "0.0.0");
+        let response = JsonRpcResponse::success(
+            serde_json::json!(1),
+            tool_call_result(
+                serde_json::json!({"body": "\\".repeat(MAX_TOOL_RESULT_CHARS / 3)}),
+                false,
+                false,
+            ),
+        )
+        .bound_tool_call(false, identity);
+        let value = serde_json::to_value(&response).expect("bounded escaped response");
+        let text: serde_json::Value = serde_json::from_str(
+            value["result"]["content"][0]["text"]
+                .as_str()
+                .expect("bounded legacy error text"),
+        )
+        .expect("typed legacy error JSON");
+        assert_eq!(text["error"]["code"], "result_too_large");
+        let serialized = serde_json::to_string(&response).expect("bounded escaped response JSON");
         assert!(
             serialized.chars().count() <= MAX_TOOL_RESULT_CHARS,
-            "JSON escaping must not expand the final MCP text beyond the cap; got {}",
+            "JSON string escaping must not expand the assembled response beyond the cap; got {}",
             serialized.chars().count()
         );
     }

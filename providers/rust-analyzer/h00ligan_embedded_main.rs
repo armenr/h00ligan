@@ -27,7 +27,7 @@ fn typescript_provider_identity() -> h00ligan_provider_protocol::ProviderIdentit
         provider_id: h00ligan_provider_protocol::H00_TYPESCRIPT_PROVIDER_ID.into(),
         language: h00ligan_provider_protocol::H00_TYPESCRIPT_LANGUAGE.into(),
         implementation_version:
-            h00ligan_provider_protocol::H00_TYPESCRIPT_IMPLEMENTATION_V1.into(),
+            h00ligan_provider_protocol::H00_TYPESCRIPT_IMPLEMENTATION_V2.into(),
         source_components: h00ligan_provider_protocol::typescript_source_components(),
         patch_sha256: env!("H00_TYPESCRIPT_PROVIDER_PATCH_SHA256").into(),
         executable_sha256: env!("H00_TYPESCRIPT_PROVIDER_BINARY_SHA256").into(),

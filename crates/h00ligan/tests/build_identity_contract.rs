@@ -120,7 +120,7 @@ fn shipped_index_and_status_roundtrip_exact_classifier_currency() {
     );
     let status: serde_json::Value = serde_json::from_slice(&status.stdout).expect("status JSON");
     let provenance = &status["classified_by"];
-    assert_eq!(status["schema_version"], "h00/code-intel/status/v3");
+    assert_eq!(status["schema_version"], "h00/code-intel/status/v4");
     assert_eq!(
         provenance["build_identity"],
         h00ligan_engine::BUILD_IDENTITY

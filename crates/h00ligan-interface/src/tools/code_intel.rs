@@ -8,52 +8,12 @@
 //! This module is gated by `#[cfg(feature = "code-intel")]` at the declaration
 //! site in `mod.rs`; no additional per-item gates are needed.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use h00ligan_engine::graph::KnowledgeGraph;
-
 use crate::tool_api::{CodeIntelAccess, CodeIntelHandler};
 use crate::{CodeIntelContext, ToolDefinition, ToolError};
-
-/// One coherent snapshot view. Deref keeps the query code compact while the
-/// attached metadata guarantees coverage/envelope decisions come from the
-/// same loaded generation as the graph.
-pub(super) struct GraphView {
-    graph: Arc<KnowledgeGraph>,
-}
-
-impl std::ops::Deref for GraphView {
-    type Target = KnowledgeGraph;
-
-    fn deref(&self) -> &Self::Target {
-        &self.graph
-    }
-}
-
-/// Clone one immutable generation and fail closed when the pinned snapshot is
-/// absent or incomplete. An in-progress on-disk candidate does not revoke a
-/// previously validated generation.
-pub(super) fn require_graph(
-    ctx: &CodeIntelContext,
-    snapshot: &Arc<crate::CodeIntelSnapshot>,
-) -> Result<GraphView, ToolError> {
-    let graph = snapshot
-        .graph
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| ToolError::Unindexed {
-            root: ctx.binding().root().to_path_buf(),
-            graph_dir: ctx.binding().graph_dir().to_path_buf(),
-            remedy: format!(
-                "call reindex/init or run `h00ligan --root {} index`",
-                ctx.binding().root().display()
-            ),
-        })?;
-    Ok(GraphView { graph })
-}
 
 // ============================================================================
 // ReindexHandler
@@ -832,7 +792,7 @@ impl CodeIntelHandler for CallSitesHandler {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "calls".into(),
-            description: "Find provider-resolved explicit source invocations of one symbol. The typed authority.population states the exact bounded population; it does not claim runtime dispatch or expanded-macro completeness. Exact call spans are present only when provider identity and source invocation syntax agree. Returns the same cursor-paged Calls result as h00ligan calls --format json. Check authority.status: complete has no exclusions within that population; qualified lists exact coverage_exclusions whose source regions may contain additional invocations. Check repository.live_inputs before applying generation evidence to the current worktree."
+            description: "Find provider-resolved explicit source invocations of one symbol. Every exact call span carries a typed callable or source execution-root origin; execution roots are not fabricated graph symbols. The typed authority.population states the exact bounded population; it does not claim runtime dispatch or expanded-macro completeness. Returns the same cursor-paged Calls result as h00ligan calls --format json. Check authority.status: complete has no exclusions within that population; qualified lists exact coverage_exclusions whose source regions may contain additional invocations. Check repository.live_inputs before applying generation evidence to the current worktree."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -1073,6 +1033,7 @@ mod tests {
             documents,
             symbols,
             calls,
+            root_invocations: Vec::new(),
             callable_bindings: Vec::new(),
             coverage_exclusions: Vec::new(),
         });
@@ -1263,7 +1224,7 @@ mod tests {
         assert!(!sites.is_empty(), "should find at least one call site");
 
         let first = &sites[0];
-        assert_eq!(first["caller"]["name"], "caller_fn");
+        assert_eq!(first["origin"]["identity"]["name"], "caller_fn");
         assert!(first.get("confidence").is_none());
         assert!(first.get("evidence").is_none());
         assert_eq!(first["call_span"]["start_line"], 4);
@@ -1354,11 +1315,15 @@ mod tests {
             .expect("absolute --file must resolve the homonym");
         let sites = result["items"].as_array().expect("Calls items array");
         assert!(
-            sites.iter().any(|s| s["caller"]["name"] == "caller_a"),
+            sites
+                .iter()
+                .any(|s| s["origin"]["identity"]["name"] == "caller_a"),
             "must resolve to a.rs's process (caller_a), got: {sites:?}"
         );
         assert!(
-            !sites.iter().any(|s| s["caller"]["name"] == "caller_b"),
+            !sites
+                .iter()
+                .any(|s| s["origin"]["identity"]["name"] == "caller_b"),
             "must NOT resolve to b.rs's process (caller_b), got: {sites:?}"
         );
     }

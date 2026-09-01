@@ -11,10 +11,11 @@ use serde::Serialize;
 
 use crate::code_intel_domain::{
     CapabilityCoverage, CapabilityCoverageStatus, DocumentMembershipKind, DomainError,
-    GenerationId, ProjectInventoryCoverage, RepositoryBinding, assess_structural_graph_capability,
+    GenerationId, MAX_CODE_INTEL_RESULT_CHARS, ProjectInventoryCoverage, RepositoryBinding,
+    assess_structural_graph_capability,
 };
 use crate::code_intel_publication::ResolvedGeneration;
-use crate::code_intel_query::repository_binding;
+use crate::code_intel_query::{language_id_for_path, repository_binding};
 use crate::diff::{
     DiffExclusionReason, DiffExclusionSummary, DiffObservation, FileDiff, SymbolDiff, diff_bound,
 };
@@ -29,9 +30,6 @@ pub const DIFF_CANDIDATE_POPULATION: &str = "live_worktree_registered_source_fil
 pub const DEFAULT_DIFF_LIMIT: usize = 50;
 pub const MAX_DIFF_LIMIT: usize = 100;
 pub const MAX_DIFF_PATH_BYTES: usize = 4_096;
-/// Keep successful results below the MCP adapter's final 30,000-character
-/// ceiling so transport never replaces a valid diff with a generic cap error.
-pub const MAX_DIFF_RESULT_CHARS: usize = 28_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffRequest {
@@ -343,10 +341,19 @@ fn bind_diff_result(
     );
     let comparison_coverage_complete = observation.exclusions.is_empty()
         && observation.files_compared == observation.files_considered;
+    let inventory_coverage =
+        request
+            .path
+            .as_deref()
+            .map_or(generation.project_inventory.coverage, |path| {
+                generation
+                    .project_inventory
+                    .coverage_for_language(&language_id_for_path(path))
+            });
     let baseline_complete = matches!(
         structural_graph.status,
         CapabilityCoverageStatus::Complete | CapabilityCoverageStatus::NotApplicable
-    ) && generation.project_inventory.coverage
+    ) && inventory_coverage
         == ProjectInventoryCoverage::IndexedSourcePopulationComplete;
     let authority_status = if baseline_complete && comparison_coverage_complete {
         DiffAuthorityStatus::Complete
@@ -415,7 +422,7 @@ fn bind_diff_result(
                 kind: DiffBaselineKind::ImmutableGenerationStructuralGraph,
                 population: DIFF_BASELINE_POPULATION.into(),
                 structural_graph,
-                project_inventory_coverage: generation.project_inventory.coverage,
+                project_inventory_coverage: inventory_coverage,
             },
             candidate: DiffCandidateAuthority {
                 kind: DiffCandidateKind::LiveWorktree,
@@ -450,14 +457,13 @@ fn bind_diff_result(
         })?
         .chars()
         .count();
-    if result_chars > MAX_DIFF_RESULT_CHARS {
-        return Err(DomainError::InvalidRequest {
-            operation: "diff",
-            field: "limit",
-            reason: format!(
-                "result would contain {result_chars} serialized characters, above the {MAX_DIFF_RESULT_CHARS}-character product bound; lower limit or narrow path"
-            ),
-        });
+    if result_chars > MAX_CODE_INTEL_RESULT_CHARS {
+        return Err(DomainError::result_too_large(
+            "diff",
+            result_chars,
+            MAX_CODE_INTEL_RESULT_CHARS,
+            "Lower the Diff limit or narrow the path scope",
+        ));
     }
     Ok(result)
 }
@@ -633,7 +639,7 @@ mod tests {
                 digest: "5".repeat(64),
             },
             manifest: GenerationManifest {
-                schema_version: "h00/code-intel/generation/v6".into(),
+                schema_version: crate::code_intel_publication::GENERATION_SCHEMA_VERSION.into(),
                 generation_id,
                 repository_id,
                 parent_generation_id: None,

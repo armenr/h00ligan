@@ -120,7 +120,7 @@ impl CodeIntelHandler for AssessHandler {
         ToolDefinition {
             name: "assess".into(),
             description: "Before changing a symbol, inspect provider-backed call impact, separately \
-                labeled structural dependents, exact direct callers, runnable test roots, and objective \
+                labeled structural dependents, exact direct call origins, runnable test roots, and objective \
                 review signals. No HIGH/MEDIUM/LOW score is invented. The blast-radius population is \
                 deterministic and cursor-paged. Check repository.live_inputs before applying \
                 generation evidence to the current worktree; use page.next_cursor while \
@@ -466,6 +466,8 @@ impl CodeIntelHandler for TestsHandler {
                 provider-resolved source invocations. Returns the same immutable-generation, \
                 authority-qualified, cursor-paged result as h00ligan tests --format json. \
                 Test-only helpers are traversed but are not misreported as runnable tests. \
+                Exact test-source execution roots that cannot be tied to a named runnable test \
+                remain positive evidence and explicitly qualify the runnable-test population. \
                 Check repository.live_inputs before applying generation evidence to the current \
                 worktree. \
                 Follow page.next_cursor while page.has_more is true."
@@ -514,14 +516,18 @@ pub struct OverviewHandler;
 
 #[async_trait::async_trait]
 impl CodeIntelHandler for OverviewHandler {
-    async fn execute(&self, _input: Value, ctx: &CodeIntelContext) -> Result<Value, ToolError> {
+    async fn execute(&self, input: Value, ctx: &CodeIntelContext) -> Result<Value, ToolError> {
         if ctx.cancel_token().is_cancelled() {
             return Err(ToolError::Cancelled);
         }
 
+        let mut request = h00ligan_engine::code_intel_overview::OverviewRequest::default();
+        request.limit = optional_usize(&input, "limit", request.limit)?;
+        h00ligan_engine::code_intel_overview::validate_overview_request(&request)
+            .map_err(code_intel_domain_error)?;
         let snapshot = ctx.snapshot();
         let result = snapshot
-            .query_overview(ctx.binding())
+            .query_overview(ctx.binding(), &request)
             .await
             .map_err(code_intel_domain_error)?;
         serde_json::to_value(result).map_err(|error| {
@@ -547,7 +553,15 @@ impl CodeIntelHandler for OverviewHandler {
                 .into(),
             input_schema: json!({
                 "type": "object",
-                "properties": {}
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": h00ligan_engine::code_intel_overview::MAX_OVERVIEW_COLLECTION_LIMIT,
+                        "description": "Maximum preview rows returned per Overview collection (default 50, max 100)."
+                    }
+                },
+                "additionalProperties": false
             }),
             server_tool_type: None,
         }

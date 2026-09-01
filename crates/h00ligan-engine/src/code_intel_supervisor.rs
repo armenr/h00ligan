@@ -24,6 +24,7 @@ use crate::code_intel_cancellation::IndexCancellation;
 use crate::code_intel_indexing::{
     BoundIndexAdmission, BoundIndexPlan, BoundIndexPlanError, BoundIndexRequest, ProviderIntent,
 };
+use crate::code_intel_payload::NormalizedProviderPayload;
 use crate::code_intel_publication::{
     CapabilityFloorPolicy, IndexGenerationPublicationError, LiveGenerationBasis,
     PublicationControlToken, PublicationControlWitness, PublicationError, PublicationRecovery,
@@ -696,6 +697,27 @@ impl From<&PublishedIndexGeneration> for IndexPublicationReceipt {
     }
 }
 
+/// Minimal immutable authority needed to update a long-lived WATCH
+/// population after publication. Keeping only the shared normalized payloads
+/// avoids pinning an entire published generation in the notification channel.
+#[derive(Clone)]
+pub(crate) struct IndexWatchPublication {
+    pub provider_payloads: Arc<[NormalizedProviderPayload]>,
+}
+
+impl From<&PublishedIndexGeneration> for IndexWatchPublication {
+    fn from(published: &PublishedIndexGeneration) -> Self {
+        Self {
+            provider_payloads: published
+                .publication
+                .provider_payloads
+                .iter()
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
 /// Exact process-local status for one operation ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexOperationSnapshot {
@@ -1062,7 +1084,7 @@ struct SupervisorInner {
     state: Mutex<SupervisorRuntimeState>,
     wake: Arc<Notify>,
     worker_done: Arc<Notify>,
-    publication_updates: watch::Sender<Option<Arc<PublishedIndexGeneration>>>,
+    publication_updates: watch::Sender<Option<IndexWatchPublication>>,
     worker_running: AtomicBool,
 }
 
@@ -1345,10 +1367,20 @@ impl IndexSupervisor {
     /// cannot miss the transition between subscription and its first await.
     /// Structural staging publications are intentionally excluded: their
     /// provider input authority is not final yet.
-    pub(crate) fn subscribe_publications(
-        &self,
-    ) -> watch::Receiver<Option<Arc<PublishedIndexGeneration>>> {
+    pub(crate) fn subscribe_publications(&self) -> watch::Receiver<Option<IndexWatchPublication>> {
         self.inner.publication_updates.subscribe()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_watch_publication_for_test(
+        &self,
+        provider_payloads: Vec<NormalizedProviderPayload>,
+    ) {
+        self.inner
+            .publication_updates
+            .send_replace(Some(IndexWatchPublication {
+                provider_payloads: provider_payloads.into(),
+            }));
     }
 
     /// Read the bounded publication-control token for WATCH drift detection.
@@ -1860,7 +1892,9 @@ fn finish_runtime_operation(
     trim_records(&mut state.records);
     drop(state);
     if let Some(published) = publication_update {
-        inner.publication_updates.send_replace(Some(published));
+        inner
+            .publication_updates
+            .send_replace(Some(IndexWatchPublication::from(published.as_ref())));
     }
     inner.wake.notify_one();
 }
@@ -2861,7 +2895,7 @@ mod tests {
             protocol: receipt_text("protocol"),
             provider_id: receipt_text("provider_id"),
             language: receipt_text("language"),
-            implementation_version: h00ligan_provider_protocol::H00_RUST_ANALYZER_IMPLEMENTATION_V5
+            implementation_version: h00ligan_provider_protocol::H00_RUST_ANALYZER_IMPLEMENTATION_V6
                 .into(),
             source_components: h00ligan_provider_protocol::rust_analyzer_source_components(),
             patch_sha256: receipt_text("patch_sha256"),

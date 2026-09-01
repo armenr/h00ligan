@@ -1027,6 +1027,12 @@ fn mcp_supports_current_stateless_discovery_and_tool_results() {
         expected_identity
     );
     assert!(called["content"].is_array());
+    assert!(called["structuredContent"].is_object());
+    assert_eq!(
+        called["content"][0]["text"],
+        "Full typed h00ligan result is available in structuredContent.",
+        "current MCP must carry the full typed result once, not duplicate it as JSON text"
+    );
 
     assert_eq!(responses[3]["error"]["code"], -32602);
     assert!(
@@ -2341,7 +2347,7 @@ fn explicit_mcp_reindex_refreshes_the_same_server_snapshot_graph_only() {
     assert_eq!(after["graph_loaded"], true);
     assert_eq!(after["publication_state"], "published");
     assert!(after["stats"]["node_count"].as_u64().is_some_and(|n| n > 0));
-    assert_eq!(type_result["schema_version"], "h00/code-intel/type/v1");
+    assert_eq!(type_result["schema_version"], "h00/code-intel/type/v2");
     assert_eq!(type_result["resolved_type"]["document_path"], "src/lib.rs");
     assert_eq!(type_result["resolved_type"]["start_line"], 0);
     assert_eq!(diff_result["total_added"], 0, "{diff_result}");
@@ -2409,7 +2415,13 @@ fn fresh_publication_ignores_an_obsolete_split_bundle_marker_without_mutating_it
     assert!(status.success(), "MCP recovery server failed: {stderr}");
     assert_eq!(initial_status["publication_state"], "unpublished");
     assert_eq!(initial_status["graph_loaded"], false);
-    assert_eq!(blocked_query["error"]["kind"], "unindexed");
+    assert_eq!(blocked_response["result"]["isError"], true);
+    assert_eq!(blocked_query["error"]["code"], "capability_unavailable");
+    assert_eq!(blocked_query["error"]["capability"], "structural_graph");
+    assert_eq!(
+        blocked_query["error"]["evidence"][0]["reason_code"],
+        "immutable_generation_unavailable"
+    );
     assert_eq!(publication["index_mode"], "fresh_generation");
     assert_eq!(publication["provider_requested"], false);
     assert!(publication["generation"]["id"].as_str().is_some());
@@ -2677,9 +2689,9 @@ fn cli_json_and_mcp_diff_share_one_bounded_result_contract() {
     .expect("MCP inner diff JSON");
 
     assert_eq!(cli_result, mcp_result);
-    assert_eq!(
-        mcp_result, outer["result"]["structuredContent"],
-        "MCP text and native structured result must carry the same engine DTO: {outer}"
+    assert!(
+        outer["result"].get("structuredContent").is_none(),
+        "legacy MCP must carry the full typed value once in JSON text: {outer}"
     );
     assert_eq!(cli_result["schema_version"], "h00/code-intel/diff/v1");
     assert!(

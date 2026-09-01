@@ -25,7 +25,7 @@ use crate::code_intel_domain::{
 };
 use crate::scip_normalizer::CanonicalScipSnapshot;
 
-pub const CALLS_PROVIDER_PAYLOAD_SCHEMA: &str = "h00/code-intel/provider-payload/calls/v17";
+pub const CALLS_PROVIDER_PAYLOAD_SCHEMA: &str = "h00/code-intel/provider-payload/calls/v19";
 pub const CALLABLE_LIVENESS_PROVIDER_PAYLOAD_SCHEMA: &str =
     "h00/code-intel/provider-payload/callable-liveness/v1";
 
@@ -82,7 +82,9 @@ pub enum ProviderSymbolRole {
     /// their class suites callable bodies.
     SourceInvocationTarget,
     /// A provider-resolved local invocation target (parameter, closure, or
-    /// mutable binding) without its own structural graph identity.
+    /// mutable binding) without its own structural graph identity. A nested
+    /// callable may still carry an exact call-owner extent for scoped coverage
+    /// accounting; it cannot serve as a published graph-call caller.
     LocalInvocationTarget,
     /// A symbol outside the payload's source-document population.
     External,
@@ -120,6 +122,20 @@ pub struct ProviderCall {
     pub call_site: ProviderLocation,
 }
 
+/// One exact provider-resolved invocation whose execution context has no
+/// published structural caller.
+///
+/// This includes true module initialization and anonymous framework/callback
+/// roots. The call remains positive evidence and seeds liveness directly; no
+/// synthetic graph node is fabricated for it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRootInvocation {
+    pub callee_symbol_id: String,
+    pub call_site: ProviderLocation,
+    pub context: crate::code_intel_domain::ExecutionRootContext,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderCallableBinding {
@@ -138,7 +154,7 @@ pub struct ProviderCoverageExclusion {
     /// source-backed callable population.
     pub location: ProviderLocation,
     /// Stable machine-readable classification such as
-    /// `conditional_compilation` or `module_initialization`.
+    /// `conditional_compilation` or `dynamic_callable_target_unresolved`.
     pub reason_code: String,
 }
 
@@ -228,6 +244,10 @@ pub struct CallsProviderPayload {
     /// `calls`. A callable with zero call edges remains addressable here.
     pub symbols: Vec<ProviderSymbol>,
     pub calls: Vec<ProviderCall>,
+    /// Exact invocations originating outside any published structural
+    /// callable. Their source document determines production/test root scope
+    /// through the same registered language adapter used by extraction.
+    pub root_invocations: Vec<ProviderRootInvocation>,
     /// Exact local callable-value assignments. These are possible dispatch
     /// paths for conservative liveness, never direct invocation records.
     pub callable_bindings: Vec<ProviderCallableBinding>,
@@ -250,6 +270,7 @@ impl CallsProviderPayload {
             documents: Vec::new(),
             symbols: Vec::new(),
             calls: Vec::new(),
+            root_invocations: Vec::new(),
             callable_bindings: Vec::new(),
             coverage_exclusions: Vec::new(),
         }
@@ -741,6 +762,7 @@ fn normalize_calls_payload(
     normalized.documents.sort();
     normalized.symbols.sort();
     normalized.calls.sort();
+    normalized.root_invocations.sort();
     normalized.callable_bindings.sort();
     normalized.coverage_exclusions.sort();
 
@@ -766,6 +788,42 @@ fn normalize_calls_payload(
         return Err(ProviderPayloadError::Invalid(
             "provider call records must not contain exact duplicates".into(),
         ));
+    }
+    if normalized
+        .root_invocations
+        .windows(2)
+        .any(|pair| pair[0] == pair[1])
+    {
+        return Err(ProviderPayloadError::Invalid(
+            "provider root-invocation records must not contain exact duplicates".into(),
+        ));
+    }
+    let mut root_invocation_targets = BTreeMap::new();
+    for invocation in &normalized.root_invocations {
+        match root_invocation_targets.entry(source_occurrence_key(&invocation.call_site)) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((invocation.callee_symbol_id.as_str(), invocation.context));
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                let existing = *entry.get();
+                if existing.0 != invocation.callee_symbol_id {
+                    return Err(ProviderPayloadError::Invalid(format!(
+                        "one exact root invocation site names conflicting callees {} and {}",
+                        existing.0, invocation.callee_symbol_id
+                    )));
+                }
+                if existing.1 != invocation.context {
+                    return Err(ProviderPayloadError::Invalid(format!(
+                        "one exact root invocation site for {} names conflicting execution contexts {:?} and {:?}",
+                        invocation.callee_symbol_id, existing.1, invocation.context
+                    )));
+                }
+                return Err(ProviderPayloadError::Invalid(
+                    "provider root-invocation records must not duplicate one exact source site"
+                        .into(),
+                ));
+            }
+        }
     }
     if normalized
         .callable_bindings
@@ -840,12 +898,9 @@ fn normalize_calls_payload(
                 }
             }
             ProviderSymbolRole::LocalInvocationTarget => {
-                if symbol.definition.is_none()
-                    || symbol.structural_extent.is_some()
-                    || symbol.call_owner_extent.is_some()
-                {
+                if symbol.definition.is_none() || symbol.structural_extent.is_some() {
                     return Err(ProviderPayloadError::Invalid(format!(
-                        "local invocation target {} has invalid structural or call-owner identity",
+                        "local invocation target {} has invalid structural identity",
                         symbol.provider_symbol_id
                     )));
                 }
@@ -901,9 +956,9 @@ fn normalize_calls_payload(
             }
         }
         if let Some(call_owner_extent) = &symbol.call_owner_extent {
-            if symbol.role != ProviderSymbolRole::SourceInvocationTarget {
+            if symbol.role == ProviderSymbolRole::External {
                 return Err(ProviderPayloadError::Invalid(format!(
-                    "symbol {} has a call-owner extent without source invocation identity",
+                    "external symbol {} has a call-owner extent",
                     symbol.provider_symbol_id
                 )));
             }
@@ -914,18 +969,31 @@ fn normalize_calls_payload(
                     symbol.provider_symbol_id, symbol.language_id, document.language_id
                 )));
             }
-            let Some(structural_extent) = &symbol.structural_extent else {
+            let Some(identity_extent) = symbol
+                .structural_extent
+                .as_ref()
+                .or(symbol.definition.as_ref())
+            else {
                 return Err(ProviderPayloadError::Invalid(format!(
-                    "symbol {} has a call-owner extent but no structural extent",
+                    "symbol {} has a call-owner extent but no local source identity",
                     symbol.provider_symbol_id
                 )));
             };
-            if call_owner_extent.document_path != structural_extent.document_path
-                || !span_contains(&structural_extent.span, &call_owner_extent.span)
+            let owner_contains_identity = match symbol.role {
+                ProviderSymbolRole::SourceInvocationTarget => {
+                    span_contains(&identity_extent.span, &call_owner_extent.span)
+                }
+                ProviderSymbolRole::LocalInvocationTarget => {
+                    span_contains(&call_owner_extent.span, &identity_extent.span)
+                }
+                ProviderSymbolRole::External => unreachable!("rejected above"),
+            };
+            if call_owner_extent.document_path != identity_extent.document_path
+                || !owner_contains_identity
                 || call_owner_extent.span.start_byte == call_owner_extent.span.end_byte
             {
                 return Err(ProviderPayloadError::Invalid(format!(
-                    "symbol {} call-owner extent is empty or outside its structural extent",
+                    "symbol {} call-owner extent is empty or inconsistent with its source identity",
                     symbol.provider_symbol_id
                 )));
             }
@@ -951,6 +1019,12 @@ fn normalize_calls_payload(
                 call.caller_symbol_id
             )));
         };
+        if caller.role != ProviderSymbolRole::SourceInvocationTarget {
+            return Err(ProviderPayloadError::Invalid(format!(
+                "caller symbol {} has no published structural identity",
+                call.caller_symbol_id
+            )));
+        }
         let Some(caller_extent) = &caller.call_owner_extent else {
             return Err(ProviderPayloadError::Invalid(format!(
                 "caller symbol {} has no call-owner extent",
@@ -976,6 +1050,59 @@ fn normalize_calls_payload(
             return Err(ProviderPayloadError::Invalid(format!(
                 "call site for {} is outside caller callable extent",
                 call.caller_symbol_id
+            )));
+        }
+    }
+
+    for invocation in &normalized.root_invocations {
+        let Some(callee) = symbols.get(invocation.callee_symbol_id.as_str()) else {
+            return Err(ProviderPayloadError::Invalid(format!(
+                "root invocation references missing callee symbol {}",
+                invocation.callee_symbol_id
+            )));
+        };
+        if callee.role != ProviderSymbolRole::SourceInvocationTarget
+            || callee.definition.is_none()
+            || callee.structural_extent.is_none()
+        {
+            return Err(ProviderPayloadError::Invalid(format!(
+                "root invocation callee {} has no published structural identity",
+                invocation.callee_symbol_id
+            )));
+        }
+        let document = validate_location(&invocation.call_site, &documents)?;
+        validate_receipt_language(&payload.receipt.scope, &document.language_id)?;
+        if document.language_id != callee.language_id {
+            return Err(ProviderPayloadError::Invalid(format!(
+                "root invocation callee {} language differs from its call-site document",
+                invocation.callee_symbol_id
+            )));
+        }
+        if invocation.call_site.span.start_byte == invocation.call_site.span.end_byte {
+            return Err(ProviderPayloadError::Invalid(format!(
+                "root invocation site for {} is empty",
+                invocation.callee_symbol_id
+            )));
+        }
+        if normalized.calls.iter().any(|call| {
+            call.callee_symbol_id == invocation.callee_symbol_id
+                && source_occurrence_key(&call.call_site)
+                    == source_occurrence_key(&invocation.call_site)
+        }) {
+            return Err(ProviderPayloadError::Invalid(format!(
+                "invocation of {} is recorded as both a callable edge and an execution root",
+                invocation.callee_symbol_id
+            )));
+        }
+        if normalized.symbols.iter().any(|symbol| {
+            symbol.call_owner_extent.as_ref().is_some_and(|owner| {
+                owner.document_path == invocation.call_site.document_path
+                    && span_contains(&owner.span, &invocation.call_site.span)
+            })
+        }) {
+            return Err(ProviderPayloadError::Invalid(format!(
+                "root invocation site for {} is inside callable owner authority",
+                invocation.callee_symbol_id
             )));
         }
     }
@@ -1305,12 +1432,12 @@ fn validate_reconstruction_semantic_inputs(
         };
         for input in &semantic_inputs.paths {
             if paths
-                .insert(input.path.clone(), input.clone())
+                .insert((input.root, input.path.clone()), input.clone())
                 .is_some_and(|previous| previous != *input)
             {
                 return Err(ProviderPayloadError::Invalid(format!(
-                    "reconstruction path {} has conflicting identities",
-                    input.path
+                    "reconstruction path {:?}:{} has conflicting identities",
+                    input.root, input.path
                 )));
             }
         }
@@ -1386,6 +1513,20 @@ fn is_sha256(value: &str) -> bool {
 
 const fn span_contains(outer: &NormalizedSourceSpan, inner: &NormalizedSourceSpan) -> bool {
     outer.start_byte <= inner.start_byte && inner.end_byte <= outer.end_byte
+}
+
+/// Stable identity for one exact source occurrence.
+///
+/// Line and column coordinates remain useful presentation evidence, but the
+/// provider contract defines UTF-8 byte offsets in the content-addressed
+/// document as authority. Redundant coordinate drift must not create a second
+/// invocation identity for the same bytes.
+const fn source_occurrence_key(location: &ProviderLocation) -> (&str, u64, u64) {
+    (
+        location.document_path.as_str(),
+        location.span.start_byte,
+        location.span.end_byte,
+    )
 }
 
 fn validate_location<'a>(
@@ -1561,6 +1702,7 @@ mod tests {
                 callee_symbol_id: "callee".into(),
                 call_site: location(8, 14),
             }],
+            root_invocations: Vec::new(),
             callable_bindings: Vec::new(),
             coverage_exclusions: Vec::new(),
         })
@@ -1767,6 +1909,186 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn root_invocations_require_exact_structural_targets_and_unique_call_sites() {
+        let mut valid = payload("provider-a");
+        let ProviderPayload::Calls(document) = &mut valid else {
+            unreachable!("Calls fixture")
+        };
+        document.calls.clear();
+        let caller = document
+            .symbols
+            .iter_mut()
+            .find(|symbol| symbol.provider_symbol_id == "caller")
+            .expect("caller control");
+        caller.structural_extent = Some(location(0, 16));
+        caller.call_owner_extent = Some(location(0, 16));
+        document.root_invocations.push(ProviderRootInvocation {
+            callee_symbol_id: "callee".into(),
+            call_site: location(16, 22),
+            context: crate::code_intel_domain::ExecutionRootContext::ModuleInitialization,
+        });
+        let normalized = normalize_provider_payload(&valid)
+            .expect("exact root invocation with structural callee");
+        let ProviderPayload::Calls(normalized) = normalized else {
+            unreachable!("Calls fixture")
+        };
+        assert_eq!(normalized.root_invocations.len(), 1, "positive control");
+
+        let mut fabricated_root = valid.clone();
+        let ProviderPayload::Calls(document) = &mut fabricated_root else {
+            unreachable!("Calls fixture")
+        };
+        document.root_invocations[0].call_site = location(8, 14);
+        assert!(matches!(
+            normalize_provider_payload(&fabricated_root),
+            Err(ProviderPayloadError::Invalid(reason))
+                if reason.contains("inside callable owner")
+        ));
+
+        let mut missing = valid.clone();
+        let ProviderPayload::Calls(document) = &mut missing else {
+            unreachable!("Calls fixture")
+        };
+        document.root_invocations[0].callee_symbol_id = "absent".into();
+        assert!(matches!(
+            normalize_provider_payload(&missing),
+            Err(ProviderPayloadError::Invalid(reason))
+                if reason.contains("root invocation references missing callee")
+        ));
+
+        let mut nonstructural = valid.clone();
+        let ProviderPayload::Calls(document) = &mut nonstructural else {
+            unreachable!("Calls fixture")
+        };
+        let callee = document
+            .symbols
+            .iter_mut()
+            .find(|symbol| symbol.provider_symbol_id == "callee")
+            .expect("callee control");
+        callee.role = ProviderSymbolRole::LocalInvocationTarget;
+        callee.structural_extent = None;
+        assert!(matches!(
+            normalize_provider_payload(&nonstructural),
+            Err(ProviderPayloadError::Invalid(reason))
+                if reason.contains("has no published structural identity")
+        ));
+
+        let mut duplicated = payload("provider-a");
+        let ProviderPayload::Calls(document) = &mut duplicated else {
+            unreachable!("Calls fixture")
+        };
+        document.root_invocations.push(ProviderRootInvocation {
+            callee_symbol_id: "callee".into(),
+            call_site: location(8, 14),
+            context: crate::code_intel_domain::ExecutionRootContext::ModuleInitialization,
+        });
+        assert!(matches!(
+            normalize_provider_payload(&duplicated),
+            Err(ProviderPayloadError::Invalid(reason))
+                if reason.contains("both a callable edge and an execution root")
+        ));
+
+        let mut duplicated_with_line_drift = payload("provider-a");
+        let ProviderPayload::Calls(document) = &mut duplicated_with_line_drift else {
+            unreachable!("Calls fixture")
+        };
+        let mut drifted_call_site = location(8, 14);
+        drifted_call_site.span.start_line = 1;
+        drifted_call_site.span.end_line = 1;
+        document.root_invocations.push(ProviderRootInvocation {
+            callee_symbol_id: "callee".into(),
+            call_site: drifted_call_site,
+            context: crate::code_intel_domain::ExecutionRootContext::ModuleInitialization,
+        });
+        assert!(matches!(
+            normalize_provider_payload(&duplicated_with_line_drift),
+            Err(ProviderPayloadError::Invalid(reason))
+                if reason.contains("both a callable edge and an execution root")
+        ));
+
+        let mut conflicting_contexts = valid.clone();
+        let ProviderPayload::Calls(document) = &mut conflicting_contexts else {
+            unreachable!("Calls fixture")
+        };
+        document.root_invocations.push(ProviderRootInvocation {
+            callee_symbol_id: "callee".into(),
+            call_site: location(16, 22),
+            context: crate::code_intel_domain::ExecutionRootContext::AnonymousCallable,
+        });
+        assert!(matches!(
+            normalize_provider_payload(&conflicting_contexts),
+            Err(ProviderPayloadError::Invalid(reason))
+                if reason.contains("conflicting execution contexts")
+        ));
+
+        // RIGHT-REASON FALSIFIER: UTF-8 byte offsets are the canonical source
+        // occurrence identity. Redundant line/column coordinates must not let
+        // the same occurrence claim two execution contexts before publication.
+        let mut conflicting_contexts_with_line_drift = valid.clone();
+        let ProviderPayload::Calls(document) = &mut conflicting_contexts_with_line_drift else {
+            unreachable!("Calls fixture")
+        };
+        let mut drifted_call_site = location(16, 22);
+        drifted_call_site.span.start_line = 1;
+        drifted_call_site.span.end_line = 1;
+        document.root_invocations.push(ProviderRootInvocation {
+            callee_symbol_id: "callee".into(),
+            call_site: drifted_call_site,
+            context: crate::code_intel_domain::ExecutionRootContext::AnonymousCallable,
+        });
+        assert!(matches!(
+            normalize_provider_payload(&conflicting_contexts_with_line_drift),
+            Err(ProviderPayloadError::Invalid(reason))
+                if reason.contains("conflicting execution contexts")
+        ));
+
+        let mut duplicated_root_with_line_drift = valid.clone();
+        let ProviderPayload::Calls(document) = &mut duplicated_root_with_line_drift else {
+            unreachable!("Calls fixture")
+        };
+        let mut drifted_call_site = location(16, 22);
+        drifted_call_site.span.start_line = 1;
+        drifted_call_site.span.end_line = 1;
+        document.root_invocations.push(ProviderRootInvocation {
+            callee_symbol_id: "callee".into(),
+            call_site: drifted_call_site,
+            context: crate::code_intel_domain::ExecutionRootContext::ModuleInitialization,
+        });
+        assert!(matches!(
+            normalize_provider_payload(&duplicated_root_with_line_drift),
+            Err(ProviderPayloadError::Invalid(reason))
+                if reason.contains("must not duplicate one exact source site")
+        ));
+
+        let mut conflicting_targets = valid;
+        let ProviderPayload::Calls(document) = &mut conflicting_targets else {
+            unreachable!("Calls fixture")
+        };
+        let mut second_callee = document
+            .symbols
+            .iter()
+            .find(|symbol| symbol.provider_symbol_id == "callee")
+            .expect("first callee control")
+            .clone();
+        second_callee.provider_symbol_id = "other-callee".into();
+        second_callee.name = "other_callee".into();
+        second_callee.definition = Some(location(24, 30));
+        second_callee.structural_extent = Some(location(22, 31));
+        second_callee.call_owner_extent = Some(location(22, 31));
+        document.symbols.push(second_callee);
+        document.root_invocations.push(ProviderRootInvocation {
+            callee_symbol_id: "other-callee".into(),
+            call_site: location(16, 22),
+            context: crate::code_intel_domain::ExecutionRootContext::ModuleInitialization,
+        });
+        assert!(matches!(
+            normalize_provider_payload(&conflicting_targets),
+            Err(ProviderPayloadError::Invalid(reason))
+                if reason.contains("one exact root invocation site names conflicting callees")
+        ));
+    }
+
     /// RIGHT-REASON REGRESSION for B06: removing the extent from a declared
     /// source callable must not silently reclassify it as a dynamic or external
     /// target. The independent role discriminant makes that mutation invalid.
@@ -1787,6 +2109,50 @@ mod tests {
             normalize_provider_payload(&payload),
             Err(ProviderPayloadError::Invalid(reason))
                 if reason.contains("source invocation target callee lacks a local definition or structural extent")
+        ));
+    }
+
+    #[test]
+    fn nested_local_callable_owner_is_scoped_but_cannot_be_a_graph_caller() {
+        let mut valid = payload("provider-a");
+        let ProviderPayload::Calls(document) = &mut valid else {
+            unreachable!("Calls fixture")
+        };
+        let local = document
+            .symbols
+            .iter_mut()
+            .find(|symbol| symbol.provider_symbol_id == "callee")
+            .expect("local callable control");
+        local.role = ProviderSymbolRole::LocalInvocationTarget;
+        local.structural_extent = None;
+        normalize_provider_payload(&valid)
+            .expect("a nested callable may retain exact lexical ownership evidence");
+
+        let mut fabricated_caller = valid.clone();
+        let ProviderPayload::Calls(document) = &mut fabricated_caller else {
+            unreachable!("Calls fixture")
+        };
+        document.calls[0].caller_symbol_id = "callee".into();
+        assert!(matches!(
+            normalize_provider_payload(&fabricated_caller),
+            Err(ProviderPayloadError::Invalid(reason))
+                if reason.contains("has no published structural identity")
+        ));
+
+        let mut unrelated_owner = valid;
+        let ProviderPayload::Calls(document) = &mut unrelated_owner else {
+            unreachable!("Calls fixture")
+        };
+        document
+            .symbols
+            .iter_mut()
+            .find(|symbol| symbol.provider_symbol_id == "callee")
+            .expect("local callable control")
+            .call_owner_extent = Some(location(0, 32));
+        assert!(matches!(
+            normalize_provider_payload(&unrelated_owner),
+            Err(ProviderPayloadError::Invalid(reason))
+                if reason.contains("inconsistent with its source identity")
         ));
     }
 

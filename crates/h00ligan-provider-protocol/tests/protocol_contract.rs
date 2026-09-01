@@ -5,33 +5,34 @@ use h00ligan_provider_protocol::{
     AdmittedProviderDocument, ExpectedAffectedRefresh, ExpectedFullCertification,
     ExpectedProviderAnalysis, ExpectedProviderDocument, H00_PYREFLY_IMPLEMENTATION_V1,
     H00_PYREFLY_LANGUAGE, H00_PYREFLY_PROVIDER_ID, H00_PYREFLY_UPSTREAM_COMMIT,
-    H00_PYREFLY_UPSTREAM_VERSION, H00_RUST_ANALYZER_IMPLEMENTATION_V5,
+    H00_PYREFLY_UPSTREAM_VERSION, H00_RUST_ANALYZER_IMPLEMENTATION_V6,
     H00_RUST_ANALYZER_PROVIDER_ID, H00_SCIP_BINDINGS_UPSTREAM_COMMIT,
-    H00_SCIP_BINDINGS_UPSTREAM_VERSION, H00_TYPESCRIPT_IMPLEMENTATION_V1, H00_TYPESCRIPT_LANGUAGE,
+    H00_SCIP_BINDINGS_UPSTREAM_VERSION, H00_TYPESCRIPT_IMPLEMENTATION_V2, H00_TYPESCRIPT_LANGUAGE,
     H00_TYPESCRIPT_PROVIDER_ID, H00_TYPESCRIPT_UPSTREAM_COMMIT, H00_TYPESCRIPT_UPSTREAM_VERSION,
     ProviderAnalysisOutcome, ProviderAuthority, ProviderComponentHealth, ProviderDocumentOutcome,
     ProviderFrame, ProviderFrameLimits, ProviderHealthEvidence, ProviderIdentity,
     ProviderOperation, ProviderRequest, ProviderRequestBody, ProviderRequestClaims,
     ProviderResponse, ProviderResponseBody, ProviderRuntimeConfiguration,
     ProviderSemanticEnvironmentInput, ProviderSemanticInputCoverage, ProviderSemanticInputs,
-    ProviderSemanticPathKind, ProviderSourceChange, ProviderSourceIdentity, RustCargoFeatures,
-    RustSemanticProfile, SEMANTIC_PROVIDER_FRAME_MAGIC, SEMANTIC_PROVIDER_PROTOCOL,
-    capture_provider_semantic_directory_listing, capture_provider_semantic_inputs,
-    decode_provider_frame, encode_provider_frame, provider_identity_sha256,
-    provider_runtime_configuration, provider_semantic_file_identity_sha256,
-    provider_semantic_inputs_are_current, provider_semantic_inputs_are_current_in_environment,
-    provider_semantic_inputs_sha256, provider_semantic_paths_are_current,
-    pyrefly_source_components, read_provider_frame, resolved_authority_configuration_sha256,
-    rust_analyzer_runtime_configuration, rust_analyzer_source_components, sha256_hex,
-    source_population_sha256, typescript_source_components, validate_affected_refresh,
-    validate_full_certification, validate_provider_request, validate_runtime_configuration,
-    write_provider_frame,
+    ProviderSemanticPathKind, ProviderSemanticPathRoot, ProviderSourceChange,
+    ProviderSourceIdentity, RustCargoFeatures, RustSemanticProfile, SEMANTIC_PROVIDER_FRAME_MAGIC,
+    SEMANTIC_PROVIDER_PROTOCOL, capture_provider_semantic_directory_listing,
+    capture_provider_semantic_inputs, capture_provider_semantic_inputs_at_coordinates,
+    classify_provider_semantic_input_path, decode_provider_frame, encode_provider_frame,
+    provider_identity_sha256, provider_runtime_configuration,
+    provider_semantic_file_identity_sha256, provider_semantic_inputs_are_current,
+    provider_semantic_inputs_are_current_in_environment, provider_semantic_inputs_sha256,
+    provider_semantic_paths_are_current, pyrefly_source_components, read_provider_frame,
+    resolved_authority_configuration_sha256, rust_analyzer_runtime_configuration,
+    rust_analyzer_source_components, sha256_hex, source_population_sha256,
+    typescript_source_components, validate_affected_refresh, validate_full_certification,
+    validate_provider_request, validate_runtime_configuration, write_provider_frame,
 };
 
 #[test]
-fn protocol_v13_owns_v13_frame_magic() {
-    assert_eq!(SEMANTIC_PROVIDER_PROTOCOL, "h00/semantic-provider/v13");
-    assert_eq!(SEMANTIC_PROVIDER_FRAME_MAGIC, b"H00SP13\0");
+fn protocol_v15_owns_v15_frame_magic() {
+    assert_eq!(SEMANTIC_PROVIDER_PROTOCOL, "h00/semantic-provider/v15");
+    assert_eq!(SEMANTIC_PROVIDER_FRAME_MAGIC, b"H00SP15\0");
 }
 
 fn sha(byte: char) -> String {
@@ -61,6 +62,44 @@ impl Drop for ScratchDirectory {
     }
 }
 
+/// RIGHT-REASON REGRESSION: source documents and compiler-observed semantic
+/// inputs are different bounded populations. A small source unit may resolve
+/// more dependency/configuration files than it contains source documents.
+#[test]
+fn semantic_inputs_are_not_capped_by_the_source_document_limit() {
+    let root = ScratchDirectory::new("independent-semantic-input-bound");
+    std::fs::write(root.0.join("first.lock"), b"first\n").expect("first semantic input");
+    std::fs::write(root.0.join("second.lock"), b"second\n").expect("second semantic input");
+    let paths = BTreeSet::from(["first.lock".to_owned(), "second.lock".to_owned()]);
+    let limits = ProviderFrameLimits {
+        max_document_paths: 1,
+        ..ProviderFrameLimits::default()
+    };
+
+    let captured = capture_provider_semantic_inputs(&root.0, &paths, &BTreeSet::new(), &limits)
+        .expect("semantic inputs use their own negotiated population bound");
+    assert_eq!(captured.paths.len(), 2, "populated semantic-input control");
+
+    let sources = [
+        ProviderSourceIdentity {
+            document_path: "first.rs".into(),
+            language: "rust".into(),
+            content_identity: "first".into(),
+            content_sha256: sha('a'),
+        },
+        ProviderSourceIdentity {
+            document_path: "second.rs".into(),
+            language: "rust".into(),
+            content_identity: "second".into(),
+            content_sha256: sha('b'),
+        },
+    ];
+    assert!(
+        source_population_sha256(&sources, &limits).is_err(),
+        "positive control: the one-document source limit must still fire"
+    );
+}
+
 #[test]
 fn semantic_input_manifest_is_content_exact_bounded_and_non_vacuous() {
     let root = ScratchDirectory::new("semantic-inputs");
@@ -77,6 +116,24 @@ fn semantic_input_manifest_is_content_exact_bounded_and_non_vacuous() {
         .expect("capture exact semantic inputs");
     assert_eq!(manifest.coverage, ProviderSemanticInputCoverage::Complete);
     assert_eq!(manifest.paths.len(), 3, "positive populated-path control");
+    let encoded_manifest = serde_json::to_value(&manifest).expect("serialize semantic manifest");
+    assert!(
+        encoded_manifest["paths"]
+            .as_array()
+            .expect("semantic path population")
+            .iter()
+            .all(|input| input["root"] == "repository"),
+        "every persisted semantic path must state its authority root explicitly"
+    );
+    let mut missing_root = encoded_manifest;
+    missing_root["paths"][0]
+        .as_object_mut()
+        .expect("semantic path object")
+        .remove("root");
+    assert!(
+        serde_json::from_value::<ProviderSemanticInputs>(missing_root).is_err(),
+        "an omitted authority root must fail closed instead of defaulting to repository"
+    );
     let selector = manifest
         .paths
         .iter()
@@ -187,6 +244,241 @@ fn semantic_input_manifest_is_content_exact_bounded_and_non_vacuous() {
     assert!(
         provider_semantic_inputs_sha256(&duplicate, &limits).is_err(),
         "duplicate/noncanonical input sabotage must fail closed"
+    );
+}
+
+/// RIGHT-REASON REGRESSION: linked worktrees relocate Git's per-worktree and
+/// common control files, but the relocation does not grant arbitrary external
+/// filesystem authority. Persisted inputs must retain only typed roots and
+/// safe relative labels, then re-resolve those exact roots on freshness checks.
+#[test]
+fn semantic_inputs_bind_linked_worktree_git_roots_without_absolute_paths() {
+    let scratch = ScratchDirectory::new("linked-worktree-semantic-inputs");
+    let repository = scratch.0.join("worktree");
+    let common_git = scratch.0.join("main/.git");
+    let worktree_git = common_git.join("worktrees/fixture");
+    let branch_ref = common_git.join("refs/heads/fixture");
+    std::fs::create_dir_all(&repository).expect("worktree source root");
+    std::fs::create_dir_all(branch_ref.parent().expect("branch-ref parent")).expect("common refs");
+    std::fs::create_dir_all(&worktree_git).expect("worktree gitdir");
+    std::fs::write(
+        repository.join(".git"),
+        format!("gitdir: {}\n", worktree_git.display()),
+    )
+    .expect("linked-worktree marker");
+    std::fs::write(worktree_git.join("commondir"), "../..\n").expect("commondir");
+    std::fs::write(worktree_git.join("HEAD"), "ref: refs/heads/fixture\n")
+        .expect("per-worktree HEAD");
+    std::fs::write(&branch_ref, format!("{}\n", "1".repeat(40))).expect("shared ref");
+
+    let nonreciprocal_error = classify_provider_semantic_input_path(&repository, &branch_ref)
+        .expect_err("a one-way repository gitfile must not grant external filesystem authority");
+    assert!(
+        nonreciprocal_error
+            .to_string()
+            .contains("linked-worktree gitdir backpointer"),
+        "the refusal must identify the missing reciprocal proof: {nonreciprocal_error}"
+    );
+    std::fs::write(
+        worktree_git.join("gitdir"),
+        format!("{}\n", repository.join(".git").display()),
+    )
+    .expect("reciprocal worktree pointer");
+
+    let coordinates = BTreeSet::from([
+        classify_provider_semantic_input_path(&repository, &worktree_git.join("HEAD"))
+            .expect("classify per-worktree control"),
+        classify_provider_semantic_input_path(&repository, &branch_ref)
+            .expect("classify shared control"),
+    ]);
+    assert_eq!(coordinates.len(), 2, "populated typed-root control");
+    let outside = scratch.0.join("unrelated-machine-input");
+    std::fs::write(&outside, "private\n").expect("outside negative fixture");
+    assert!(
+        classify_provider_semantic_input_path(&repository, &outside).is_err(),
+        "the Git control plane must not authorize an unrelated sibling path"
+    );
+
+    let limits = ProviderFrameLimits::default();
+    let manifest = capture_provider_semantic_inputs_at_coordinates(
+        &repository,
+        &coordinates,
+        &BTreeSet::new(),
+        &limits,
+    )
+    .expect("capture typed linked-worktree inputs");
+    assert_eq!(
+        manifest
+            .paths
+            .iter()
+            .map(|input| (input.root, input.path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (ProviderSemanticPathRoot::Repository, ".git"),
+            (ProviderSemanticPathRoot::GitWorktree, "HEAD"),
+            (ProviderSemanticPathRoot::GitWorktree, "commondir"),
+            (ProviderSemanticPathRoot::GitWorktree, "gitdir"),
+            (ProviderSemanticPathRoot::GitCommon, "refs/heads/fixture"),
+        ],
+        "addressing inputs and Git roots must form one canonical population"
+    );
+    let encoded = serde_json::to_string(&manifest).expect("serialize semantic inputs");
+    assert!(!encoded.contains(scratch.0.to_str().expect("UTF-8 scratch")));
+    assert!(
+        provider_semantic_paths_are_current(&repository, &manifest, &limits)
+            .expect("re-observe unchanged linked-worktree controls")
+    );
+
+    std::fs::write(&branch_ref, format!("{}\n", "2".repeat(40))).expect("move shared ref");
+    assert!(
+        !provider_semantic_paths_are_current(&repository, &manifest, &limits)
+            .expect("re-observe shared-ref drift"),
+        "same-shape Git ref byte drift must invalidate persisted authority"
+    );
+
+    let unrelated_common = scratch.0.join("unrelated-common");
+    let unrelated_ref = unrelated_common.join("refs/heads/fixture");
+    std::fs::create_dir_all(unrelated_ref.parent().expect("unrelated ref parent"))
+        .expect("unrelated common directory");
+    std::fs::write(&unrelated_ref, format!("{}\n", "3".repeat(40))).expect("unrelated common ref");
+    std::fs::write(
+        worktree_git.join("commondir"),
+        unrelated_common.display().to_string(),
+    )
+    .expect("forged common-dir pointer");
+    assert!(
+        classify_provider_semantic_input_path(&repository, &unrelated_ref).is_err(),
+        "commondir must not grant an unrelated directory without Git topology proof"
+    );
+}
+
+/// FALSIFIER: the per-worktree `commondir` file participates in locating every
+/// external Git root, even when the selected semantic input itself lives only
+/// in the per-worktree directory. Its exact bytes must therefore be captured
+/// and any representation drift must invalidate the old authority manifest.
+#[test]
+fn git_worktree_only_semantic_inputs_bind_commondir_addressing_bytes() {
+    let scratch = ScratchDirectory::new("linked-worktree-only-semantic-inputs");
+    let repository = scratch.0.join("worktree");
+    let common_git = scratch.0.join("main/.git");
+    let worktree_git = common_git.join("worktrees/fixture");
+    std::fs::create_dir_all(&repository).expect("worktree source root");
+    std::fs::create_dir_all(&worktree_git).expect("worktree gitdir");
+    std::fs::write(
+        repository.join(".git"),
+        format!("gitdir: {}\n", worktree_git.display()),
+    )
+    .expect("linked-worktree marker");
+    std::fs::write(worktree_git.join("commondir"), "../..\n").expect("commondir");
+    std::fs::write(worktree_git.join("HEAD"), "ref: refs/heads/fixture\n")
+        .expect("per-worktree HEAD");
+    std::fs::write(
+        worktree_git.join("gitdir"),
+        format!("{}\n", repository.join(".git").display()),
+    )
+    .expect("reciprocal worktree pointer");
+
+    let coordinates = BTreeSet::from([classify_provider_semantic_input_path(
+        &repository,
+        &worktree_git.join("HEAD"),
+    )
+    .expect("classify per-worktree control")]);
+    assert_eq!(coordinates.len(), 1, "populated Git-worktree control");
+    let limits = ProviderFrameLimits::default();
+    let manifest = capture_provider_semantic_inputs_at_coordinates(
+        &repository,
+        &coordinates,
+        &BTreeSet::new(),
+        &limits,
+    )
+    .expect("capture typed linked-worktree input");
+    assert_eq!(
+        manifest
+            .paths
+            .iter()
+            .map(|input| (input.root, input.path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (ProviderSemanticPathRoot::Repository, ".git"),
+            (ProviderSemanticPathRoot::GitWorktree, "HEAD"),
+            (ProviderSemanticPathRoot::GitWorktree, "commondir"),
+            (ProviderSemanticPathRoot::GitWorktree, "gitdir"),
+        ],
+        "every external Git manifest must bind its complete addressing population"
+    );
+    assert!(
+        provider_semantic_paths_are_current(&repository, &manifest, &limits)
+            .expect("unchanged addressing population")
+    );
+
+    std::fs::write(
+        worktree_git.join("commondir"),
+        format!("{}\n", common_git.display()),
+    )
+    .expect("same-target commondir representation drift");
+    assert!(
+        !provider_semantic_paths_are_current(&repository, &manifest, &limits)
+            .expect("re-observe changed commondir bytes"),
+        "same-target addressing-byte drift must invalidate persisted authority"
+    );
+}
+
+/// RIGHT-REASON REGRESSION: a linked-worktree gitdir is a per-worktree entry
+/// below the common repository and therefore has a `commondir` pointer. A
+/// repository-local gitfile plus an arbitrary reciprocal external directory
+/// is not enough to grant that directory semantic-input authority.
+#[test]
+fn gitfile_without_commondir_is_not_linked_worktree_authority() {
+    let scratch = ScratchDirectory::new("forged-linked-worktree-without-commondir");
+    let repository = scratch.0.join("repository");
+    let external_gitdir = scratch.0.join("external-gitdir");
+    std::fs::create_dir_all(&repository).expect("repository directory");
+    std::fs::create_dir_all(&external_gitdir).expect("external gitdir directory");
+    std::fs::write(
+        repository.join(".git"),
+        format!("gitdir: {}\n", external_gitdir.display()),
+    )
+    .expect("repository gitfile");
+    std::fs::write(external_gitdir.join("HEAD"), "ref: refs/heads/main\n").expect("external HEAD");
+    std::fs::write(
+        external_gitdir.join("gitdir"),
+        format!("{}\n", repository.join(".git").display()),
+    )
+    .expect("synthetic reciprocal pointer");
+
+    let error = classify_provider_semantic_input_path(&repository, &external_gitdir.join("HEAD"))
+        .expect_err("a non-worktree gitfile must not grant external authority");
+    assert!(
+        error.to_string().contains("commondir"),
+        "the refusal must identify the missing linked-worktree control: {error}"
+    );
+}
+
+#[test]
+fn gitfile_with_self_commondir_is_not_linked_worktree_authority() {
+    let scratch = ScratchDirectory::new("forged-linked-worktree-self-commondir");
+    let repository = scratch.0.join("repository");
+    let external_gitdir = scratch.0.join("external-gitdir");
+    std::fs::create_dir_all(&repository).expect("repository directory");
+    std::fs::create_dir_all(&external_gitdir).expect("external gitdir directory");
+    std::fs::write(
+        repository.join(".git"),
+        format!("gitdir: {}\n", external_gitdir.display()),
+    )
+    .expect("repository gitfile");
+    std::fs::write(external_gitdir.join("HEAD"), "ref: refs/heads/main\n").expect("external HEAD");
+    std::fs::write(
+        external_gitdir.join("gitdir"),
+        format!("{}\n", repository.join(".git").display()),
+    )
+    .expect("synthetic reciprocal pointer");
+    std::fs::write(external_gitdir.join("commondir"), ".\n").expect("synthetic self commondir");
+
+    let error = classify_provider_semantic_input_path(&repository, &external_gitdir.join("HEAD"))
+        .expect_err("a self-common gitfile must not grant external authority");
+    assert!(
+        error.to_string().contains("common Git directory"),
+        "the refusal must identify the invalid common-directory topology: {error}"
     );
 }
 
@@ -467,7 +759,7 @@ fn provider() -> ProviderIdentity {
         protocol: SEMANTIC_PROVIDER_PROTOCOL.into(),
         provider_id: H00_RUST_ANALYZER_PROVIDER_ID.into(),
         language: "rust".into(),
-        implementation_version: H00_RUST_ANALYZER_IMPLEMENTATION_V5.into(),
+        implementation_version: H00_RUST_ANALYZER_IMPLEMENTATION_V6.into(),
         source_components: rust_analyzer_source_components(),
         patch_sha256: sha('a'),
         executable_sha256: sha('b'),
@@ -567,7 +859,7 @@ fn pinned_python_and_typescript_provider_identities_are_complete() {
                 protocol: SEMANTIC_PROVIDER_PROTOCOL.into(),
                 provider_id: H00_TYPESCRIPT_PROVIDER_ID.into(),
                 language: H00_TYPESCRIPT_LANGUAGE.into(),
-                implementation_version: H00_TYPESCRIPT_IMPLEMENTATION_V1.into(),
+                implementation_version: H00_TYPESCRIPT_IMPLEMENTATION_V2.into(),
                 source_components: typescript_source_components(),
                 patch_sha256: sha('c'),
                 executable_sha256: sha('d'),

@@ -20,7 +20,7 @@ use crate::code_intel_calls::{
 use crate::code_intel_cursor::page_window;
 use crate::code_intel_domain::{
     AuthorityStatus, CallerFilter, CallsRequest, CapabilityCoverage, CapabilityCoverageStatus,
-    DomainError, GenerationId, LIVE_INPUT_RESULT_RESERVE_CHARS, ProjectInventoryCoverage,
+    DomainError, GenerationId, MAX_GENERATION_ENGINE_RESULT_CHARS, ProjectInventoryCoverage,
     RepositoryBinding, TypeRequest, UnitGraph, assess_structural_graph_capability,
 };
 use crate::code_intel_inventory::project_unit_graph;
@@ -47,12 +47,11 @@ use crate::reachability::ReachabilityClass;
 use crate::source_materialization::materialize_source;
 use crate::structural_ir::{SymbolRole, symbol_kind_has_role};
 
-pub const INSPECT_SCHEMA_VERSION: &str = "h00/code-intel/inspect/v2";
+pub const INSPECT_SCHEMA_VERSION: &str = "h00/code-intel/inspect/v3";
 pub const MAX_INSPECT_SYMBOL_BYTES: usize = 4_096;
 pub const MAX_INSPECT_FILE_BYTES: usize = 4_096;
 pub const DEFAULT_INSPECT_PREVIEW_ITEMS: usize = 20;
 pub const DEFAULT_INSPECT_SOURCE_CHARACTERS: usize = 4_000;
-pub const MAX_INSPECT_RESULT_CHARS: usize = 28_000;
 const MAX_FIELD_USAGE_CANDIDATES_SCANNED: usize = 100;
 
 #[cfg(test)]
@@ -372,7 +371,7 @@ async fn query_published_inspect_with_index(
     )
     .await?;
     let full_result_chars = serialized_inspect_chars(&full_result)?;
-    if full_result_chars <= MAX_INSPECT_RESULT_CHARS - LIVE_INPUT_RESULT_RESERVE_CHARS {
+    if full_result_chars <= MAX_GENERATION_ENGINE_RESULT_CHARS {
         return Ok(full_result);
     }
 
@@ -393,18 +392,18 @@ async fn query_published_inspect_with_index(
             source_character_limit,
         )?;
         let result_chars = serialized_inspect_chars(&result)?;
-        if result_chars <= MAX_INSPECT_RESULT_CHARS - LIVE_INPUT_RESULT_RESERVE_CHARS {
+        if result_chars <= MAX_GENERATION_ENGINE_RESULT_CHARS {
             return Ok(result);
         }
         if preview_item_limit == 1 && source_character_limit == 1 {
             break result_chars;
         }
     };
-    Err(invalid_request(
-        "symbol",
-        format!(
-            "the minimum Inspect dossier would contain {smallest_result_chars} serialized characters and cannot leave room for required live-input evidence within the {MAX_INSPECT_RESULT_CHARS}-character product bound"
-        ),
+    Err(DomainError::result_too_large(
+        "inspect",
+        smallest_result_chars,
+        MAX_GENERATION_ENGINE_RESULT_CHARS,
+        "Request fewer sections or narrow the symbol/file scope; the minimum Inspect dossier does not fit after every optional preview is reduced",
     ))
 }
 
@@ -574,7 +573,7 @@ fn compact_calls_facet(
     let mut projected_documents = result
         .items
         .iter()
-        .map(|item| item.caller.document_path.as_str())
+        .map(|item| item.origin.document_path())
         .collect::<Vec<_>>();
     projected_documents.push(&result.resolved_symbol.document_path);
     result.unit_graph = project_unit_graph(&generation.project_inventory, projected_documents);
@@ -603,7 +602,7 @@ fn compact_tests_facet(
     for item in &result.items {
         projected_documents.push(item.test.document_path.as_str());
         for step in &item.chain {
-            projected_documents.push(step.source().document_path.as_str());
+            projected_documents.push(step.source_document());
             projected_documents.push(step.target().document_path.as_str());
         }
     }
@@ -838,8 +837,11 @@ async fn build_inspect_result(
     let target_structural_complete = structural_graph
         .language_status(&target_language.0)
         .is_some_and(|status| status == CapabilityCoverageStatus::Complete);
-    let inventory_complete = generation.project_inventory.coverage
-        == ProjectInventoryCoverage::IndexedSourcePopulationComplete;
+    let inventory_coverage = generation
+        .project_inventory
+        .coverage_for_language(&target_language);
+    let inventory_complete =
+        inventory_coverage == ProjectInventoryCoverage::IndexedSourcePopulationComplete;
     let status = if requested_facets_complete && target_structural_complete && inventory_complete {
         AuthorityStatus::Complete
     } else {
@@ -874,7 +876,7 @@ async fn build_inspect_result(
         authority: InspectAuthority {
             status,
             structural_graph,
-            project_inventory_coverage: generation.project_inventory.coverage,
+            project_inventory_coverage: inventory_coverage,
             requested_facets_complete,
         },
         source,
@@ -1398,7 +1400,7 @@ mod tests {
         );
         assert!(
             serialized_inspect_chars(&result).expect("serialized bounded dossier")
-                <= MAX_INSPECT_RESULT_CHARS - LIVE_INPUT_RESULT_RESERVE_CHARS,
+                <= MAX_GENERATION_ENGINE_RESULT_CHARS,
             "successful Inspect output must satisfy its transport reserve"
         );
         assert_eq!(

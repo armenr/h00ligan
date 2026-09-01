@@ -42,7 +42,7 @@ use crate::code_intel_payload::{
     CALLS_PROVIDER_PAYLOAD_SCHEMA, CallsProviderPayload, NormalizedProviderPayload,
     NormalizedSourceSpan, ProviderCall, ProviderCallableBinding, ProviderCoverageExclusion,
     ProviderDocument, ProviderExecutionAuthority, ProviderLocation, ProviderPayload,
-    ProviderSymbol, ProviderSymbolRole, normalize_provider_payload_typed,
+    ProviderRootInvocation, ProviderSymbol, ProviderSymbolRole, normalize_provider_payload_typed,
 };
 use crate::language::NamedCallForm;
 use crate::scip_paths::{execution_prefix, repository_document_path};
@@ -1509,6 +1509,22 @@ impl DefinitionCallOwnerIndex {
         }
         Ok(owner)
     }
+
+    fn resolve_published<'a>(
+        &self,
+        definitions: &'a SharedCanonicalDefinitions,
+        call_span: &NormalizedSourceSpan,
+    ) -> Result<Option<&'a DefinitionRecord>, ()> {
+        enclosing_callable_linear(
+            self.provider_ids_by_range
+                .values()
+                .flatten()
+                .filter_map(|provider_id| definitions.get(provider_id.as_str()))
+                .map(Arc::as_ref)
+                .filter(|definition| definition.structural_span().is_some()),
+            call_span,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1526,11 +1542,13 @@ struct SourceSyntaxEvidence {
     go_package_function_names: SourceCallableNames,
     binding_scopes: SourceBindingScopes,
     callable_extents: SourceCallableExtents,
+    non_structural_callable_definitions: BTreeSet<(usize, usize)>,
     invocation_target_extents: SourceInvocationTargetExtents,
     value_binding_extents: SourceValueBindingExtents,
     callable_binding_targets: SourceCallableBindingTargets,
     direct_closure_bindings: SourceDirectClosureBindings,
     call_owner_extents: SourceRangeIndex,
+    anonymous_callable_extents: SourceRangeIndex,
     declared_type_names: SourceDeclaredTypeNames,
     parameter_bindings: SourceParameterBindings,
     conditional_ranges: SourceRangeIndex,
@@ -1544,10 +1562,12 @@ struct SourceDefinitionContexts {
     go_package_function_names: SourceCallableNames,
     binding_scopes: SourceBindingScopes,
     callable_extents: SourceCallableExtents,
+    non_structural_callable_definitions: BTreeSet<(usize, usize)>,
     invocation_target_extents: SourceInvocationTargetExtents,
     value_binding_extents: SourceValueBindingExtents,
     direct_closure_bindings: SourceDirectClosureBindings,
     call_owner_extents: SourceCallOwnerExtents,
+    anonymous_callable_extents: SourceCallOwnerExtents,
     declared_type_names: SourceDeclaredTypeNames,
 }
 
@@ -1726,6 +1746,22 @@ impl SourceSyntaxEvidence {
         self.call_owner_extents
             .ranges
             .contains(&(start_byte, end_byte))
+    }
+
+    fn execution_root_context(
+        &self,
+        start_byte: u64,
+        end_byte: u64,
+    ) -> crate::code_intel_domain::ExecutionRootContext {
+        if self
+            .anonymous_callable_extents
+            .tightest_containing(start_byte, end_byte)
+            .is_some()
+        {
+            crate::code_intel_domain::ExecutionRootContext::AnonymousCallable
+        } else {
+            crate::code_intel_domain::ExecutionRootContext::ModuleInitialization
+        }
     }
 }
 
@@ -3377,8 +3413,18 @@ fn normalize_complete(
             }
             // Provider enclosing ranges are descriptive metadata, not lexical
             // ownership authority. Only the exact syntax callable matched by
-            // the provider definition may own call sites.
-            let enclosing_span = syntax_callable_extent;
+            // the provider definition may own call sites. A language adapter
+            // may additionally prove that the callable is nested runtime
+            // state rather than a stable structural target. Keep its exact
+            // owner span for coverage accounting without publishing a graph
+            // identity that structural extraction deliberately does not own.
+            let structurally_published_callable = !source
+                .syntax
+                .non_structural_callable_definitions
+                .contains(&definition_range);
+            let enclosing_span = structurally_published_callable
+                .then_some(syntax_callable_extent)
+                .flatten();
             let record = DefinitionRecord {
                 provider_symbol_id,
                 name,
@@ -3855,7 +3901,7 @@ fn normalize_complete(
             .map(|symbol| (symbol.provider_symbol_id.as_str(), symbol))
             .collect::<BTreeMap<_, _>>();
         reused_call_documents.retain(|document_path| {
-            reuse
+            let calls_are_reusable = reuse
                 .prior_payload
                 .calls
                 .iter()
@@ -3884,7 +3930,24 @@ fn normalize_complete(
                                 |current_symbol| current_symbol == prior_symbol,
                             )
                         })
-                })
+                });
+            let roots_are_reusable = reuse
+                .prior_payload
+                .root_invocations
+                .iter()
+                .filter(|invocation| invocation.call_site.document_path == *document_path)
+                .all(|invocation| {
+                    let Some(prior_symbol) = prior_symbols
+                        .get(invocation.callee_symbol_id.as_str())
+                        .copied()
+                    else {
+                        return false;
+                    };
+                    symbols
+                        .get(&invocation.callee_symbol_id)
+                        .is_some_and(|current_symbol| current_symbol == prior_symbol)
+                });
+            calls_are_reusable && roots_are_reusable
         });
         coverage_exclusions.extend(
             reuse
@@ -3906,10 +3969,26 @@ fn normalize_complete(
             .cloned()
             .collect()
     });
+    let mut root_invocations = affected_calls_reuse.map_or_else(Vec::new, |reuse| {
+        reuse
+            .prior_payload
+            .root_invocations
+            .iter()
+            .filter(|invocation| {
+                reused_call_documents.contains(&invocation.call_site.document_path)
+            })
+            .cloned()
+            .collect()
+    });
     if let Some(reuse) = affected_calls_reuse {
         let retained_symbol_ids = calls
             .iter()
             .flat_map(|call| [&call.caller_symbol_id, &call.callee_symbol_id])
+            .chain(
+                root_invocations
+                    .iter()
+                    .map(|invocation| &invocation.callee_symbol_id),
+            )
             .collect::<BTreeSet<_>>();
         for symbol in &reuse.prior_payload.symbols {
             if retained_symbol_ids.contains(&symbol.provider_symbol_id) {
@@ -4064,7 +4143,7 @@ fn normalize_complete(
                 // structural node.
                 continue;
             }
-            if callee.structural_span().is_none() {
+            if callee.structural_span().is_none() && callee.call_owner_span.is_none() {
                 // The provider proved an invocation of a local callable value,
                 // but no source-backed structural callable owns that value.
                 // Preserve the positive call-site evidence while qualifying
@@ -4079,19 +4158,46 @@ fn normalize_complete(
                     reason_code: "dynamic_callable_target_unresolved".into(),
                 });
             }
-            let caller = definition_owner_indexes
-                .get(document_path)
+            let owner_index = definition_owner_indexes.get(document_path);
+            let provider_caller = owner_index
                 .map_or(Ok(None), |index| index.resolve(&definitions, &call_span))
-            .map_err(|()| {
-                NormalizationFailure::partial(
-                    "call_owner_ambiguous",
-                    format!(
-                        "call at {document_path}:{}-{} to {} has multiple equally tight callable owners",
-                        call_span.start_byte, call_span.end_byte, occurrence.symbol
-                    ),
-                )
-            })?;
-            let Some(caller) = caller else {
+                .map_err(|()| {
+                    NormalizationFailure::partial(
+                        "call_owner_ambiguous",
+                        format!(
+                            "call at {document_path}:{}-{} to {} has multiple equally tight callable owners",
+                            call_span.start_byte, call_span.end_byte, occurrence.symbol
+                        ),
+                    )
+                })?;
+            let provider_caller = if provider_caller
+                .is_some_and(|caller| caller.structural_span().is_none())
+            {
+                // Nested callable values have exact lexical bodies but are not
+                // stable structural query targets. Attribute their explicit
+                // source invocations to the tightest published enclosing
+                // callable, matching the graph's deliberate granularity.
+                // This is the same conservative lexical over-approximation
+                // used for branches: it may retain a target, never erase one.
+                owner_index
+                    .map_or(Ok(None), |index| {
+                        index.resolve_published(&definitions, &call_span)
+                    })
+                    .map_err(|()| {
+                        NormalizationFailure::partial(
+                            "call_owner_ambiguous",
+                            format!(
+                                "call at {document_path}:{}-{} to {} has multiple equally tight published callable owners",
+                                call_span.start_byte, call_span.end_byte, occurrence.symbol
+                            ),
+                        )
+                    })?
+            } else {
+                provider_caller
+            };
+            let caller = if let Some(caller) = provider_caller {
+                Cow::Borrowed(caller)
+            } else {
                 if let Some((start, end)) = source
                     .syntax
                     .enclosing_conditional_range(call_span.start_byte, call_span.end_byte)
@@ -4109,27 +4215,59 @@ fn normalize_complete(
                     .syntax
                     .range_has_callable_owner(call_span.start_byte, call_span.end_byte)
                 {
-                    coverage_exclusions.insert(ProviderCoverageExclusion {
-                        location: ProviderLocation {
-                            document_path: document_path.clone(),
-                            span: call_span,
-                        },
-                        reason_code: "module_initialization".into(),
-                    });
+                    if callee.structural_span().is_some() {
+                        symbols
+                            .entry(callee.provider_symbol_id.clone())
+                            .or_insert_with(|| provider_symbol(callee.as_ref(), spec.language));
+                        root_invocations.push(ProviderRootInvocation {
+                            callee_symbol_id: callee.provider_symbol_id.clone(),
+                            context: source
+                                .syntax
+                                .execution_root_context(call_span.start_byte, call_span.end_byte),
+                            call_site: ProviderLocation {
+                                document_path: document_path.clone(),
+                                span: call_span,
+                            },
+                        });
+                    }
+                    // A non-structural callee already received an exact dynamic
+                    // target exclusion above. Do not add a second, misleading
+                    // execution-root diagnosis for the same call site.
                     continue;
                 }
-                return Err(NormalizationFailure::partial(
-                    "call_owner_unproven",
-                    format!(
-                        "call at {document_path}:{}-{} to {} has no uniquely enclosing callable definition",
-                        call_span.start_byte, call_span.end_byte, occurrence.symbol
-                    ),
-                ));
+                let Some(caller) =
+                    structural_call_owner(source, document_path, spec.language, &call_span)?
+                else {
+                    return Err(NormalizationFailure::partial(
+                        "call_owner_unproven",
+                        format!(
+                            "call at {document_path}:{}-{} to {} has no uniquely enclosing callable definition",
+                            call_span.start_byte, call_span.end_byte, occurrence.symbol
+                        ),
+                    ));
+                };
+                Cow::Owned(caller)
             };
+
+            if caller.structural_span().is_none() {
+                // A nested callable value can be the exact compiler-proven
+                // lexical owner of this call while remaining intentionally
+                // absent from the structural graph. Do not manufacture a
+                // graph caller for runtime-local state. Preserve the scoped
+                // uncertainty at the exact call site instead.
+                coverage_exclusions.insert(ProviderCoverageExclusion {
+                    location: ProviderLocation {
+                        document_path: document_path.clone(),
+                        span: call_span,
+                    },
+                    reason_code: "local_callable_caller_unpublished".into(),
+                });
+                continue;
+            }
 
             symbols
                 .entry(caller.provider_symbol_id.clone())
-                .or_insert_with(|| provider_symbol(caller, spec.language));
+                .or_insert_with(|| provider_symbol(caller.as_ref(), spec.language));
             symbols
                 .entry(callee.provider_symbol_id.clone())
                 .or_insert_with(|| provider_symbol(callee.as_ref(), spec.language));
@@ -4272,6 +4410,7 @@ fn normalize_complete(
             .collect(),
         symbols: symbols.into_values().collect(),
         calls,
+        root_invocations,
         callable_bindings,
         coverage_exclusions: coverage_exclusions.into_iter().collect(),
     });
@@ -4348,6 +4487,99 @@ fn provider_coverage_exclusion(
     })
 }
 
+/// Reconstruct only a missing caller identity from exact source syntax. The
+/// compiler provider remains authoritative for the call occurrence and callee;
+/// this witness supplies the one co-published structural callable whose extent
+/// uniquely contains that occurrence.
+fn structural_call_owner(
+    source: &SourceDocument,
+    document_path: &str,
+    language: &str,
+    call_span: &NormalizedSourceSpan,
+) -> Result<Option<DefinitionRecord>, NormalizationFailure> {
+    let Some((owner_start, owner_end)) = source
+        .syntax
+        .call_owner_extents
+        .tightest_containing(call_span.start_byte, call_span.end_byte)
+    else {
+        return Ok(None);
+    };
+    let owner_start_usize = usize::try_from(owner_start).map_err(|_| {
+        NormalizationFailure::unavailable(
+            "call_owner_span_invalid",
+            format!("call owner start in {document_path} exceeds this platform"),
+        )
+    })?;
+    let owner_end_usize = usize::try_from(owner_end).map_err(|_| {
+        NormalizationFailure::unavailable(
+            "call_owner_span_invalid",
+            format!("call owner end in {document_path} exceeds this platform"),
+        )
+    })?;
+    let mut definition_ranges = source
+        .syntax
+        .callable_extents
+        .iter()
+        .filter_map(|(definition, extent)| {
+            (*extent == (owner_start_usize, owner_end_usize)).then_some(*definition)
+        })
+        .collect::<Vec<_>>();
+    definition_ranges.sort_unstable();
+    definition_ranges.dedup();
+    let [definition_range] = definition_ranges.as_slice() else {
+        return Ok(None);
+    };
+    let name = source
+        .text
+        .get(definition_range.0..definition_range.1)
+        .filter(|name| !name.is_empty() && *name != "_")
+        .ok_or_else(|| {
+            NormalizationFailure::unavailable(
+                "call_owner_name_invalid",
+                format!("call owner name in {document_path} is not exact UTF-8 source"),
+            )
+        })?
+        .to_owned();
+    let definition_span = normalized_source_byte_span(
+        source,
+        document_path,
+        definition_range.0,
+        definition_range.1,
+    )?;
+    let owner_span =
+        normalized_source_byte_span(source, document_path, owner_start_usize, owner_end_usize)?;
+    let identity_material = format!(
+        "h00/structural-call-owner/v1\0{language}\0{document_path}\0{}\0{}",
+        definition_range.0, definition_range.1
+    );
+    Ok(Some(DefinitionRecord {
+        provider_symbol_id: format!(
+            "h00-structural-call-owner:{}",
+            blake3::hash(identity_material.as_bytes()).to_hex()
+        ),
+        name,
+        kind: "function".into(),
+        provider_kind: symbol_information::Kind::Function,
+        document_path: document_path.into(),
+        definition: ProviderLocation {
+            document_path: document_path.into(),
+            span: definition_span,
+        },
+        enclosing_span: Some(owner_span.clone()),
+        invocation_target_span: None,
+        call_owner_span: Some(owner_span),
+        value_binding_span: None,
+        binding_scope: source
+            .syntax
+            .binding_scopes
+            .get(definition_range)
+            .copied()
+            .unwrap_or((owner_start, owner_end)),
+        callable: true,
+        rust_declared_owner: None,
+    }))
+}
+
 fn unique_provider_symbol_at_range<'a>(
     symbols: &'a ProviderSymbolsByRange,
     document_path: &str,
@@ -4368,6 +4600,7 @@ fn classify_method_omission(
         "rust" => classify_rust_method_omission(callee, evidence),
         "python" if callee.source_local_method_target => MethodOmission::MissingSourceCall,
         "python" => MethodOmission::Unresolved,
+        "typescript" => MethodOmission::Unresolved,
         // Other registered providers retain their existing fail-closed
         // behavior until their receiver population has an equivalent exact
         // witness. Go selectors are excluded before this classifier because
@@ -4968,11 +5201,16 @@ fn source_call_evidence(
         go_package_function_names: definition_contexts.go_package_function_names,
         binding_scopes: definition_contexts.binding_scopes,
         callable_extents: definition_contexts.callable_extents,
+        non_structural_callable_definitions: definition_contexts
+            .non_structural_callable_definitions,
         invocation_target_extents: definition_contexts.invocation_target_extents,
         value_binding_extents: definition_contexts.value_binding_extents,
         callable_binding_targets,
         direct_closure_bindings: definition_contexts.direct_closure_bindings,
         call_owner_extents: SourceRangeIndex::from_usize(definition_contexts.call_owner_extents),
+        anonymous_callable_extents: SourceRangeIndex::from_usize(
+            definition_contexts.anonymous_callable_extents,
+        ),
         declared_type_names: definition_contexts.declared_type_names,
         parameter_bindings,
         conditional_ranges: SourceRangeIndex::new(conditional_ranges),
@@ -5262,7 +5500,16 @@ fn collect_definition_context_at_node(
     extractor: &dyn crate::language::LanguageExtractor,
     contexts: &mut SourceDefinitionContexts,
 ) {
+    if extractor
+        .anonymous_callable_declaration_kinds()
+        .contains(&node.kind())
+    {
+        contexts
+            .anonymous_callable_extents
+            .insert((node.start_byte(), node.end_byte()));
+    }
     let named_callable = extractor.named_callable_syntax(node);
+    let definition_range = (node.start_byte(), node.end_byte());
     let invocation_target_extent = python_class_invocation_target_extent(node, language);
     if matches!(node.kind(), "identifier" | "field_identifier")
         || named_callable.is_some()
@@ -5289,6 +5536,11 @@ fn collect_definition_context_at_node(
         {
             callable_extent = Some(callable.extent);
             go_package_function |= language == "go" && callable.is_package_function;
+            if !callable.structural_target {
+                contexts
+                    .non_structural_callable_definitions
+                    .insert(definition_range);
+            }
             if callable.has_body {
                 contexts.call_owner_extents.insert(callable.extent);
             }
@@ -5303,7 +5555,6 @@ fn collect_definition_context_at_node(
             }
             ancestor = candidate.parent();
         }
-        let definition_range = (node.start_byte(), node.end_byte());
         if let Some(extent) = invocation_target_extent {
             contexts
                 .invocation_target_extents
@@ -6005,6 +6256,15 @@ fn call_target_kind(spec: ScipProviderSpec, kind: symbol_information::Kind) -> b
                 | symbol_information::Kind::Field
         ),
         "python" => kind == symbol_information::Kind::Class,
+        "typescript" => matches!(
+            kind,
+            symbol_information::Kind::Parameter
+                | symbol_information::Kind::Variable
+                | symbol_information::Kind::Constant
+                | symbol_information::Kind::StaticVariable
+                | symbol_information::Kind::Field
+                | symbol_information::Kind::Property
+        ),
         _ => false,
     }
 }
@@ -6198,6 +6458,51 @@ mod tests {
     const RUST_SOURCE: &str = "fn target() {}\nfn caller() { target(); }\n";
     const GO_SOURCE: &str = "package fixture\nfunc target() {}\nfunc caller() { target() }\n";
     const PYTHON_SOURCE: &str = "def target(): return 1\ndef caller(): return target()\n";
+
+    #[test]
+    fn anonymous_callable_context_census_is_language_registered_and_polyglot() {
+        for (language, path, source) in [
+            (
+                "rust",
+                "src/lib.rs",
+                "fn target() {}\nfn owner() { let callback = || target(); drop(callback); }\n",
+            ),
+            (
+                "go",
+                "main.go",
+                "package fixture\nfunc target() {}\nfunc owner() { callback := func() { target() }; _ = callback }\n",
+            ),
+            (
+                "python",
+                "app.py",
+                "def target(): return 1\ncallback = lambda: target()\n",
+            ),
+            (
+                "typescript",
+                "src/app.ts",
+                "function target() {}\nconst callback = () => target();\n",
+            ),
+        ] {
+            let syntax = source_call_evidence(source, path, language)
+                .unwrap_or_else(|error| panic!("{language} syntax census: {error:?}"));
+            let start = source.rfind("target()").expect("anonymous call marker") as u64;
+            assert_eq!(
+                syntax.execution_root_context(start, start + 6),
+                crate::code_intel_domain::ExecutionRootContext::AnonymousCallable,
+                "{language} must classify its registered anonymous callable syntax"
+            );
+        }
+
+        let module_source = "def target(): return 1\ntarget()\n";
+        let module_syntax = source_call_evidence(module_source, "app.py", "python")
+            .expect("module-scope positive control");
+        let module_start = module_source.rfind("target()").expect("module call") as u64;
+        assert_eq!(
+            module_syntax.execution_root_context(module_start, module_start + 6),
+            crate::code_intel_domain::ExecutionRootContext::ModuleInitialization,
+            "ordinary module scope must remain distinct"
+        );
+    }
 
     #[test]
     fn affected_definition_group_refresh_preserves_shared_unchanged_records() {
@@ -6572,6 +6877,317 @@ mod tests {
         );
     }
 
+    /// RIGHT-REASON REGRESSION: the TypeScript compiler describes a `const`
+    /// binding by its declaration kind even when its initializer owns an arrow
+    /// function body. The language adapter must supply that exact callable
+    /// extent before the resolved invocation can become a Calls edge.
+    #[test]
+    fn typescript_callable_value_joins_compiler_kind_to_structural_body() {
+        const SOURCE: &str = "const tokenColor = (name: string) => name;\nfunction caller() { return tokenColor(\"x\"); }\n";
+        const TOKEN: &str = "typescript npm fixture 0.1.0 src/index.ts/tokenColor.";
+        const CALLER: &str = "typescript npm fixture 0.1.0 src/index.ts/caller().";
+        let mut lines = SOURCE.lines();
+        let binding_line = lines.next().expect("binding line");
+        let caller_line = lines.next().expect("caller line");
+        let binding_column = binding_line.find("tokenColor").expect("binding name") as i32;
+        let caller_column = caller_line.find("caller").expect("caller name") as i32;
+        let call_column = caller_line.rfind("tokenColor").expect("call target") as i32;
+
+        let mut binding_definition = Occurrence::new();
+        binding_definition.symbol = TOKEN.into();
+        binding_definition.symbol_roles = SymbolRole::Definition.value();
+        binding_definition.range = vec![0, binding_column, binding_column + 10];
+
+        let mut caller_definition = Occurrence::new();
+        caller_definition.symbol = CALLER.into();
+        caller_definition.symbol_roles = SymbolRole::Definition.value();
+        caller_definition.range = vec![1, caller_column, caller_column + 6];
+
+        let mut call = Occurrence::new();
+        call.symbol = TOKEN.into();
+        call.range = vec![1, call_column, call_column + 10];
+
+        let mut binding_information = SymbolInformation::new();
+        binding_information.symbol = TOKEN.into();
+        binding_information.display_name = "tokenColor".into();
+        binding_information.kind = EnumOrUnknown::new(symbol_information::Kind::Constant);
+
+        let mut caller_information = SymbolInformation::new();
+        caller_information.symbol = CALLER.into();
+        caller_information.display_name = "caller".into();
+        caller_information.kind = EnumOrUnknown::new(symbol_information::Kind::Function);
+
+        let mut document = Document::new();
+        document.language = "typescript".into();
+        document.relative_path = "src/index.ts".into();
+        document.text = SOURCE.into();
+        document.position_encoding =
+            EnumOrUnknown::new(PositionEncoding::UTF8CodeUnitOffsetFromLineStart);
+        document.occurrences = vec![binding_definition, caller_definition, call];
+        document.symbols = vec![binding_information, caller_information];
+
+        let evidence = fixture(
+            ScipProviderSpec::typescript_native_sidecar(),
+            vec![document],
+            &[("src/index.ts", SOURCE)],
+        )
+        .normalize();
+        assert_eq!(
+            evidence.receipt.status,
+            CapabilityStatus::Complete,
+            "resolved callable value was not admitted: {:?}",
+            evidence.receipt
+        );
+        let ProviderPayload::Calls(payload) = evidence
+            .payload
+            .expect("complete TypeScript Calls payload")
+            .into_payload()
+        else {
+            unreachable!("Calls fixture")
+        };
+        assert_eq!(payload.calls.len(), 1);
+        let callee = payload
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "tokenColor")
+            .expect("callable-value target symbol");
+        assert_eq!(callee.provider_kind, "constant");
+        assert_eq!(callee.role, ProviderSymbolRole::SourceInvocationTarget);
+        assert!(
+            callee.structural_extent.is_some(),
+            "a package-level arrow binding is a stable structural query target"
+        );
+    }
+
+    #[test]
+    fn typescript_named_targets_from_module_and_anonymous_test_roots_remain_positive_calls() {
+        const SOURCE: &str = concat!(
+            "function target() { return 1; }\n",
+            "target();\n",
+            "test(\"works\", () => target());\n",
+        );
+        const TARGET: &str = "typescript npm fixture 0.1.0 src/index.spec.ts/target().";
+        let definition_line = SOURCE.lines().next().expect("definition line");
+        let definition_column = definition_line.find("target").expect("target definition") as i32;
+
+        let mut definition = Occurrence::new();
+        definition.symbol = TARGET.into();
+        definition.symbol_roles = SymbolRole::Definition.value();
+        definition.range = vec![0, definition_column, definition_column + 6];
+
+        let mut module_call = Occurrence::new();
+        module_call.symbol = TARGET.into();
+        module_call.range = vec![1, 0, 6];
+
+        let callback_line = SOURCE.lines().nth(2).expect("callback line");
+        let callback_column = callback_line.rfind("target").expect("callback call") as i32;
+        let mut callback_call = Occurrence::new();
+        callback_call.symbol = TARGET.into();
+        callback_call.range = vec![2, callback_column, callback_column + 6];
+
+        let mut information = SymbolInformation::new();
+        information.symbol = TARGET.into();
+        information.display_name = "target".into();
+        information.kind = EnumOrUnknown::new(symbol_information::Kind::Function);
+
+        let mut document = Document::new();
+        document.language = "typescript".into();
+        document.relative_path = "src/index.spec.ts".into();
+        document.text = SOURCE.into();
+        document.position_encoding =
+            EnumOrUnknown::new(PositionEncoding::UTF8CodeUnitOffsetFromLineStart);
+        document.occurrences = vec![definition, module_call, callback_call];
+        document.symbols = vec![information];
+
+        let evidence = fixture(
+            ScipProviderSpec::typescript_native_sidecar(),
+            vec![document],
+            &[("src/index.spec.ts", SOURCE)],
+        )
+        .normalize();
+        assert_eq!(evidence.receipt.status, CapabilityStatus::Complete);
+        let ProviderPayload::Calls(payload) = evidence
+            .payload
+            .expect("complete TypeScript Calls payload")
+            .into_payload()
+        else {
+            unreachable!("Calls fixture")
+        };
+        assert!(payload.calls.is_empty());
+        assert_eq!(payload.root_invocations.len(), 2);
+        assert!(payload.root_invocations.iter().all(|invocation| {
+            invocation.callee_symbol_id == TARGET
+                && invocation.call_site.document_path == "src/index.spec.ts"
+        }));
+        let module = payload
+            .root_invocations
+            .iter()
+            .find(|invocation| invocation.call_site.span.start_line == 1)
+            .expect("module initialization invocation");
+        let callback = payload
+            .root_invocations
+            .iter()
+            .find(|invocation| invocation.call_site.span.start_line == 2)
+            .expect("anonymous callback invocation");
+        assert_eq!(
+            module.context,
+            crate::code_intel_domain::ExecutionRootContext::ModuleInitialization
+        );
+        assert_eq!(
+            callback.context,
+            crate::code_intel_domain::ExecutionRootContext::AnonymousCallable,
+            "a deferred anonymous callback must not inherit module-initialization authority"
+        );
+        assert!(payload.coverage_exclusions.is_empty());
+    }
+
+    /// RIGHT-REASON REGRESSION from ERA dogfood: a nested TypeScript arrow
+    /// binding owns compiler call evidence but structural extraction does not
+    /// publish runtime-local values as stable graph/query identities. Those
+    /// are separate contracts: keep exact scoped coverage evidence without
+    /// forcing a fabricated structural node into publication.
+    #[test]
+    fn typescript_nested_callable_preserves_calls_without_becoming_a_structural_target() {
+        const SOURCE: &str = concat!(
+            "function target() { return 1; }\n",
+            "function caller() {\n",
+            "  const local = () => target();\n",
+            "  return local();\n",
+            "}\n",
+        );
+        const TARGET: &str = "typescript npm fixture 0.1.0 src/index.ts/target().";
+        const CALLER: &str = "typescript npm fixture 0.1.0 src/index.ts/caller().";
+        const LOCAL: &str = "local 0";
+        const QUALIFIED_LOCAL: &str = "h00-local:src/index.ts:local 0";
+
+        let mut definitions = Vec::new();
+        let mut information = Vec::new();
+        for (line_index, name, symbol, kind) in [
+            (0, "target", TARGET, symbol_information::Kind::Function),
+            (1, "caller", CALLER, symbol_information::Kind::Function),
+            (2, "local", LOCAL, symbol_information::Kind::Constant),
+        ] {
+            let line = SOURCE.lines().nth(line_index).expect("definition line");
+            let column = line.find(name).expect("definition name") as i32;
+            let mut definition = Occurrence::new();
+            definition.symbol = symbol.into();
+            definition.symbol_roles = SymbolRole::Definition.value();
+            definition.range = vec![
+                line_index as i32,
+                column,
+                column + i32::try_from(name.len()).expect("definition name length"),
+            ];
+            definitions.push(definition);
+
+            let mut symbol_information = SymbolInformation::new();
+            symbol_information.symbol = symbol.into();
+            symbol_information.display_name = name.into();
+            symbol_information.kind = EnumOrUnknown::new(kind);
+            information.push(symbol_information);
+        }
+
+        let nested_line = SOURCE.lines().nth(2).expect("nested arrow line");
+        let target_call_column = nested_line.rfind("target").expect("nested target call") as i32;
+        let mut target_call = Occurrence::new();
+        target_call.symbol = TARGET.into();
+        target_call.range = vec![2, target_call_column, target_call_column + 6];
+
+        let outer_line = SOURCE.lines().nth(3).expect("outer call line");
+        let local_call_column = outer_line.rfind("local").expect("local call") as i32;
+        let mut local_call = Occurrence::new();
+        local_call.symbol = LOCAL.into();
+        local_call.range = vec![3, local_call_column, local_call_column + 5];
+
+        let mut document = Document::new();
+        document.language = "typescript".into();
+        document.relative_path = "src/index.ts".into();
+        document.text = SOURCE.into();
+        document.position_encoding =
+            EnumOrUnknown::new(PositionEncoding::UTF8CodeUnitOffsetFromLineStart);
+        document.occurrences = definitions;
+        document.occurrences.extend([target_call, local_call]);
+        document.symbols = information;
+
+        let fixture = fixture(
+            ScipProviderSpec::typescript_native_sidecar(),
+            vec![document],
+            &[("src/index.ts", SOURCE)],
+        );
+        let evidence = fixture.normalize();
+        assert_eq!(
+            evidence.receipt.status,
+            CapabilityStatus::Complete,
+            "runtime-local callable evidence must be scoped rather than poisoning the project: {:?}",
+            evidence.receipt
+        );
+        let ProviderPayload::Calls(payload) = evidence
+            .payload
+            .expect("complete TypeScript Calls payload")
+            .into_payload()
+        else {
+            unreachable!("Calls fixture")
+        };
+
+        let local = payload
+            .symbols
+            .iter()
+            .find(|symbol| symbol.provider_symbol_id == QUALIFIED_LOCAL)
+            .expect("provider-observed nested callable");
+        assert_eq!(local.role, ProviderSymbolRole::LocalInvocationTarget);
+        assert!(local.structural_extent.is_none());
+        assert!(
+            local.call_owner_extent.is_some(),
+            "the exact nested arrow still owns its compiler-observed body calls"
+        );
+        assert_eq!(
+            payload.calls.len(),
+            2,
+            "the local invocation and its body call must both remain positive provider evidence"
+        );
+        assert!(
+            payload
+                .calls
+                .iter()
+                .any(|call| { call.caller_symbol_id == CALLER && call.callee_symbol_id == TARGET })
+        );
+        assert!(payload.calls.iter().any(|call| {
+            call.caller_symbol_id == CALLER && call.callee_symbol_id == QUALIFIED_LOCAL
+        }));
+        assert!(
+            payload.coverage_exclusions.is_empty(),
+            "an exact local body and exact published lexical owner need no uncertainty escape hatch"
+        );
+
+        let extracted =
+            crate::extractor::extract_file(&fixture.root.join("src/index.ts"), &fixture.root)
+                .expect("independently extract the TypeScript structural graph");
+        let mut graph = crate::graph::KnowledgeGraph::new();
+        crate::edge_builder::build_graph(&[extracted], &mut graph)
+            .expect("build the TypeScript structural graph");
+        assert!(
+            graph.node_by_name("local").is_none(),
+            "positive control: structural extraction deliberately omits nested runtime values"
+        );
+        let caller_id = graph
+            .node_by_name("caller")
+            .expect("structural caller")
+            .memory_id;
+        let target_id = graph
+            .node_by_name("target")
+            .expect("structural target")
+            .memory_id;
+        let stats =
+            crate::code_intel_calls::project_calls_payload_structural_join(&mut graph, &payload)
+                .expect("runtime-local evidence must not break publication join");
+        assert_eq!(stats.novel_edges, 1);
+        assert!(
+            graph
+                .find_edge_by_kind_mut(caller_id, target_id, crate::graph::EdgeKind::Calls)
+                .is_some(),
+            "the nested body's exact call must project through its nearest stable lexical owner"
+        );
+    }
+
     #[test]
     fn rust_normalization_builds_only_receiver_owner_occurrence_index() {
         let fixture = fixture(
@@ -6798,6 +7414,11 @@ mod tests {
                 "[project]\nname = \"normalizer-fixture\"\nversion = \"0.1.0\"\n",
             )
             .expect("Python fixture manifest"),
+            "typescript" => fs::write(
+                root.join("package.json"),
+                "{\"name\":\"normalizer-fixture\",\"version\":\"0.1.0\",\"type\":\"module\"}\n",
+            )
+            .expect("TypeScript fixture manifest"),
             language => panic!("fixture has no executable project model for {language}"),
         }
         for (relative_path, source) in sources {
@@ -6832,7 +7453,7 @@ mod tests {
                     ecosystem_id: EcosystemId::new(spec.ecosystem),
                     kind: match spec.language {
                         "go" => ProjectUnitKind::Module,
-                        "rust" | "python" => ProjectUnitKind::Package,
+                        "rust" | "python" | "typescript" => ProjectUnitKind::Package,
                         language => panic!("fixture has no unit kind for {language}"),
                     },
                     root_path: String::new(),
@@ -6840,6 +7461,7 @@ mod tests {
                         "go" => "go.mod".into(),
                         "rust" => "Cargo.toml".into(),
                         "python" => "pyproject.toml".into(),
+                        "typescript" => "package.json".into(),
                         language => panic!("fixture has no manifest path for {language}"),
                     }),
                     compilation_root_paths: Vec::new(),
@@ -7909,6 +8531,100 @@ mod tests {
         );
     }
 
+    /// RIGHT-REASON REGRESSION from ERA dogfood: the native TypeScript
+    /// provider omits an optional external selector when the compiler has no
+    /// repository symbol for it. A local callable with the same terminal name
+    /// must not turn that receiver-unresolved syntax into a missing local call.
+    /// The direct-call control proves that real local omissions still fail.
+    #[test]
+    fn typescript_unresolved_selector_name_collision_is_scoped_but_direct_call_is_not() {
+        const STATUS: &str = "typescript npm fixture 0.1.0 src/fixture.mjs/status().";
+        const CALLER: &str = "typescript npm fixture 0.1.0 src/fixture.mjs/caller().";
+        fn definitions_only_document(source: &str) -> Document {
+            let mut lines = source.lines();
+            let status_line = lines.next().expect("status line");
+            let caller_line = lines.next().expect("caller line");
+            let status_column = status_line.find("status").expect("status definition") as i32;
+            let caller_column = caller_line.find("caller").expect("caller definition") as i32;
+
+            let mut status_definition = Occurrence::new();
+            status_definition.symbol = STATUS.into();
+            status_definition.symbol_roles = SymbolRole::Definition.value();
+            status_definition.range = vec![0, status_column, status_column + 6];
+
+            let mut caller_definition = Occurrence::new();
+            caller_definition.symbol = CALLER.into();
+            caller_definition.symbol_roles = SymbolRole::Definition.value();
+            caller_definition.range = vec![1, caller_column, caller_column + 6];
+
+            let mut status_information = SymbolInformation::new();
+            status_information.symbol = STATUS.into();
+            status_information.display_name = "status".into();
+            status_information.kind = EnumOrUnknown::new(symbol_information::Kind::Function);
+
+            let mut caller_information = SymbolInformation::new();
+            caller_information.symbol = CALLER.into();
+            caller_information.display_name = "caller".into();
+            caller_information.kind = EnumOrUnknown::new(symbol_information::Kind::Function);
+
+            let mut document = Document::new();
+            document.language = "typescript".into();
+            document.relative_path = "src/fixture.mjs".into();
+            document.text = source.into();
+            document.position_encoding =
+                EnumOrUnknown::new(PositionEncoding::UTF8CodeUnitOffsetFromLineStart);
+            document.occurrences = vec![status_definition, caller_definition];
+            document.symbols = vec![status_information, caller_information];
+            document
+        }
+
+        const SELECTOR_SOURCE: &str = concat!(
+            "function status() { return 200; }\n",
+            "function caller(response) { return response?.status(); }\n",
+        );
+        let selector = fixture(
+            ScipProviderSpec::typescript_native_sidecar(),
+            vec![definitions_only_document(SELECTOR_SOURCE)],
+            &[("src/fixture.mjs", SELECTOR_SOURCE)],
+        )
+        .normalize();
+        assert_eq!(selector.receipt.status, CapabilityStatus::Complete);
+        let ProviderPayload::Calls(payload) = selector
+            .payload
+            .expect("qualified TypeScript Calls payload")
+            .into_payload()
+        else {
+            unreachable!("Calls fixture")
+        };
+        assert!(payload.calls.is_empty());
+        assert_eq!(payload.coverage_exclusions.len(), 1);
+        assert_eq!(
+            payload.coverage_exclusions[0].reason_code,
+            "provider_method_call_unresolved"
+        );
+        let selector_start = SELECTOR_SOURCE.rfind("status").expect("optional selector") as u64;
+        assert_eq!(
+            payload.coverage_exclusions[0].location.span.start_byte,
+            selector_start
+        );
+
+        const DIRECT_SOURCE: &str = concat!(
+            "function status() { return 200; }\n",
+            "function caller() { return status(); }\n",
+        );
+        let direct = fixture(
+            ScipProviderSpec::typescript_native_sidecar(),
+            vec![definitions_only_document(DIRECT_SOURCE)],
+            &[("src/fixture.mjs", DIRECT_SOURCE)],
+        )
+        .normalize();
+        assert_failure(
+            &direct,
+            CapabilityStatus::Partial,
+            "provider_call_occurrence_incomplete",
+        );
+    }
+
     #[test]
     fn python_bound_receiver_method_witness_is_narrow_and_non_vacuous() {
         const SOURCE: &str = concat!(
@@ -8007,6 +8723,64 @@ mod tests {
         assert_eq!(payload.calls[0].caller_symbol_id, CALLER);
         assert_eq!(payload.calls[0].callee_symbol_id, GET);
         assert!(payload.coverage_exclusions.is_empty());
+    }
+
+    /// RIGHT-REASON REGRESSION from AEGIS: Pyrefly can resolve a call target
+    /// while omitting the enclosing ordinary function's definition occurrence.
+    /// Exact tree-sitter name/extent evidence still identifies one co-published
+    /// structural caller; losing that positive call edge would make reachability
+    /// classification incomplete for an analyzer-export detail.
+    #[test]
+    fn syntax_callable_owner_supplies_missing_provider_caller_definition() {
+        const SOURCE: &str = "def target(): return 1\ndef caller(): return target()\n";
+        const TARGET: &str = "pyrefly python fixture . target().";
+        let mut document = python_document_with_definitions(
+            "src/fixture.py",
+            SOURCE,
+            &[(0, "target", TARGET, symbol_information::Kind::Function)],
+        );
+        let call_line = SOURCE.lines().nth(1).expect("caller line");
+        let call_column = call_line.rfind("target").expect("target call") as i32;
+        let mut call = Occurrence::new();
+        call.symbol = TARGET.into();
+        call.range = vec![1, call_column, call_column + "target".len() as i32];
+        document.occurrences.push(call);
+
+        let evidence = fixture(
+            ScipProviderSpec::pyrefly_sidecar(),
+            vec![document],
+            &[("src/fixture.py", SOURCE)],
+        )
+        .normalize();
+        assert_eq!(
+            evidence.receipt.status,
+            CapabilityStatus::Complete,
+            "exact structural caller ownership must complete a provider-resolved call: {evidence:#?}"
+        );
+        let ProviderPayload::Calls(payload) = evidence
+            .payload
+            .expect("complete Calls payload")
+            .into_payload()
+        else {
+            unreachable!("Calls fixture")
+        };
+        assert_eq!(payload.calls.len(), 1);
+        assert_eq!(payload.calls[0].callee_symbol_id, TARGET);
+        let caller = payload
+            .symbols
+            .iter()
+            .find(|symbol| symbol.provider_symbol_id == payload.calls[0].caller_symbol_id)
+            .expect("structurally witnessed caller symbol");
+        assert_eq!(caller.name, "caller");
+        assert_eq!(
+            caller
+                .structural_extent
+                .as_ref()
+                .expect("caller structural extent")
+                .span
+                .start_line,
+            1
+        );
     }
 
     #[test]
@@ -8698,7 +9472,7 @@ mod tests {
     }
 
     #[test]
-    fn module_initializer_call_is_an_explicit_coverage_exclusion_not_a_language_failure() {
+    fn module_initializer_call_is_positive_root_invocation_evidence() {
         const SOURCE: &str = concat!(
             "const fn target() -> usize { 1 }\n",
             "const VALUE: usize = target();\n",
@@ -8752,10 +9526,16 @@ mod tests {
             unreachable!("Calls fixture")
         };
         assert!(payload.calls.is_empty());
-        assert!(payload.coverage_exclusions.iter().any(|exclusion| {
-            exclusion.reason_code == "module_initialization"
-                && exclusion.location.span.start_line == 1
-        }));
+        assert_eq!(payload.root_invocations.len(), 1);
+        assert_eq!(payload.root_invocations[0].callee_symbol_id, TARGET);
+        assert_eq!(payload.root_invocations[0].call_site.span.start_line, 1);
+        assert!(
+            payload
+                .coverage_exclusions
+                .iter()
+                .all(|exclusion| exclusion.reason_code != "module_initialization"),
+            "a resolved source-root invocation is positive evidence, not an authority gap"
+        );
     }
 
     #[test]
@@ -10606,10 +11386,15 @@ mod tests {
             }),
             "package initialization executes wrap; invoking handler later does not"
         );
-        assert!(payload.coverage_exclusions.iter().any(|exclusion| {
-            exclusion.reason_code == "module_initialization"
-                && exclusion.location.span.start_line == 3
+        assert!(payload.root_invocations.iter().any(|invocation| {
+            invocation.callee_symbol_id == WRAP && invocation.call_site.span.start_line == 3
         }));
+        assert!(
+            payload
+                .coverage_exclusions
+                .iter()
+                .all(|exclusion| exclusion.reason_code != "module_initialization")
+        );
     }
 
     #[test]

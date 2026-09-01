@@ -12,9 +12,10 @@ use serde::Serialize;
 use crate::code_intel_cursor::{page_window, request_digest};
 use crate::code_intel_domain::{
     AuthorityStatus, CapabilityCoverage, CapabilityCoverageStatus, ConfigurationId,
-    DocumentMembershipKind, DomainError, GenerationId, LIVE_INPUT_RESULT_RESERVE_CHARS, LanguageId,
-    Page, ProjectInventoryCoverage, ProjectUnitId, RepositoryBinding,
-    STRUCTURAL_GRAPH_CONFIGURATION_ID, SourceSpan, assess_structural_graph_capability,
+    DocumentMembershipKind, DomainError, GenerationId, LanguageId,
+    MAX_GENERATION_ENGINE_RESULT_CHARS, Page, ProjectInventoryCoverage, ProjectUnitId,
+    RepositoryBinding, STRUCTURAL_GRAPH_CONFIGURATION_ID, SourceSpan,
+    assess_structural_graph_language_capability,
 };
 use crate::code_intel_publication::ResolvedGeneration;
 use crate::code_intel_query::{generation_file_context, language_id_for_path, repository_binding};
@@ -39,7 +40,6 @@ pub const MAX_READ_SYMBOL_BYTES: usize = 4_096;
 pub const MAX_READ_FILE_BYTES: usize = 4_096;
 pub const MAX_READ_CURSOR_BYTES: usize = 8_192;
 /// Leaves room below the MCP transport's final 30,000-character ceiling.
-pub const MAX_READ_RESULT_CHARS: usize = 28_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadRequest {
@@ -235,7 +235,12 @@ pub async fn query_published_read(
         source_authority_unavailable(node, "target document has no indexed-source record")
     })?;
     let project_unit_ids = source_owner_ids(generation, &node.file_path, &language_id)?;
-    let structural_graph = target_structural_coverage(graph, generation, &language_id)?;
+    let structural_graph = assess_structural_graph_language_capability(
+        graph,
+        &generation.manifest.receipts,
+        &generation.project_inventory,
+        &language_id,
+    )?;
     let language_status = structural_graph
         .language_status(&language_id.0)
         .ok_or_else(|| {
@@ -286,8 +291,11 @@ pub async fn query_published_read(
 
     let selection_complete =
         normalized_file.is_some() || language_status == CapabilityCoverageStatus::Complete;
-    let inventory_complete = generation.project_inventory.coverage
-        == ProjectInventoryCoverage::IndexedSourcePopulationComplete;
+    let inventory_coverage = generation
+        .project_inventory
+        .coverage_for_language(&language_id);
+    let inventory_complete =
+        inventory_coverage == ProjectInventoryCoverage::IndexedSourcePopulationComplete;
     let status = if selection_complete
         && identity.selected_file_population_complete
         && whole_file_matches_generation
@@ -360,7 +368,7 @@ pub async fn query_published_read(
             },
             source_consistency: ReadSourceConsistency::LiveDefinitionHashMatchesGeneration,
             structural_graph,
-            project_inventory_coverage: generation.project_inventory.coverage,
+            project_inventory_coverage: inventory_coverage,
             selected_file_population_complete: identity.selected_file_population_complete,
             selected_symbol_identity_complete: true,
             identity_evidence: identity.evidence,
@@ -380,12 +388,12 @@ pub async fn query_published_read(
         })?
         .chars()
         .count();
-    if result_characters > MAX_READ_RESULT_CHARS - LIVE_INPUT_RESULT_RESERVE_CHARS {
-        return Err(invalid_request(
-            "limit",
-            format!(
-                "result would contain {result_characters} serialized characters and cannot leave room for required live-input evidence within the {MAX_READ_RESULT_CHARS}-character product bound; lower limit"
-            ),
+    if result_characters > MAX_GENERATION_ENGINE_RESULT_CHARS {
+        return Err(DomainError::result_too_large(
+            "read",
+            result_characters,
+            MAX_GENERATION_ENGINE_RESULT_CHARS,
+            "Lower the Read limit or narrow the symbol/file scope",
         ));
     }
     Ok(result)
@@ -571,33 +579,6 @@ fn source_owner_ids(
         }
     }
     Ok(ids)
-}
-
-fn target_structural_coverage(
-    graph: &KnowledgeGraph,
-    generation: &ResolvedGeneration,
-    language_id: &LanguageId,
-) -> Result<CapabilityCoverage, DomainError> {
-    let mut coverage = assess_structural_graph_capability(
-        graph,
-        &generation.manifest.receipts,
-        &generation.project_inventory,
-    );
-    coverage
-        .languages
-        .retain(|language| language.language_id == *language_id);
-    coverage.status = match coverage.languages.as_slice() {
-        [] => CapabilityCoverageStatus::Unavailable,
-        [language] => language.status,
-        _ => {
-            return Err(DomainError::PublishedGenerationInvalid {
-                reason: format!(
-                    "structural authority contains duplicate language rows for {language_id}"
-                ),
-            });
-        }
-    };
-    Ok(coverage)
 }
 
 fn byte_offset_for_character(source: &str, character: usize) -> usize {

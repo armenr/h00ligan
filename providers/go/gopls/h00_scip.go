@@ -770,7 +770,8 @@ func h00ObserveSemanticInputs(
 		}
 		contents, err := fh.Content()
 		hasher := sha256.New()
-		h00ServerHashField(hasher, []byte("h00/semantic-provider/semantic-path/v2\x00"))
+		h00ServerHashField(hasher, []byte("h00/semantic-provider/semantic-path/v3\x00"))
+		h00ServerHashField(hasher, []byte("repository"))
 		h00ServerHashField(hasher, nil)
 		h00ServerHashField(hasher, nil)
 		if errors.Is(err, fs.ErrNotExist) {

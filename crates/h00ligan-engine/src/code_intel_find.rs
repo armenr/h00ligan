@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::code_intel_cursor::{page_window, request_digest};
 use crate::code_intel_domain::{
     AuthorityStatus, CapabilityCoverage, CapabilityCoverageStatus, DomainError, GenerationId,
-    LIVE_INPUT_RESULT_RESERVE_CHARS, LanguageId, Page, ProjectInventoryCoverage, RepositoryBinding,
-    assess_structural_graph_capability,
+    LanguageId, MAX_GENERATION_ENGINE_RESULT_CHARS, Page, ProjectInventoryCoverage,
+    RepositoryBinding, assess_structural_graph_capability,
 };
 use crate::code_intel_publication::ResolvedGeneration;
 use crate::code_intel_query::{
@@ -31,7 +31,6 @@ pub const MAX_FIND_QUERY_BYTES: usize = 4_096;
 pub const MAX_FIND_KIND_BYTES: usize = 256;
 pub const MAX_FIND_CURSOR_BYTES: usize = 8_192;
 /// Leaves headroom below the MCP adapter's final 30,000-character ceiling.
-pub const MAX_FIND_RESULT_CHARS: usize = 28_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -248,10 +247,11 @@ pub fn query_published_find(
         .iter()
         .map(|path| language_id_for_path(path))
         .filter(|language| language.0 != "unknown")
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let population_complete = generation.project_inventory.coverage
+        .collect::<BTreeSet<_>>();
+    let inventory_coverage = generation
+        .project_inventory
+        .coverage_for_languages(&selected_language_ids);
+    let population_complete = inventory_coverage
         == ProjectInventoryCoverage::IndexedSourcePopulationComplete
         && selected_language_ids.iter().all(|language| {
             structural_graph.language_status(&language.0)
@@ -262,6 +262,7 @@ pub fn query_published_find(
     } else {
         AuthorityStatus::Qualified
     };
+    let selected_language_ids = selected_language_ids.into_iter().collect::<Vec<_>>();
 
     let suggestions = if items.is_empty() && mode == FindMode::Name {
         symbol_not_found_candidates(graph, &query)
@@ -326,7 +327,7 @@ pub fn query_published_find(
                 status: status.clone(),
                 population: FindPopulation::PublishedStructuralGraphSymbols,
                 structural_graph: structural_graph.clone(),
-                project_inventory_coverage: generation.project_inventory.coverage,
+                project_inventory_coverage: inventory_coverage,
                 selected_language_ids: selected_language_ids.clone(),
                 selected_file_count: selected_files.len(),
                 population_complete,
@@ -343,15 +344,15 @@ pub fn query_published_find(
             .chars()
             .count();
         smallest_result_chars = result_chars;
-        if result_chars <= MAX_FIND_RESULT_CHARS - LIVE_INPUT_RESULT_RESERVE_CHARS {
+        if result_chars <= MAX_GENERATION_ENGINE_RESULT_CHARS {
             return Ok(result);
         }
     }
-    Err(invalid_request(
-        "query",
-        format!(
-            "even a one-item Find page would contain {smallest_result_chars} serialized characters and cannot leave room for required live-input evidence within the {MAX_FIND_RESULT_CHARS}-character product bound; narrow the query or kind filter"
-        ),
+    Err(DomainError::result_too_large(
+        "find",
+        smallest_result_chars,
+        MAX_GENERATION_ENGINE_RESULT_CHARS,
+        "Narrow the query, kind, or file scope; required Find identity, authority, and unit metadata do not fit even when the page limit is one",
     ))
 }
 

@@ -949,7 +949,7 @@ func h00ParseGoStdlibVersion(report []byte) (string, error) {
 
 func h00CaptureGoSemanticInputs(repositoryRoot string, expected h00SemanticInputs) (h00SemanticInputs, error) {
 	if expected.SchemaVersion != h00ProviderSemanticInputsSchema || expected.Coverage != "complete" ||
-		len(expected.Paths) == 0 || len(expected.Paths) > h00MaxDocumentPaths || len(expected.Issues) != 0 {
+		len(expected.Paths) == 0 || len(expected.Paths) > h00MaxSemanticInputPaths || len(expected.Issues) != 0 {
 		return h00SemanticInputs{}, fmt.Errorf("invalid expected Go semantic-input population")
 	}
 	inputs := h00SemanticInputs{
@@ -959,7 +959,7 @@ func h00CaptureGoSemanticInputs(repositoryRoot string, expected h00SemanticInput
 	}
 	previousPath := ""
 	for _, input := range expected.Paths {
-		if input.Path <= previousPath {
+		if input.Root != "repository" || input.Path <= previousPath {
 			return h00SemanticInputs{}, fmt.Errorf("expected Go semantic-input paths are not canonical")
 		}
 		previousPath = input.Path

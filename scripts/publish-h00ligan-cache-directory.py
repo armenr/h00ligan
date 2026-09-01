@@ -5,15 +5,19 @@ from __future__ import annotations
 
 import argparse
 import errno
+import fcntl
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 
 REPLAY_ERRNOS = {errno.EEXIST, errno.ENOTEMPTY}
+LOCK_DESCRIPTOR_ENV = "H00LIGAN_CACHE_LOCK_FD"
 
 
 def require_real_directory(path: Path, label: str) -> Path:
@@ -75,8 +79,90 @@ def run_publish(args: argparse.Namespace) -> int:
     return 0
 
 
+def validate_lock_path(lock_file: Path, owner: Path) -> None:
+    require_real_directory(owner, "cache owner root")
+    require_real_directory(lock_file.parent, "cache lock parent")
+    require_owned_path(lock_file, owner, "cache lock")
+    if lock_file.is_symlink():
+        raise SystemExit(f"cache lock must not be a symlink: {lock_file}")
+
+
+def validate_lock_descriptor(
+    lock_file: Path,
+    owner: Path,
+    descriptor: int,
+    *,
+    blocking: bool,
+) -> None:
+    validate_lock_path(lock_file, owner)
+    try:
+        descriptor_status = os.fstat(descriptor)
+    except OSError as error:
+        raise SystemExit("cache lock descriptor is not open") from error
+    try:
+        path_status = os.stat(lock_file, follow_symlinks=False)
+    except OSError as error:
+        raise SystemExit(f"cache lock is missing: {lock_file}") from error
+    if not stat.S_ISREG(descriptor_status.st_mode) or not stat.S_ISREG(path_status.st_mode):
+        raise SystemExit(f"cache lock must be a regular file: {lock_file}")
+    if (descriptor_status.st_dev, descriptor_status.st_ino) != (
+        path_status.st_dev,
+        path_status.st_ino,
+    ):
+        raise SystemExit("cache lock descriptor names another file")
+    operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+    try:
+        fcntl.flock(descriptor, operation)
+    except BlockingIOError as error:
+        raise SystemExit("cache lock descriptor does not own the active lock") from error
+
+
+def locked_exec(lock_file: Path, owner: Path, command: list[str]) -> None:
+    """Replace this process while retaining one crash-released cache lock."""
+    validate_lock_path(lock_file, owner)
+    if command[:1] == ["--"]:
+        command = command[1:]
+    if not command:
+        raise SystemExit("locked cache execution requires a command")
+
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(lock_file, flags, 0o600)
+    try:
+        validate_lock_descriptor(
+            lock_file,
+            owner,
+            descriptor,
+            blocking=True,
+        )
+    except BaseException:
+        os.close(descriptor)
+        raise
+    os.set_inheritable(descriptor, True)
+    environment = os.environ.copy()
+    environment[LOCK_DESCRIPTOR_ENV] = str(descriptor)
+    os.execvpe(command[0], command, environment)
+
+
+def run_locked_exec(args: argparse.Namespace) -> int:
+    locked_exec(args.lock_file, args.owner_root, args.command)
+    raise AssertionError("locked exec unexpectedly returned")
+
+
+def run_verify_lock(args: argparse.Namespace) -> int:
+    validate_lock_descriptor(
+        args.lock_file,
+        args.owner_root,
+        args.descriptor,
+        blocking=False,
+    )
+    return 0
+
+
 def self_test() -> int:
     repository_root = Path(__file__).resolve().parent.parent
+    controls = 0
     with tempfile.TemporaryDirectory(prefix="h00ligan-cache-publication.") as raw:
         root = Path(raw)
         try:
@@ -99,6 +185,7 @@ def self_test() -> int:
         shutil.move(str(naive_candidate), str(naive_destination))
         if not (naive_destination / "artifact.naive/loser").is_file():
             raise AssertionError("nested-directory publication hazard did not fire")
+        controls += 1
 
         sequential = root / "sequential"
         sequential.mkdir()
@@ -117,6 +204,7 @@ def self_test() -> int:
             raise AssertionError("replay changed the immutable winner")
         if second.exists() or any(path.name.startswith("artifact.") for path in destination.iterdir()):
             raise AssertionError("replay nested or retained its publication candidate")
+        controls += 1
 
         concurrent = root / "concurrent"
         concurrent.mkdir()
@@ -156,7 +244,99 @@ def self_test() -> int:
             )
         if any(candidate.exists() for candidate in candidates):
             raise AssertionError("concurrent publication retained a losing candidate")
-    return 3
+        controls += 1
+
+        lock_root = root / "locked-exec"
+        lock_root.mkdir()
+        lock_file = lock_root / "compiler.lock"
+        log = lock_root / "order.log"
+        probe = (
+            "from pathlib import Path; import fcntl,os,sys,time; "
+            f"fd=int(os.environ[{LOCK_DESCRIPTOR_ENV!r}]); "
+            "fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB); "
+            "path=Path(sys.argv[1]); token=sys.argv[2]; "
+            "stream=path.open('a'); stream.write(token+':start\\n'); stream.flush(); "
+            "time.sleep(0.2); stream.write(token+':end\\n'); stream.close()"
+        )
+
+        def locked_command(token: str) -> list[str]:
+            return [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "locked-exec",
+                "--owner-root",
+                str(lock_root),
+                "--lock-file",
+                str(lock_file),
+                "--",
+                sys.executable,
+                "-c",
+                probe,
+                str(log),
+                token,
+            ]
+
+        first = subprocess.Popen(locked_command("first"))
+        deadline = time.monotonic() + 5
+        while (not log.exists() or "first:start" not in log.read_text()) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not log.exists() or "first:start" not in log.read_text():
+            first.kill()
+            raise AssertionError("locked-exec positive control never acquired its lock")
+        second = subprocess.Popen(locked_command("second"))
+        if first.wait(timeout=5) != 0 or second.wait(timeout=5) != 0:
+            raise AssertionError("locked-exec serialization probes failed")
+        if log.read_text().splitlines() != [
+            "first:start",
+            "first:end",
+            "second:start",
+            "second:end",
+        ]:
+            raise AssertionError(f"locked-exec did not serialize: {log.read_text()!r}")
+        controls += 1
+
+        forged = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "verify-lock",
+                "--owner-root",
+                str(lock_root),
+                "--lock-file",
+                str(lock_file),
+                "--descriptor",
+                "999999",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if forged.returncode == 0 or "descriptor is not open" not in forged.stderr:
+            raise AssertionError("verify-lock accepted a forged inherited descriptor")
+        controls += 1
+
+        unsafe_lock = lock_root / "unsafe.lock"
+        unsafe_lock.symlink_to(root / "outside.lock")
+        rejected = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "locked-exec",
+                "--owner-root",
+                str(lock_root),
+                "--lock-file",
+                str(unsafe_lock),
+                "--",
+                sys.executable,
+                "-c",
+                "raise SystemExit(99)",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if rejected.returncode == 0 or "must not be a symlink" not in rejected.stderr:
+            raise AssertionError("locked-exec accepted a symlinked lock")
+        controls += 1
+    return controls
 
 
 def parser() -> argparse.ArgumentParser:
@@ -168,6 +348,16 @@ def parser() -> argparse.ArgumentParser:
     publish_parser.add_argument("--candidate", type=Path, required=True)
     publish_parser.add_argument("--destination", type=Path, required=True)
     publish_parser.set_defaults(run=run_publish)
+    locked_parser = commands.add_parser("locked-exec")
+    locked_parser.add_argument("--owner-root", type=Path, required=True)
+    locked_parser.add_argument("--lock-file", type=Path, required=True)
+    locked_parser.add_argument("command", nargs=argparse.REMAINDER)
+    locked_parser.set_defaults(run=run_locked_exec)
+    verify_parser = commands.add_parser("verify-lock")
+    verify_parser.add_argument("--owner-root", type=Path, required=True)
+    verify_parser.add_argument("--lock-file", type=Path, required=True)
+    verify_parser.add_argument("--descriptor", type=int, required=True)
+    verify_parser.set_defaults(run=run_verify_lock)
     return root
 
 
