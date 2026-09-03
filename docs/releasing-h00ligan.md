@@ -29,12 +29,21 @@ failed product build therefore cannot create a complete-looking release.
 
 ## Version authority
 
+- Product ledger: `version.txt`
 - Package: `crates/h00ligan/Cargo.toml`
 - Ledger: `.release-please-manifest.json`
 - Tag: `h00ligan-vX.Y.Z`
 - Changelog: `crates/h00ligan/CHANGELOG.md`
 - Embedded product lock:
   `providers/rust-analyzer/h00ligan-product.Cargo.lock`
+
+Release Please treats `.` as one repository-wide product component. A
+conventional product commit therefore participates in the release regardless
+of whether it changes the executable crate, the engine, the MCP interface, the
+provider protocol, an embedded provider, packaging, or another shipped
+repository surface. The `simple` strategy advances the public product ledger
+and explicitly synchronized executable/lock coordinates without pretending
+that the private workspace crates are independently released packages.
 
 Before 1.0, `feat` advances the minor version, `fix` advances the patch
 version, and a breaking-change marker advances the minor version. The

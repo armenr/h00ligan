@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/v17.11.1/schemas/config.json",
-  "release-type": "rust",
+  "release-type": "simple",
   "bump-minor-pre-major": true,
   "bump-patch-for-minor-pre-major": false,
   "draft-pull-request": false,
@@ -18,27 +18,33 @@
     { "type": "chore", "section": "Miscellaneous Chores", "hidden": true }
   ],
   "packages": {
-    "crates/h00ligan": {
+    ".": {
       "component": "h00ligan",
       "package-name": "h00ligan",
-      "changelog-path": "CHANGELOG.md",
+      "version-file": "version.txt",
+      "changelog-path": "crates/h00ligan/CHANGELOG.md",
       "include-component-in-tag": true,
       "include-v-in-tag": true,
       "force-tag-creation": true,
       "extra-files": [
         {
           "type": "toml",
-          "path": "/Cargo.lock",
+          "path": "crates/h00ligan/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
           "jsonpath": "$.package[?(@.name.value == 'h00ligan')].version"
         },
         {
           "type": "toml",
-          "path": "/providers/rust-analyzer/h00ligan-product.Cargo.lock",
+          "path": "providers/rust-analyzer/h00ligan-product.Cargo.lock",
           "jsonpath": "$.package[?(@.name.value == 'h00ligan')].version"
         },
         {
           "type": "toml",
-          "path": "/providers/rust-analyzer/h00ligan-product.Cargo.lock",
+          "path": "providers/rust-analyzer/h00ligan-product.Cargo.lock",
           "jsonpath": "$.package[?(@.name.value == 'h00ligan-product')].version"
         }
       ],
