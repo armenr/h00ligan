@@ -7730,6 +7730,42 @@ fn installed_go_discards_a_provider_result_when_toolchain_bytes_drift_mid_run() 
             && !data_dir.join("publication-v4/head-1.json").exists(),
         "strict failure must not publish a candidate generation",
     );
+
+    let status = h00ligan()
+        .arg("--root")
+        .arg(&root)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["status", "--format", "json"])
+        .output()
+        .expect("inspect state after strict first-index refusal");
+    assert!(
+        status.status.success(),
+        "status must remain a total health query after strict refusal: stdout={} stderr={}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr),
+    );
+    let status = stdout_json(&status);
+    assert_eq!(status["publication_state"], "unpublished", "{status}");
+    assert_eq!(status["graph_exists"], false, "{status}");
+    assert_eq!(status["availability"], "unindexed", "{status}");
+    assert!(
+        status["recommendation"]
+            .as_str()
+            .is_some_and(|recommendation| recommendation.contains("first generation")
+                && !recommendation.contains("recover")),
+        "an uncommitted first-index refusal must not demand corruption recovery: {status}",
+    );
+
+    let (child, mut stdin, mut stdout) = spawn_mcp(&root, &data_dir);
+    let mcp_status = call_mcp(&mut stdin, &mut stdout, 1, "status", json!({}));
+    let stopped = stop_mcp(child, stdin);
+    assert!(
+        stopped.status.success(),
+        "MCP status after strict refusal failed: {}",
+        String::from_utf8_lossy(&stopped.stderr),
+    );
+    assert_eq!(mcp_status["result"]["structuredContent"], status);
 }
 
 #[cfg(unix)]
