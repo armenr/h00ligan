@@ -2671,8 +2671,13 @@ pub fn publication_control_token(
     graph_directory: &Path,
     repository_root: &Path,
 ) -> Result<PublicationControlToken, PublicationError> {
-    let (_publication_directory, repository, scan) =
+    let (publication_directory, repository, scan) =
         read_publication_controls(graph_directory, repository_root)?;
+    if !scan.present.iter().any(|present| *present) {
+        return Err(PublicationError::Unpublished {
+            path: publication_directory,
+        });
+    }
     publication_control_token_from_scan(&repository, &scan)
 }
 
@@ -6435,6 +6440,10 @@ mod tests {
         ));
         assert!(matches!(
             resolve_generation(&fixture.graph, &fixture.root),
+            Err(PublicationError::Unpublished { .. })
+        ));
+        assert!(matches!(
+            publication_control_token(&fixture.graph, &fixture.root),
             Err(PublicationError::Unpublished { .. })
         ));
     }
