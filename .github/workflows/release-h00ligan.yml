@@ -26,10 +26,10 @@ jobs:
       contents: write
       pull-requests: write
     outputs:
-      release-created: ${{ steps.release.outputs['crates/h00ligan--release_created'] }}
-      sha: ${{ steps.release.outputs['crates/h00ligan--sha'] }}
-      version: ${{ steps.release.outputs['crates/h00ligan--version'] }}
-      tag: ${{ steps.release.outputs['crates/h00ligan--tag_name'] }}
+      release-created: ${{ steps.release.outputs.release_created }}
+      sha: ${{ steps.release.outputs.sha }}
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag_name }}
     steps:
       - name: Refuse to spend a stale green result
         id: gate

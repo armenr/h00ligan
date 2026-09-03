@@ -21,6 +21,186 @@ EMBEDDED_PRODUCT_DIRECT_DEPENDENCIES = [
     "h00ligan-provider-protocol",
     "h00ligan-ra-provider",
 ]
+ROOT_RELEASE_PATH = "."
+PRODUCT_VERSION_FILE = "version.txt"
+PRODUCT_CHANGELOG_PATH = "crates/h00ligan/CHANGELOG.md"
+PRODUCT_VERSION_UPDATERS = [
+    {
+        "type": "toml",
+        "path": "crates/h00ligan/Cargo.toml",
+        "jsonpath": "$.package.version",
+    },
+    {
+        "type": "toml",
+        "path": "Cargo.lock",
+        "jsonpath": "$.package[?(@.name.value == 'h00ligan')].version",
+    },
+    {
+        "type": "toml",
+        "path": "providers/rust-analyzer/h00ligan-product.Cargo.lock",
+        "jsonpath": "$.package[?(@.name.value == 'h00ligan')].version",
+    },
+    {
+        "type": "toml",
+        "path": "providers/rust-analyzer/h00ligan-product.Cargo.lock",
+        "jsonpath": "$.package[?(@.name.value == 'h00ligan-product')].version",
+    },
+]
+
+
+def check_product_release_scope(
+    config: dict[object, object],
+    manifest: dict[object, object],
+    workflow: str,
+    version_file: str | None,
+    version: object,
+    failures: list[str],
+) -> None:
+    """Keep the one shipped product release-scoped to the whole repository."""
+    packages = config.get("packages")
+    if not isinstance(packages, dict) or set(packages) != {ROOT_RELEASE_PATH}:
+        failures.append(
+            "Release Please must define exactly one repository-wide root product "
+            "component"
+        )
+        package: dict[object, object] = {}
+    else:
+        configured_package = packages.get(ROOT_RELEASE_PATH)
+        package = configured_package if isinstance(configured_package, dict) else {}
+
+    if manifest != {ROOT_RELEASE_PATH: version}:
+        failures.append(
+            "release manifest must bind the repository-wide product version"
+        )
+    if version_file is None or version_file.strip() != version:
+        failures.append("version.txt and Cargo.toml product versions differ")
+    if config.get("release-type") != "simple":
+        failures.append(
+            "release-type must be simple so one repository-wide product version "
+            "does not rewrite private workspace crate versions"
+        )
+    if package.get("version-file") != PRODUCT_VERSION_FILE:
+        failures.append("root product component must own version.txt")
+    if package.get("changelog-path") != PRODUCT_CHANGELOG_PATH:
+        failures.append(
+            "root product component must write the shipped h00ligan changelog"
+        )
+    if package.get("package-name") != "h00ligan":
+        failures.append("root product package name must be h00ligan")
+    if package.get("extra-files") != PRODUCT_VERSION_UPDATERS:
+        failures.append(
+            "Release Please must update the executable manifest and both product locks"
+        )
+    if package.get("exclude-paths"):
+        failures.append(
+            "repository-wide product commits must not be hidden by release path exclusions"
+        )
+
+    expected_outputs = [
+        "release-created: ${{ steps.release.outputs.release_created }}",
+        "sha: ${{ steps.release.outputs.sha }}",
+        "version: ${{ steps.release.outputs.version }}",
+        "tag: ${{ steps.release.outputs.tag_name }}",
+    ]
+    for expected in expected_outputs:
+        if expected not in workflow:
+            failures.append(
+                f"release workflow must consume the root product output {expected!r}"
+            )
+    if "crates/h00ligan--" in workflow:
+        failures.append("release workflow retains crate-local Release Please outputs")
+
+
+def check_product_release_scope_canaries() -> list[str]:
+    """Prove the release-scope check catches the production defect and output drift."""
+    config = {
+        "release-type": "simple",
+        "packages": {
+            ROOT_RELEASE_PATH: {
+                "component": "h00ligan",
+                "package-name": "h00ligan",
+                "version-file": PRODUCT_VERSION_FILE,
+                "changelog-path": PRODUCT_CHANGELOG_PATH,
+                "extra-files": PRODUCT_VERSION_UPDATERS,
+            }
+        },
+    }
+    manifest = {ROOT_RELEASE_PATH: "0.2.0"}
+    workflow = "\n".join(
+        [
+            "release-created: ${{ steps.release.outputs.release_created }}",
+            "sha: ${{ steps.release.outputs.sha }}",
+            "version: ${{ steps.release.outputs.version }}",
+            "tag: ${{ steps.release.outputs.tag_name }}",
+        ]
+    )
+    failures: list[str] = []
+    check_product_release_scope(
+        config, manifest, workflow, "0.2.0\n", "0.2.0", failures
+    )
+    if failures:
+        return [f"release-scope known-positive failed: {failures!r}"]
+
+    mutants = {
+        "crate-local component": (
+            {
+                **config,
+                "packages": {
+                    "crates/h00ligan": config["packages"][ROOT_RELEASE_PATH]
+                },
+            },
+            manifest,
+            workflow,
+            "0.2.0\n",
+            "exactly one repository-wide root product component",
+        ),
+        "crate-local manifest": (
+            config,
+            {"crates/h00ligan": "0.2.0"},
+            workflow,
+            "0.2.0\n",
+            "release manifest must bind the repository-wide product version",
+        ),
+        "crate-local workflow outputs": (
+            config,
+            manifest,
+            workflow.replace(
+                "steps.release.outputs.",
+                "steps.release.outputs.crates/h00ligan--",
+            ),
+            "0.2.0\n",
+            "release workflow retains crate-local Release Please outputs",
+        ),
+        "missing product version ledger": (
+            config,
+            manifest,
+            workflow,
+            None,
+            "version.txt and Cargo.toml product versions differ",
+        ),
+    }
+    canary_failures: list[str] = []
+    for name, (
+        mutant_config,
+        mutant_manifest,
+        mutant_workflow,
+        mutant_version,
+        expected_failure,
+    ) in mutants.items():
+        mutant_failures: list[str] = []
+        check_product_release_scope(
+            mutant_config,
+            mutant_manifest,
+            mutant_workflow,
+            mutant_version,
+            "0.2.0",
+            mutant_failures,
+        )
+        if not any(expected_failure in failure for failure in mutant_failures):
+            canary_failures.append(
+                f"release-scope mutant escaped its owning check: {name}"
+            )
+    return canary_failures
 
 
 def check_workspace_publication(root: Path, failures: list[str]) -> None:
@@ -128,14 +308,31 @@ def main() -> int:
     cargo_lock = tomllib.loads((root / "Cargo.lock").read_text(encoding="utf-8"))
     manifest = json.loads((root / ".release-please-manifest.json").read_text(encoding="utf-8"))
     config = json.loads((root / "release-please-config.json").read_text(encoding="utf-8"))
-    package = config.get("packages", {}).get("crates/h00ligan", {})
+    packages = config.get("packages", {})
+    package = packages.get(ROOT_RELEASE_PATH, {}) if isinstance(packages, dict) else {}
+    version_path = root / PRODUCT_VERSION_FILE
+    version_file = (
+        version_path.read_text(encoding="utf-8") if version_path.is_file() else None
+    )
+    release_workflow_path = root / ".github/workflows/release-h00ligan.yml"
+    release_workflow = (
+        release_workflow_path.read_text(encoding="utf-8")
+        if release_workflow_path.is_file()
+        else ""
+    )
 
     version = cargo.get("package", {}).get("version")
-    failures: list[str] = []
+    failures = check_product_release_scope_canaries()
     if not isinstance(version, str) or not SEMVER.fullmatch(version):
         failures.append(f"Cargo version is not plain SemVer: {version!r}")
-    if manifest.get("crates/h00ligan") != version:
-        failures.append("Cargo.toml and .release-please-manifest.json versions differ")
+    check_product_release_scope(
+        config,
+        manifest,
+        release_workflow,
+        version_file,
+        version,
+        failures,
+    )
     lock_versions = [
         package.get("version")
         for package in cargo_lock.get("package", [])
@@ -146,8 +343,6 @@ def main() -> int:
     if cargo.get("package", {}).get("publish") is not False:
         failures.append("h00ligan must retain publish = false until crates.io is explicitly authorized")
     check_workspace_publication(root, failures)
-    if config.get("release-type") != "rust":
-        failures.append("release-type must be rust")
     if package.get("component") != "h00ligan":
         failures.append("component must be h00ligan")
     if package.get("include-component-in-tag") is not True:
@@ -160,26 +355,6 @@ def main() -> int:
         failures.append("draft releases must materialize their tag before distribution verifies it")
     if config.get("plugins"):
         failures.append("workspace plugins would widen a component-only version bump")
-    lock_updaters = package.get("extra-files")
-    expected_lock_updaters = [
-        {
-            "type": "toml",
-            "path": "/Cargo.lock",
-            "jsonpath": "$.package[?(@.name.value == 'h00ligan')].version",
-        },
-        {
-            "type": "toml",
-            "path": "/providers/rust-analyzer/h00ligan-product.Cargo.lock",
-            "jsonpath": "$.package[?(@.name.value == 'h00ligan')].version",
-        },
-        {
-            "type": "toml",
-            "path": "/providers/rust-analyzer/h00ligan-product.Cargo.lock",
-            "jsonpath": "$.package[?(@.name.value == 'h00ligan-product')].version",
-        },
-    ]
-    if lock_updaters != expected_lock_updaters:
-        failures.append("Release Please must update the root and embedded product locks")
     if "bootstrap-sha" in config:
         failures.append(
             "standalone release history must not inherit a foreign bootstrap SHA"
