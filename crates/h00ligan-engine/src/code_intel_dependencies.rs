@@ -11,11 +11,14 @@ use serde::Serialize;
 
 use crate::code_intel_calls::assess_calls_capability;
 use crate::code_intel_domain::{
-    CapabilityCoverage, CapabilityCoverageStatus, GenerationId, Page, ProjectInventoryCoverage,
-    RepositoryBinding, assess_project_dependencies_capability, assess_structural_graph_capability,
+    CapabilityCoverage, CapabilityCoverageStatus, DomainError, GenerationId,
+    MAX_GENERATION_ENGINE_RESULT_CHARS, Page, ProjectInventoryCoverage, RepositoryBinding,
+    assess_project_dependencies_capability, assess_structural_graph_capability,
 };
 use crate::code_intel_publication::ResolvedGeneration;
-use crate::code_intel_query::{generation_scope_selector, repository_binding};
+use crate::code_intel_query::{
+    generation_scope_selector, language_id_for_path, repository_binding,
+};
 use crate::graph::{EdgeKind, KnowledgeGraph};
 use crate::project_binding::ProjectBinding;
 
@@ -180,7 +183,7 @@ pub struct ExactDependenciesResult {
     pub warnings: Vec<String>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct FileBucket {
     dependencies: BTreeMap<DependencyRelationKind, usize>,
     dependents: BTreeMap<DependencyRelationKind, usize>,
@@ -258,28 +261,6 @@ pub fn query_published_dependencies(
         }
     }
 
-    let files_total = per_file.len();
-    let request_digest =
-        crate::code_intel_cursor::request_digest("dependencies", &[normalized_selector.as_str()]);
-    let window = crate::code_intel_cursor::page_window(
-        "dependencies",
-        &generation.manifest.generation_id,
-        &request_digest,
-        request.cursor.as_deref(),
-        limit,
-        files_total,
-    )?;
-    let files = per_file
-        .into_iter()
-        .skip(window.range.start)
-        .take(window.range.len())
-        .map(|(file, bucket)| DependencyFileSummary {
-            file,
-            dependencies: relation_counts(bucket.dependencies),
-            dependents: relation_counts(bucket.dependents),
-        })
-        .collect::<Vec<_>>();
-
     let structural_graph = assess_structural_graph_capability(
         graph,
         &generation.manifest.receipts,
@@ -296,7 +277,15 @@ pub fn query_published_dependencies(
         &generation.manifest.receipts,
         &generation.project_inventory,
     );
-    let authority_status = if generation.project_inventory.coverage
+    let selected_languages = scope_files
+        .iter()
+        .map(|path| language_id_for_path(path))
+        .filter(|language| language.0 != "unknown")
+        .collect::<BTreeSet<_>>();
+    let inventory_coverage = generation
+        .project_inventory
+        .coverage_for_languages(&selected_languages);
+    let authority_status = if inventory_coverage
         == ProjectInventoryCoverage::IndexedSourcePopulationComplete
         && capability_complete(&structural_graph)
         && capability_complete(&calls)
@@ -307,55 +296,102 @@ pub fn query_published_dependencies(
         DependencyAuthorityStatus::Qualified
     };
 
-    let mut warnings = Vec::new();
+    let mut base_warnings = Vec::new();
     if authority_status == DependencyAuthorityStatus::Qualified {
-        warnings.push(
+        base_warnings.push(
             "dependency rows are observed evidence only; zeroes and totals are not complete while structural, Calls, or project-dependency coverage is incomplete"
                 .into(),
         );
     }
-    if generation.project_inventory.coverage
-        == ProjectInventoryCoverage::IndexedSourcePopulationPartial
-    {
-        warnings.push(format!(
+    let inventory_issues = generation
+        .project_inventory
+        .issues_for_languages(&selected_languages);
+    if !inventory_issues.is_empty() {
+        base_warnings.push(format!(
             "project inventory is partial and reports {} issue(s)",
-            generation.project_inventory.issues.len()
-        ));
-    }
-    if window.page.has_more {
-        warnings.push(format!(
-            "showing {} of {files_total} related files in this page; continue with next_cursor",
-            window.page.returned
+            inventory_issues.len()
         ));
     }
 
-    Ok(ExactDependenciesResult {
-        schema_version: DEPENDENCIES_SCHEMA_VERSION.into(),
-        generation_id: generation.manifest.generation_id.clone(),
-        repository: repository_binding(binding, generation),
-        scope: DependencyScope {
-            path: if normalized_selector.is_empty() {
-                ".".into()
-            } else {
-                normalized_selector
+    let files_total = per_file.len();
+    let files = per_file.into_iter().collect::<Vec<_>>();
+    let request_digest =
+        crate::code_intel_cursor::request_digest("dependencies", &[normalized_selector.as_str()]);
+    let scope_path = if normalized_selector.is_empty() {
+        ".".into()
+    } else {
+        normalized_selector
+    };
+    let mut smallest_result_chars = usize::MAX;
+    for effective_limit in (1..=limit).rev() {
+        let window = crate::code_intel_cursor::page_window(
+            "dependencies",
+            &generation.manifest.generation_id,
+            &request_digest,
+            request.cursor.as_deref(),
+            effective_limit,
+            files_total,
+        )?;
+        let page_files = files[window.range.clone()]
+            .iter()
+            .map(|(file, bucket)| DependencyFileSummary {
+                file: file.clone(),
+                dependencies: relation_counts(bucket.dependencies.clone()),
+                dependents: relation_counts(bucket.dependents.clone()),
+            })
+            .collect::<Vec<_>>();
+        let mut warnings = base_warnings.clone();
+        if effective_limit < limit {
+            warnings.push(format!(
+                "serialized-result bounds reduced this page limit from {limit} to {effective_limit} related files"
+            ));
+        }
+        if window.page.has_more {
+            warnings.push(format!(
+                "showing {} of {files_total} related files in this page; continue with next_cursor",
+                window.page.returned
+            ));
+        }
+        let result = ExactDependenciesResult {
+            schema_version: DEPENDENCIES_SCHEMA_VERSION.into(),
+            generation_id: generation.manifest.generation_id.clone(),
+            repository: repository_binding(binding, generation),
+            scope: DependencyScope {
+                path: scope_path.clone(),
+                kind: scope_kind,
+                indexed_files: scope_files.len(),
+                symbols: scope_nodes.len(),
             },
-            kind: scope_kind,
-            indexed_files: scope_files.len(),
-            symbols: scope_nodes.len(),
-        },
-        authority: DependencyAuthority {
-            status: authority_status,
-            population: DEPENDENCIES_POPULATION.into(),
-            structural_graph,
-            calls,
-            project_dependencies,
-        },
-        dependency_evidence_count,
-        dependent_evidence_count,
-        page: window.page,
-        files,
-        warnings,
-    })
+            authority: DependencyAuthority {
+                status: authority_status,
+                population: DEPENDENCIES_POPULATION.into(),
+                structural_graph: structural_graph.clone(),
+                calls: calls.clone(),
+                project_dependencies: project_dependencies.clone(),
+            },
+            dependency_evidence_count,
+            dependent_evidence_count,
+            page: window.page,
+            files: page_files,
+            warnings,
+        };
+        let result_chars = serde_json::to_string(&result)
+            .map_err(|error| DomainError::PublishedGenerationInvalid {
+                reason: format!("serialize Dependencies result for size validation: {error}"),
+            })?
+            .chars()
+            .count();
+        smallest_result_chars = result_chars;
+        if result_chars <= MAX_GENERATION_ENGINE_RESULT_CHARS {
+            return Ok(result);
+        }
+    }
+    Err(DomainError::result_too_large(
+        "dependencies",
+        smallest_result_chars,
+        MAX_GENERATION_ENGINE_RESULT_CHARS,
+        "Narrow the file or directory scope; required Dependencies identity, authority, and one related-file row do not fit",
+    ))
 }
 
 fn indexed_source_files(
@@ -437,7 +473,90 @@ const fn dependency_relation(kind: EdgeKind) -> Option<DependencyRelationKind> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use uuid::Uuid;
+
     use super::*;
+    use crate::code_intel_domain::{ProjectInventory, RepositoryId};
+    use crate::code_intel_publication::{GenerationManifest, PublicationHead, PublicationHeadBody};
+    use crate::graph::{GraphEdge, GraphNode};
+    use crate::reachability::ReachabilityClass;
+
+    fn generation() -> ResolvedGeneration {
+        let repository_id = RepositoryId::new("repository-fixture");
+        let generation_id = GenerationId::new("generation-fixture");
+        ResolvedGeneration {
+            slot: 0,
+            head: PublicationHead {
+                body: PublicationHeadBody {
+                    schema_version: "h00/code-intel/head/v4".into(),
+                    sequence: 1,
+                    repository_id: repository_id.clone(),
+                    generation_id: generation_id.clone(),
+                    database_blake3: "1".repeat(64),
+                    manifest_sha256: "2".repeat(64),
+                    receipt_set_sha256: "3".repeat(64),
+                    provider_payload_set_sha256: "4".repeat(64),
+                    previous_generation_id: None,
+                },
+                digest: "5".repeat(64),
+            },
+            manifest: GenerationManifest {
+                schema_version: crate::code_intel_publication::GENERATION_SCHEMA_VERSION.into(),
+                generation_id,
+                repository_id,
+                parent_generation_id: None,
+                source_revision: None,
+                payload_blake3: "6".repeat(64),
+                graph_publication_proof: crate::graph_store::GraphPublicationProof::test_fixture(),
+                index_state_publication_proof:
+                    crate::index_state::IndexStatePublicationProof::test_fixture(),
+                project_inventory_sha256: "7".repeat(64),
+                receipts: Vec::new(),
+                provider_payloads: Vec::new(),
+            },
+            project_inventory: ProjectInventory {
+                coverage: ProjectInventoryCoverage::IndexedSourcePopulationComplete,
+                project_topology: crate::code_intel_domain::ProjectTopology {
+                    units: Vec::new(),
+                    memberships: Vec::new(),
+                    relationships: Vec::new(),
+                    exact_workspace_member_sets: Vec::new(),
+                    dependency_graphs: Vec::new(),
+                },
+                analysis_context_graphs: Vec::new(),
+                inputs: Vec::new(),
+                issues: Vec::new(),
+            }
+            .into(),
+            provider_payloads: Vec::new(),
+            database_path: PathBuf::from("generation.redb"),
+        }
+    }
+
+    fn node(name: &str, path: String) -> GraphNode {
+        GraphNode {
+            memory_id: Uuid::new_v4(),
+            symbol_name: name.into(),
+            kind: "function".into(),
+            file_path: path,
+            content_hash: format!("hash-{name}"),
+            signature: format!("pub fn {name}()"),
+            reachability_class: ReachabilityClass::Unclassified,
+            line_start: Some(0),
+            line_end: Some(0),
+            has_body: Some(true),
+            visibility: "pub".into(),
+            is_test_only: Some(false),
+            is_test_root: false,
+            has_platform_cfg: false,
+            rustc_flagged_dead: false,
+            entry_retain: Default::default(),
+            has_uncaptured_items: false,
+            oracle_receipt: None,
+        }
+    }
 
     #[test]
     fn dependency_projection_is_forward_only_and_classifies_every_edge_kind() {
@@ -506,5 +625,67 @@ mod tests {
         );
         assert!(validate_dependencies_limit(0).is_err());
         assert!(validate_dependencies_limit(MAX_DEPENDENCIES_PAGE_SIZE + 1).is_err());
+    }
+
+    #[test]
+    fn large_page_is_adaptively_reduced_without_losing_population_totals() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = temporary.path().join("repo");
+        std::fs::create_dir_all(&root).expect("fixture root");
+        let binding = ProjectBinding::explicit(&root, &temporary.path().join("bundle"))
+            .expect("fixture binding");
+        let generation = generation();
+        let mut graph = KnowledgeGraph::new();
+        let source = node("source", "src/lib.rs".into());
+        let source_id = source.memory_id;
+        graph.add_node(source).expect("source node");
+
+        let path_component = "x".repeat(100);
+        let mut related_path_characters = 0usize;
+        for index in 0..MAX_DEPENDENCIES_PAGE_SIZE {
+            let path = format!(
+                "src/{path_component}/{path_component}/{path_component}/dependency_{index}.rs"
+            );
+            related_path_characters += path.chars().count();
+            let target = node(&format!("target_{index}"), path);
+            let target_id = target.memory_id;
+            graph.add_node(target).expect("target node");
+            graph
+                .add_edge(
+                    source_id,
+                    target_id,
+                    GraphEdge {
+                        kind: EdgeKind::References,
+                        ..GraphEdge::default()
+                    },
+                )
+                .expect("dependency edge");
+        }
+        assert!(
+            related_path_characters > MAX_GENERATION_ENGINE_RESULT_CHARS,
+            "positive control: file paths alone must exceed the result envelope"
+        );
+
+        let result = query_published_dependencies(
+            &graph,
+            &generation,
+            &binding,
+            &DependenciesRequest {
+                path: "src/lib.rs".into(),
+                limit: MAX_DEPENDENCIES_PAGE_SIZE,
+                cursor: None,
+            },
+        )
+        .expect("large Dependencies result must remain useful through page reduction");
+        let serialized = serde_json::to_string(&result).expect("Dependencies JSON");
+
+        assert!(serialized.chars().count() <= MAX_GENERATION_ENGINE_RESULT_CHARS);
+        assert!(result.page.returned < MAX_DEPENDENCIES_PAGE_SIZE);
+        assert_eq!(result.page.total_items, MAX_DEPENDENCIES_PAGE_SIZE);
+        assert!(result.page.has_more);
+        assert!(result.page.next_cursor.is_some());
+        assert!(result.warnings.iter().any(|warning| {
+            warning.contains("serialized-result bounds reduced this page limit")
+        }));
     }
 }

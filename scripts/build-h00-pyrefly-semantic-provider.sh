@@ -12,13 +12,49 @@ if [[ -z "${H00_PYREFLY_BUILDER_INVOCATION_ROOT:-}" ]]; then
         }
         exec devbox run -- "$live_script" "$@"
     fi
+    live_cache_publisher="$live_repo_root/scripts/publish-h00ligan-cache-directory.py"
+    [[ -f "$live_cache_publisher" && ! -L "$live_cache_publisher" ]] || {
+        echo "Pyrefly cache publisher must be a regular non-symlink" >&2
+        exit 1
+    }
+    live_cache_root="$live_repo_root/target/portable-cache/python-provider"
     invocation_parent="$live_repo_root/target/portable-cache/python-provider/invocations"
     [[ ! -L "$live_repo_root/target" && ! -L "$live_repo_root/target/portable-cache" ]] || {
         echo "Pyrefly provider cache roots must not be symlinks" >&2
         exit 1
     }
-    mkdir -p "$invocation_parent"
+    mkdir -p "$live_cache_root" "$invocation_parent"
+    [[ -d "$live_cache_root" && ! -L "$live_cache_root" ]] || {
+        echo "Pyrefly provider cache root is invalid: $live_cache_root" >&2
+        exit 1
+    }
+    if [[ -z "${H00LIGAN_CACHE_LOCK_FD:-}" ]]; then
+        exec python3 "$live_cache_publisher" locked-exec \
+            --owner-root "$live_cache_root" \
+            --lock-file "$live_cache_root/compiler.lock" \
+            -- "$live_script" "$@"
+    fi
+    python3 "$live_cache_publisher" verify-lock \
+        --owner-root "$live_cache_root" \
+        --lock-file "$live_cache_root/compiler.lock" \
+        --descriptor "$H00LIGAN_CACHE_LOCK_FD"
+    prune_interrupted_invocation_roots() {
+        local interrupted
+        local interrupted_invocations=()
+        shopt -s nullglob
+        interrupted_invocations=("$invocation_parent"/invocation.*)
+        shopt -u nullglob
+        for interrupted in "${interrupted_invocations[@]}"; do
+            [[ -d "$interrupted" && ! -L "$interrupted" ]] || {
+                echo "Pyrefly interrupted invocation entry is unsafe: $interrupted" >&2
+                return 1
+            }
+            rm -rf -- "$interrupted"
+        done
+    }
+    prune_interrupted_invocation_roots
     invocation_root="$(mktemp -d "$invocation_parent/invocation.XXXXXX")"
+    trap 'rm -rf -- "$invocation_root"' EXIT HUP INT TERM
     install -m 0500 "$live_script" "$invocation_root/build-provider.sh"
     export H00_PYREFLY_BUILDER_INVOCATION_ROOT="$invocation_root"
     export H00_PYREFLY_BUILDER_LIVE_SCRIPT="$live_script"
@@ -44,7 +80,8 @@ official source archive. The final h00ligan product links this provider behind
 a hidden same-executable mode; it is never installed as a second product.
 
 Options:
-  --target TARGET   Rust target triple (defaults to the pinned compiler host)
+  --target TARGET   Rust target triple (defaults to portable musl on Linux and
+                    the pinned compiler host on Darwin)
   --prepare-only    Verify and prepare the exact patched source, then stop
   --machine         Print stable KEY=VALUE receipt fields
   -h, --help        Show this help
@@ -213,7 +250,6 @@ for path in \
 done
 
 candidate=""
-source_lock=""
 download=""
 adapter_root=""
 compilation_root=""
@@ -221,13 +257,56 @@ artifact_candidate=""
 cleanup() {
     [[ -z "$candidate" || ! -d "$candidate" ]] || rm -rf -- "$candidate"
     [[ -z "$download" || ! -f "$download" ]] || rm -f -- "$download"
-    [[ -z "$source_lock" || ! -d "$source_lock" ]] || rmdir -- "$source_lock" 2>/dev/null || true
     [[ -z "$adapter_root" || ! -d "$adapter_root" ]] || rm -rf -- "$adapter_root"
     [[ -z "$compilation_root" || ! -d "$compilation_root" ]] || rm -rf -- "$compilation_root"
     [[ -z "$artifact_candidate" || ! -d "$artifact_candidate" ]] || rm -rf -- "$artifact_candidate"
     [[ ! -d "$invocation_root" ]] || rm -rf -- "$invocation_root"
 }
 trap cleanup EXIT HUP INT TERM
+
+python3 "$cache_publisher" verify-lock \
+    --owner-root "$cache_root" \
+    --lock-file "$cache_root/compiler.lock" \
+    --descriptor "$H00LIGAN_CACHE_LOCK_FD"
+unset H00LIGAN_CACHE_LOCK_FD
+
+prune_interrupted_cache_roots() {
+    local entry
+    local entries=()
+    local target_directory
+    shopt -s nullglob
+    entries=(
+        "$candidate_parent"/source.*
+        "$candidate_parent"/adapter.*
+        "$compilation_parent"/build.*
+    )
+    for target_directory in "$artifact_parent"/*; do
+        [[ -d "$target_directory" && ! -L "$target_directory" ]] || {
+            echo "Pyrefly artifact target cache is unsafe: $target_directory" >&2
+            return 1
+        }
+        entries+=("$target_directory"/artifact.*)
+    done
+    shopt -u nullglob
+    for entry in "${entries[@]}"; do
+        [[ -d "$entry" && ! -L "$entry" ]] || {
+            echo "Pyrefly interrupted cache entry is unsafe: $entry" >&2
+            return 1
+        }
+        rm -rf -- "$entry"
+    done
+    shopt -s nullglob
+    entries=("$archive_root"/*.download.*)
+    shopt -u nullglob
+    for entry in "${entries[@]}"; do
+        [[ -f "$entry" && ! -L "$entry" ]] || {
+            echo "Pyrefly interrupted archive entry is unsafe: $entry" >&2
+            return 1
+        }
+        rm -f -- "$entry"
+    done
+}
+prune_interrupted_cache_roots
 
 archive="$archive_root/$archive_name"
 if [[ ! -e "$archive" ]]; then
@@ -320,11 +399,6 @@ PY
 source_root="$source_parent/$source_key"
 if [[ ! -e "$source_root" ]]; then
     command -v patch >/dev/null 2>&1 || { echo "patch is required" >&2; exit 1; }
-    source_lock="$source_root.lock"
-    if ! mkdir "$source_lock"; then
-        echo "Pyrefly source preparation is already active: $source_lock" >&2
-        exit 1
-    fi
     candidate="$(mktemp -d "$candidate_parent/source.XXXXXX")"
     python3 - "$archive" "$candidate" "$archive_prefix" <<'PY'
 from pathlib import Path, PurePosixPath
@@ -381,8 +455,6 @@ PY
     verify_live_inputs
     verify_source_cache "$extracted" create
     mv "$extracted" "$source_root"
-    rmdir "$source_lock"
-    source_lock=""
     rm -rf -- "$candidate"
     candidate=""
 elif [[ ! -d "$source_root" || -L "$source_root" ]]; then
@@ -422,7 +494,22 @@ rustc_identity="$(rustup run "$rust_version" rustc -vV)"
     exit 1
 }
 host_target="$(printf '%s\n' "$rustc_identity" | sed -n 's/^host: //p')"
-target="${requested_target:-$host_target}"
+case "$host_target" in
+    x86_64-unknown-linux-gnu)
+        default_target="x86_64-unknown-linux-musl"
+        ;;
+    aarch64-unknown-linux-gnu)
+        default_target="aarch64-unknown-linux-musl"
+        ;;
+    x86_64-apple-darwin | aarch64-apple-darwin)
+        default_target="$host_target"
+        ;;
+    *)
+        echo "unsupported Pyrefly provider host: $host_target" >&2
+        exit 1
+        ;;
+esac
+target="${requested_target:-$default_target}"
 rustup target list --toolchain "$rust_version" --installed | grep -Fxq "$target" || {
     echo "Rust $rust_version target is not installed: $target" >&2
     exit 1
@@ -434,12 +521,6 @@ case "$target" in
     x86_64-unknown-linux-musl | aarch64-unknown-linux-musl)
         [[ "$host_os" == Linux ]] || { echo "Linux target requires a Linux host" >&2; exit 1; }
         portable_linux=1
-        ;;
-    x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu)
-        [[ "$host_os" == Linux && "$target" == "$host_target" ]] || {
-            echo "non-portable GNU provider builds must target the native host" >&2
-            exit 1
-        }
         ;;
     x86_64-apple-darwin | aarch64-apple-darwin)
         [[ "$host_os" == Darwin ]] || { echo "Darwin target requires a Darwin host" >&2; exit 1; }
@@ -510,12 +591,30 @@ validate_provider_binary() {
     }
     python3 - "$candidate" "$repo_root" "$HOME" "${DEVBOX_PACKAGES_DIR:-}" <<'PY'
 from pathlib import Path
+import re
 import sys
 
 payload = Path(sys.argv[1]).read_bytes().lower()
-for value in ("/nix/store", *sys.argv[2:]):
+for label, value in (
+    ("Nix store", "/nix/store"),
+    ("repository root", sys.argv[2]),
+    ("home root", sys.argv[3]),
+    ("Devbox package root", sys.argv[4]),
+):
     if value and value.encode().lower() in payload:
-        raise SystemExit("Pyrefly provider embeds a forbidden host/build path")
+        detail = ""
+        if label == "Nix store":
+            packages = sorted(
+                match.decode("utf-8", errors="replace")
+                for match in re.findall(
+                    rb"/nix/store/[0-9a-z]{32}-([^/\x00\s]+)", payload
+                )
+            )
+            if packages:
+                detail = f": {', '.join(packages)}"
+        raise SystemExit(
+            f"Pyrefly provider embeds a forbidden host/build path ({label}{detail})"
+        )
 for token in (b"devbox_packages_dir", b"devbox run"):
     if token in payload:
         raise SystemExit("Pyrefly provider embeds a build-environment command")
@@ -614,7 +713,7 @@ import sys
 ) = sys.argv[1:]
 payload = {
     "schema": "h00/pyrefly-semantic-provider-build/v2",
-    "protocol": "h00/semantic-provider/v13",
+    "protocol": "h00/semantic-provider/v15",
     "provider_id": "h00-pyrefly-scip",
     "language": "python",
     "build_key": build_key,
@@ -665,7 +764,7 @@ import sys
 payload = json.loads(Path(receipt).read_text(encoding="utf-8"))
 expected = {
     "schema": "h00/pyrefly-semantic-provider-build/v2",
-    "protocol": "h00/semantic-provider/v13",
+    "protocol": "h00/semantic-provider/v15",
     "provider_id": "h00-pyrefly-scip",
     "language": "python",
     "build_key": build_key,

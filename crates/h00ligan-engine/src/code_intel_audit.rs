@@ -18,9 +18,9 @@ use crate::code_intel_dead::{
     callable_root_sets,
 };
 use crate::code_intel_domain::{
-    CapabilityCoverage, DomainError, GenerationId, LIVE_INPUT_RESULT_RESERVE_CHARS, LanguageId,
-    Page, ProjectInventoryCoverage, ProjectUnitId, RepositoryBinding, UnitGraph,
-    assess_structural_graph_capability,
+    CapabilityCoverage, DocumentMembershipKind, DomainError, GenerationId, LanguageId,
+    MAX_GENERATION_ENGINE_RESULT_CHARS, Page, ProjectInventoryCoverage, ProjectUnitId,
+    RepositoryBinding, UnitGraph, assess_structural_graph_capability,
 };
 use crate::code_intel_inventory::project_unit_graph;
 use crate::code_intel_publication::ResolvedGeneration;
@@ -28,12 +28,11 @@ use crate::code_intel_query::{language_id_for_path, repository_binding};
 use crate::code_intel_symbol::exact_symbol_id;
 use crate::graph::{EdgeKind, EdgeScope, EdgeSource, GraphEdge, GraphNode, KnowledgeGraph};
 use crate::graph_overview::project_unit_label;
-use crate::graph_stats::dead_code_unknown_guidance;
+use crate::graph_stats::{dead_code_unknown_guidance, unclassified_population_guidance};
 use crate::project_binding::ProjectBinding;
 use crate::reachability::ReachabilityEvidence;
 use crate::structural_ir::{SymbolRole, symbol_kind_has_role};
 
-#[cfg(test)]
 use crate::reachability::ReachabilityClass;
 
 pub const AUDIT_SCHEMA_VERSION: &str = "h00/code-intel/audit/v2";
@@ -42,7 +41,6 @@ pub const DEFAULT_AUDIT_DEAD_RATIO_PERCENT: usize = 10;
 pub const DEFAULT_AUDIT_PAGE_SIZE: usize = 20;
 pub const MAX_AUDIT_PAGE_SIZE: usize = 100;
 pub const MAX_AUDIT_CURSOR_BYTES: usize = 8_192;
-pub const MAX_AUDIT_RESULT_CHARS: usize = 28_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -437,16 +435,16 @@ pub fn query_published_audit(
             .chars()
             .count();
         smallest_result_chars = result_chars;
-        if result_chars <= MAX_AUDIT_RESULT_CHARS - LIVE_INPUT_RESULT_RESERVE_CHARS {
+        if result_chars <= MAX_GENERATION_ENGINE_RESULT_CHARS {
             return Ok(result);
         }
     }
 
-    Err(invalid_request(
-        "limit",
-        format!(
-            "even a one-hotspot Audit page would contain {smallest_result_chars} serialized characters and cannot leave room for required live-input evidence within the {MAX_AUDIT_RESULT_CHARS}-character product bound"
-        ),
+    Err(DomainError::result_too_large(
+        "audit",
+        smallest_result_chars,
+        MAX_GENERATION_ENGINE_RESULT_CHARS,
+        "Narrow the audit scope or raise its thresholds; required Audit authority and summary metadata do not fit even when the page limit is one",
     ))
 }
 
@@ -542,11 +540,7 @@ fn dead_code_summary(
         .project_topology
         .memberships
         .iter()
-        .filter(|membership| {
-            generation
-                .project_inventory
-                .is_semantic_source_owner(membership)
-        })
+        .filter(|membership| membership.kind == DocumentMembershipKind::SourceOwner)
         .map(|membership| {
             (
                 membership.document_path.as_str(),
@@ -583,12 +577,15 @@ fn dead_code_summary(
     let mut liveness_resolver =
         roots.map(|roots| ProjectUnitCallableLivenessResolver::new(graph, generation, roots));
     for (project_unit_id, (_, callable_symbols)) in &unit_populations {
-        if !units.contains_key(project_unit_id) {
+        let Some(unit) = units.get(project_unit_id) else {
             return Err(DomainError::ProjectInventoryMismatch {
                 document_path: format!("<project unit {project_unit_id}>"),
                 reason: "source-owner project unit is missing from the persisted unit population"
                     .into(),
             });
+        };
+        if !unit.kind.grants_semantic_authority() {
+            continue;
         }
         if *callable_symbols == 0 {
             authoritative_unit_ids.insert(project_unit_id.clone());
@@ -723,8 +720,15 @@ fn dead_code_summary(
             .then_with(|| left.project_unit_id.cmp(&right.project_unit_id))
     });
 
-    let guidance = (status != AuditDeadCodeStatus::Complete)
-        .then(|| dead_code_unknown_guidance(calls, roots.is_some(), graph.node_count() > 0));
+    let unclassified_node_count = nodes
+        .iter()
+        .filter(|node| node.reachability_class == ReachabilityClass::Unclassified)
+        .count();
+    let guidance = (status != AuditDeadCodeStatus::Complete).then(|| {
+        unclassified_population_guidance(unclassified_node_count).unwrap_or_else(|| {
+            dead_code_unknown_guidance(calls, roots.is_some(), graph.node_count() > 0)
+        })
+    });
     Ok(AuditDeadCode {
         status,
         total: aggregate_authoritative.then_some(total_dead),

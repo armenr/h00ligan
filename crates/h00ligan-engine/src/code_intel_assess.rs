@@ -18,7 +18,7 @@ use crate::code_intel_calls::{
 use crate::code_intel_cursor::{page_window, request_digest};
 use crate::code_intel_domain::{
     AuthorityStatus, CallerFilter, CapabilityCoverage, CapabilityCoverageStatus, DomainError,
-    GenerationId, LIVE_INPUT_RESULT_RESERVE_CHARS, Page, ProjectInventoryCoverage,
+    GenerationId, LanguageId, MAX_GENERATION_ENGINE_RESULT_CHARS, Page, ProjectInventoryCoverage,
     RepositoryBinding, SymbolIdentity, UnitGraph, assess_structural_graph_capability,
 };
 use crate::code_intel_inventory::project_unit_graph;
@@ -35,7 +35,7 @@ use crate::graph::{EdgeKind, GraphNode, KnowledgeGraph};
 use crate::project_binding::ProjectBinding;
 use crate::reachability::ReachabilityClass;
 
-pub const ASSESS_SCHEMA_VERSION: &str = "h00/code-intel/assess/v2";
+pub const ASSESS_SCHEMA_VERSION: &str = "h00/code-intel/assess/v4";
 pub const DEFAULT_ASSESS_DEPTH: usize = 3;
 pub const MAX_ASSESS_DEPTH: usize = 10;
 pub const DEFAULT_ASSESS_PAGE_SIZE: usize = 50;
@@ -43,7 +43,6 @@ pub const MAX_ASSESS_PAGE_SIZE: usize = 100;
 pub const MAX_ASSESS_SYMBOL_BYTES: usize = 4_096;
 pub const MAX_ASSESS_FILE_BYTES: usize = 4_096;
 pub const MAX_ASSESS_CURSOR_BYTES: usize = 8_192;
-pub const MAX_ASSESS_RESULT_CHARS: usize = 28_000;
 const MAX_ASSESS_FACET_PREVIEW: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -499,8 +498,11 @@ fn query_published_assess_with_index(
             ))
     });
 
-    let inventory_complete = generation.project_inventory.coverage
-        == ProjectInventoryCoverage::IndexedSourcePopulationComplete;
+    let inventory_coverage = generation
+        .project_inventory
+        .coverage_for_language(&target_language);
+    let inventory_complete =
+        inventory_coverage == ProjectInventoryCoverage::IndexedSourcePopulationComplete;
     let structural_complete = structural_coverage.language_status(&target_language.0)
         == Some(CapabilityCoverageStatus::Complete);
     let execution_complete = execution_evidence.as_ref().is_some_and(|evidence| {
@@ -539,7 +541,7 @@ fn query_published_assess_with_index(
         .map_or_else(Vec::new, |evidence| evidence.direct_references.clone());
     let direct_callers = direct_references
         .iter()
-        .map(|reference| reference.caller.symbol_id.as_str())
+        .map(|reference| reference.origin.stable_key())
         .collect::<BTreeSet<_>>()
         .len();
     let call_sites = direct_references.len();
@@ -570,12 +572,15 @@ fn query_published_assess_with_index(
     );
     let base_warnings = assess_warnings(
         generation,
-        structural_complete,
-        calls_applicability,
-        execution_evidence.as_ref(),
-        structural.depth_cutoff_nodes,
-        filtered_out.len(),
-        qualified_binding_impacted.len(),
+        &AssessWarningEvidence {
+            target_language: &target_language,
+            structural_complete,
+            calls_applicability,
+            execution: execution_evidence.as_ref(),
+            structural_depth_cutoff_nodes: structural.depth_cutoff_nodes,
+            filtered_out_symbols: filtered_out.len(),
+            qualified_binding_symbols: qualified_binding_impacted.len(),
+        },
     );
     let sections = request.sections.iter().copied().collect::<Vec<_>>();
 
@@ -591,22 +596,31 @@ fn query_published_assess_with_index(
         )?;
         let page_items = all_items[window.range.clone()].to_vec();
         let preview_limit = effective_limit.min(MAX_ASSESS_FACET_PREVIEW);
-        let caller_items = direct_references
-            .iter()
-            .take(preview_limit)
-            .cloned()
-            .collect::<Vec<_>>();
-        let test_items = tests_result
-            .as_ref()
-            .map(|result| {
-                result
-                    .items
-                    .iter()
-                    .take(preview_limit)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let caller_items = if request.sections.contains(&AssessSection::Callers) {
+            direct_references
+                .iter()
+                .take(preview_limit)
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let test_items = if request.sections.contains(&AssessSection::Tests) {
+            tests_result
+                .as_ref()
+                .map(|result| {
+                    result
+                        .items
+                        .iter()
+                        .take(preview_limit)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let previews_present = !caller_items.is_empty() || !test_items.is_empty();
         let mut warnings = base_warnings.clone();
         if effective_limit < request.limit {
             warnings.push(format!(
@@ -642,18 +656,14 @@ fn query_published_assess_with_index(
             .iter()
             .map(|item| item.symbol.document_path.as_str())
             .collect::<Vec<_>>();
-        projected_documents.extend(
-            caller_items
-                .iter()
-                .map(|item| item.caller.document_path.as_str()),
-        );
+        projected_documents.extend(caller_items.iter().map(|item| item.origin.document_path()));
         projected_documents.extend(
             test_items
                 .iter()
                 .map(|item| item.test.document_path.as_str()),
         );
         projected_documents.push(&target_structural.document_path);
-        let result = ExactAssessResult {
+        let mut result = ExactAssessResult {
             schema_version: ASSESS_SCHEMA_VERSION.into(),
             capability: "assess".into(),
             generation_id: generation.manifest.generation_id.clone(),
@@ -683,7 +693,7 @@ fn query_published_assess_with_index(
                 structural_graph: structural_coverage.clone(),
                 calls: calls_coverage.clone(),
                 exact_calls: exact_calls.clone(),
-                project_inventory_coverage: generation.project_inventory.coverage,
+                project_inventory_coverage: inventory_coverage,
                 execution_traversal_complete: !calls_applicable
                     || execution_evidence
                         .as_ref()
@@ -769,16 +779,73 @@ fn query_published_assess_with_index(
             })?
             .chars()
             .count();
-        smallest_result_chars = result_chars;
-        if result_chars <= MAX_ASSESS_RESULT_CHARS - LIVE_INPUT_RESULT_RESERVE_CHARS {
+        smallest_result_chars = if smallest_result_chars == 0 {
+            result_chars
+        } else {
+            smallest_result_chars.min(result_chars)
+        };
+        if result_chars <= MAX_GENERATION_ENGINE_RESULT_CHARS {
             return Ok(result);
         }
+        if previews_present {
+            if let Some(callers) = result.callers.as_mut() {
+                callers.items.clear();
+                callers.items_complete = direct_references.is_empty();
+                if !direct_references.is_empty()
+                    && !result.warnings.iter().any(|warning| {
+                        warning
+                            == "the callers section is a bounded preview; use Calls for every exact call occurrence"
+                    })
+                {
+                    result.warnings.push(
+                        "the callers section is a bounded preview; use Calls for every exact call occurrence"
+                            .into(),
+                    );
+                }
+            }
+            if let Some(tests) = result.tests.as_mut() {
+                tests.items.clear();
+                tests.items_complete = test_count == Some(0);
+                if test_count.is_some_and(|count| count > 0)
+                    && !result.warnings.iter().any(|warning| {
+                        warning
+                            == "the tests section is a bounded preview; use Tests for every runnable test root and continuation"
+                    })
+                {
+                    result.warnings.push(
+                        "the tests section is a bounded preview; use Tests for every runnable test root and continuation"
+                            .into(),
+                    );
+                }
+            }
+            let mut projected_documents = result
+                .blast_radius
+                .iter()
+                .flat_map(|blast_radius| blast_radius.items.iter())
+                .map(|item| item.symbol.document_path.as_str())
+                .collect::<Vec<_>>();
+            projected_documents.push(&target_structural.document_path);
+            result.unit_graph =
+                project_unit_graph(&generation.project_inventory, projected_documents);
+            let bounded_chars = serde_json::to_string(&result)
+                .map_err(|error| {
+                    invalid_generation(format!(
+                        "serialize Assess result without facet previews for size validation: {error}"
+                    ))
+                })?
+                .chars()
+                .count();
+            smallest_result_chars = smallest_result_chars.min(bounded_chars);
+            if bounded_chars <= MAX_GENERATION_ENGINE_RESULT_CHARS {
+                return Ok(result);
+            }
+        }
     }
-    Err(invalid_request(
-        "symbol",
-        format!(
-            "even a one-item Assess page would contain {smallest_result_chars} serialized characters and cannot leave room for required live-input evidence within the {MAX_ASSESS_RESULT_CHARS}-character product bound"
-        ),
+    Err(DomainError::result_too_large(
+        "assess",
+        smallest_result_chars,
+        MAX_GENERATION_ENGINE_RESULT_CHARS,
+        "Request fewer sections, a shallower depth, or a narrower symbol/file scope; the minimum Assess result does not fit after optional previews are removed",
     ))
 }
 
@@ -819,16 +886,7 @@ fn collect_execution_evidence(
         .iter()
         .map(|path| (path.caller_id, path.depth, path.chain.clone()))
         .collect();
-    let direct_references = calls
-        .incoming(target.memory_id)
-        .iter()
-        .filter(|incoming| filter_admits(request.filter, incoming.caller_reachability))
-        .map(|incoming| ExactCallReference {
-            caller: incoming.caller.clone(),
-            call_span: incoming.call_span.clone(),
-            context: "exact provider-resolved direct call occurrence".into(),
-        })
-        .collect();
+    let (direct_references, _) = calls.filtered_exact_references(target.memory_id, request.filter);
     Ok(ExecutionEvidence {
         resolved_symbol,
         authority: calls.authority(),
@@ -990,36 +1048,46 @@ fn assess_request_digest(
             file.as_deref().unwrap_or_default(),
             sections.as_str(),
             &request.max_depth.to_string(),
-            &format!("{:?}", request.filter),
+            request.filter.as_str(),
         ],
     )
 }
 
-fn assess_warnings(
-    generation: &ResolvedGeneration,
+struct AssessWarningEvidence<'a> {
+    target_language: &'a LanguageId,
     structural_complete: bool,
     calls_applicability: Option<AssessApplicability>,
-    execution: Option<&ExecutionEvidence>,
+    execution: Option<&'a ExecutionEvidence>,
     structural_depth_cutoff_nodes: usize,
     filtered_out_symbols: usize,
     qualified_binding_symbols: usize,
+}
+
+fn assess_warnings(
+    generation: &ResolvedGeneration,
+    evidence: &AssessWarningEvidence<'_>,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
-    if generation.project_inventory.coverage
+    let inventory_issues = generation
+        .project_inventory
+        .issues_for_language(evidence.target_language);
+    if generation
+        .project_inventory
+        .coverage_for_language(evidence.target_language)
         == ProjectInventoryCoverage::IndexedSourcePopulationPartial
     {
         warnings.push(format!(
             "project inventory is partial and reports {} issue(s); impact is limited to the published source-owner population",
-            generation.project_inventory.issues.len()
+            inventory_issues.len()
         ));
     }
-    if !structural_complete {
+    if !evidence.structural_complete {
         warnings.push(
             "structural authority is incomplete for the target language; structural zeroes and totals are qualified"
                 .into(),
         );
     }
-    match calls_applicability {
+    match evidence.calls_applicability {
         None => warnings.push(
             "non-callable impact is limited to observed structural edges; provider-backed reference authority is unavailable for this symbol class, so zeroes and totals are qualified"
                 .into(),
@@ -1028,16 +1096,19 @@ fn assess_warnings(
             "the callable is structurally indexed source data without a semantic project execution unit, so Calls-backed callers, execution impact, and runnable-test discovery do not apply; structural impact remains available"
                 .into(),
         ),
-        Some(AssessApplicability::Applicable) if execution.is_none() => warnings.push(
+        Some(AssessApplicability::Applicable) if evidence.execution.is_none() => warnings.push(
             "Calls evidence is unavailable for the target language; structural impact remains available, while callers, execution impact, runnable tests, and semantic risk populations are unknown"
                 .into(),
         ),
         Some(AssessApplicability::Applicable) => {}
     }
-    if let Some(warning) = execution.and_then(|execution| execution.warning.clone()) {
+    if let Some(warning) = evidence
+        .execution
+        .and_then(|execution| execution.warning.clone())
+    {
         warnings.push(warning);
     }
-    if let Some(execution) = execution
+    if let Some(execution) = evidence.execution
         && execution.depth_cutoff_nodes > 0
     {
         warnings.push(format!(
@@ -1045,17 +1116,20 @@ fn assess_warnings(
             execution.depth_cutoff_nodes
         ));
     }
-    if qualified_binding_symbols > 0 {
+    if evidence.qualified_binding_symbols > 0 {
+        let qualified_binding_symbols = evidence.qualified_binding_symbols;
         warnings.push(format!(
             "{qualified_binding_symbols} affected symbol(s) are connected through provider-resolved callable-value assignments; those are qualified possible-dispatch paths, not exact invocation records"
         ));
     }
-    if structural_depth_cutoff_nodes > 0 {
+    if evidence.structural_depth_cutoff_nodes > 0 {
+        let structural_depth_cutoff_nodes = evidence.structural_depth_cutoff_nodes;
         warnings.push(format!(
             "{structural_depth_cutoff_nodes} structural dependent node(s) exist beyond the requested depth boundary"
         ));
     }
-    if filtered_out_symbols > 0 {
+    if evidence.filtered_out_symbols > 0 {
+        let filtered_out_symbols = evidence.filtered_out_symbols;
         warnings.push(format!(
             "the reachability filter excluded {filtered_out_symbols} observed affected symbol(s)"
         ));
@@ -1248,7 +1322,7 @@ mod tests {
                 digest: "5".repeat(64),
             },
             manifest: GenerationManifest {
-                schema_version: "h00/code-intel/generation/v6".into(),
+                schema_version: crate::code_intel_publication::GENERATION_SCHEMA_VERSION.into(),
                 generation_id,
                 repository_id,
                 parent_generation_id: None,
@@ -1396,6 +1470,52 @@ mod tests {
         assert!(result.warnings.iter().any(|warning| {
             warning.contains("non-callable") && warning.contains("reference authority")
         }));
+    }
+
+    #[test]
+    fn unrelated_language_inventory_issue_does_not_qualify_rust_assess() {
+        let mut fixture = structural_fixture();
+        let inventory = std::sync::Arc::make_mut(&mut fixture.generation.project_inventory);
+        inventory.coverage = ProjectInventoryCoverage::IndexedSourcePopulationPartial;
+        inventory
+            .issues
+            .push(crate::code_intel_domain::ProjectInventoryIssue {
+                scope: crate::code_intel_domain::ProjectInventoryIssueScope::Ecosystem {
+                    language_id: crate::code_intel_domain::LanguageId::new("go"),
+                    ecosystem_id: crate::code_intel_domain::EcosystemId::new("go"),
+                },
+                code: "manifest_unsafe".into(),
+                path: "go/go.mod".into(),
+                detail: "Go-only positive issue control".into(),
+            });
+
+        let mut request = AssessRequest::new("Target");
+        request.filter = CallerFilter::All;
+        let result = query_published_assess(
+            &fixture.graph,
+            &fixture.generation,
+            &fixture.binding,
+            &request,
+        )
+        .expect("Rust Assess query with unrelated Go inventory issue");
+
+        assert_eq!(
+            result.authority.project_inventory_coverage,
+            ProjectInventoryCoverage::IndexedSourcePopulationComplete,
+            "Rust query authority must project only repository-wide and Rust issues"
+        );
+        assert_eq!(
+            result.unit_graph.coverage,
+            crate::code_intel_domain::UnitGraphCoverage::IndexedGenerationQueryProjection,
+            "the Rust unit projection must not inherit unrelated Go uncertainty"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("project inventory is partial")),
+            "unrelated Go issues must remain absent from Rust query warnings"
+        );
     }
 
     #[test]

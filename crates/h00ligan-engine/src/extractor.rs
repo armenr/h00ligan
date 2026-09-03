@@ -36,7 +36,10 @@ use crate::structural_ir::{
 /// anchored predicate — deliberately NOT `graph_query::is_test_file`'s
 /// unanchored `test_` substring check (CL-REACH-06's target).
 pub(crate) fn file_is_test(path: &str) -> bool {
-    path.contains("/tests/") || path.ends_with("/tests.rs")
+    let path = Path::new(path);
+    path.components()
+        .any(|component| component.as_os_str() == "tests")
+        || path.file_name().is_some_and(|name| name == "tests.rs")
 }
 
 /// Whether a single `cfg` KEY atom, at the given `not()` negation parity, denotes

@@ -95,7 +95,8 @@ fn registered_source_publishes_structural_truth_without_reachability_owner() {
 }
 
 #[test]
-fn mixed_reachability_scope_keeps_structural_only_source_visible_without_global_downgrade() {
+fn mixed_reachability_scope_keeps_structural_only_source_visible_without_erasing_classified_scope()
+{
     let temporary = TempDir::new().expect("scratch workspace");
     let root = temporary.path().join("repo");
     let data_dir = temporary.path().join("data");
@@ -148,8 +149,16 @@ fn mixed_reachability_scope_keeps_structural_only_source_visible_without_global_
         "the structural-only document must remain explicitly unclassified: {overview}"
     );
     assert_eq!(
-        overview["health_status"], "unavailable",
-        "missing Calls authority may withhold health, but must not erase the independently classified Go unit: {overview}"
+        overview["health_status"], "unclassified",
+        "the aggregate label must disclose source outside the classified scope without erasing the independently classified Go evidence: {overview}"
+    );
+    assert_eq!(overview["health_action_needed"], true, "{overview}");
+    assert!(
+        overview["health_guidance"]
+            .as_str()
+            .is_some_and(|guidance| guidance.contains("project ownership")
+                && guidance.contains("same unchanged indexing request")),
+        "aggregate guidance must name the owning seam without prescribing a blind retry: {overview}"
     );
 
     let status = h00ligan(&root, &data_dir)
@@ -163,6 +172,10 @@ fn mixed_reachability_scope_keeps_structural_only_source_visible_without_global_
             .as_u64()
             .is_some_and(|count| count > 0),
         "positive control: the mixed graph really contains source outside the classified scope: {status}"
+    );
+    assert!(
+        status["reachability"].get("dead").is_none(),
+        "structured Status must withhold aggregate deadness while any indexed source remains unclassified: {status}"
     );
     assert_eq!(
         status["classification_currency"]["current"], true,

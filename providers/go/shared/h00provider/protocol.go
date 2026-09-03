@@ -21,14 +21,15 @@ import (
 )
 
 const (
-	Protocol                = "h00/semantic-provider/v13"
-	SemanticInputsSchema    = "h00/semantic-provider/semantic-inputs/v3"
+	Protocol                = "h00/semantic-provider/v15"
+	SemanticInputsSchema    = "h00/semantic-provider/semantic-inputs/v4"
 	MaxFrameBytes           = 128 * 1024 * 1024
-	MaxMetadataBytes        = 1024 * 1024
+	MaxMetadataBytes        = 4 * 1024 * 1024
 	MaxAttachments          = 4096
 	MaxAttachmentBytes      = 64 * 1024 * 1024
 	MaxTotalAttachmentBytes = 120 * 1024 * 1024
 	MaxDocumentPaths        = 4096
+	MaxSemanticInputPaths   = 8192
 	MaxOutstandingRequests  = 64
 	ProviderParentPIDEnv    = "H00_PROVIDER_PARENT_PID"
 	maxSemanticInputEntries = 2_000_000
@@ -36,11 +37,11 @@ const (
 )
 
 var (
-	ProviderFrameMagic             = [8]byte{'H', '0', '0', 'S', 'P', '1', '3', 0}
+	ProviderFrameMagic             = [8]byte{'H', '0', '0', 'S', 'P', '1', '5', 0}
 	providerRuntimeConfigurationID = []byte("h00/semantic-provider/runtime-configuration/v1\x00")
 	providerSourcePopulationID     = []byte("h00/semantic-provider/source-population/v1\x00")
-	providerSemanticPathID         = []byte("h00/semantic-provider/semantic-path/v2\x00")
-	providerSemanticInputsDigestID = []byte("h00/semantic-provider/semantic-inputs-digest/v3\x00")
+	providerSemanticPathID         = []byte("h00/semantic-provider/semantic-path/v3\x00")
+	providerSemanticInputsDigestID = []byte("h00/semantic-provider/semantic-inputs-digest/v4\x00")
 )
 
 type SourceComponent struct {
@@ -65,6 +66,7 @@ type FrameLimits struct {
 	MaxAttachmentBytes      int `json:"max_attachment_bytes"`
 	MaxTotalAttachmentBytes int `json:"max_total_attachment_bytes"`
 	MaxDocumentPaths        int `json:"max_document_paths"`
+	MaxSemanticInputPaths   int `json:"max_semantic_input_paths"`
 	MaxOutstandingRequests  int `json:"max_outstanding_requests"`
 }
 
@@ -76,6 +78,7 @@ func Limits() FrameLimits {
 		MaxAttachmentBytes:      MaxAttachmentBytes,
 		MaxTotalAttachmentBytes: MaxTotalAttachmentBytes,
 		MaxDocumentPaths:        MaxDocumentPaths,
+		MaxSemanticInputPaths:   MaxSemanticInputPaths,
 		MaxOutstandingRequests:  MaxOutstandingRequests,
 	}
 }
@@ -107,6 +110,7 @@ type SourceIdentity struct {
 }
 
 type SemanticPathInput struct {
+	Root           string `json:"root"`
 	Path           string `json:"path"`
 	Kind           string `json:"kind"`
 	IdentitySHA256 string `json:"identity_sha256"`
@@ -398,18 +402,21 @@ func SourcePopulationSHA256(sources []SourceIdentity) (string, error) {
 
 func SemanticInputsSHA256(inputs SemanticInputs) (string, error) {
 	if inputs.SchemaVersion != SemanticInputsSchema || inputs.Coverage != "complete" ||
-		len(inputs.Issues) != 0 || len(inputs.Paths) > MaxDocumentPaths ||
-		len(inputs.Environment) > MaxDocumentPaths {
+		len(inputs.Issues) != 0 || len(inputs.Paths) > MaxSemanticInputPaths ||
+		len(inputs.Environment) > MaxSemanticInputPaths {
 		return "", fmt.Errorf("semantic input manifest is not complete")
 	}
 	hasher := sha256.New()
 	HashField(hasher, providerSemanticInputsDigestID)
 	HashField(hasher, []byte("complete"))
+	previousRootRank := -1
 	previousPath := ""
 	var totalEntries uint64
 	var totalBytes uint64
 	for _, input := range inputs.Paths {
-		if input.Path <= previousPath || !SafeSemanticPath(input.Path) ||
+		root, rootRank, ok := semanticPathRoot(input.Root)
+		if !ok || (previousRootRank >= 0 && (rootRank < previousRootRank || (rootRank == previousRootRank && input.Path <= previousPath))) ||
+			!SafeSemanticPath(input.Path) ||
 			!IsSHA256(input.IdentitySHA256) || !validSemanticPathInput(input) {
 			return "", fmt.Errorf("semantic input paths are not canonical")
 		}
@@ -419,7 +426,9 @@ func SemanticInputsSHA256(inputs SemanticInputs) (string, error) {
 		}
 		totalEntries += input.EntryCount
 		totalBytes += input.ByteLength
+		previousRootRank = rootRank
 		previousPath = input.Path
+		HashField(hasher, []byte(root))
 		HashField(hasher, []byte(input.Path))
 		HashField(hasher, []byte(input.Kind))
 		HashField(hasher, []byte(input.IdentitySHA256))
@@ -450,14 +459,34 @@ func SemanticInputsSHA256(inputs SemanticInputs) (string, error) {
 }
 
 func validSemanticPathInput(input SemanticPathInput) bool {
+	root, _, ok := semanticPathRoot(input.Root)
+	if !ok || (root != "repository" && input.Path == ".") {
+		return false
+	}
 	switch input.Kind {
 	case "missing":
 		return input.EntryCount == 0 && input.ByteLength == 0
 	case "file", "directory", "directory_listing":
+		if root != "repository" && input.Kind != "file" {
+			return false
+		}
 		return input.EntryCount > 0 && input.EntryCount <= maxSemanticInputEntries &&
 			input.ByteLength <= maxSemanticInputBytes
 	default:
 		return false
+	}
+}
+
+func semanticPathRoot(value string) (string, int, bool) {
+	switch value {
+	case "repository":
+		return "repository", 0, true
+	case "git_worktree":
+		return value, 1, true
+	case "git_common":
+		return value, 2, true
+	default:
+		return "", 0, false
 	}
 }
 
@@ -498,6 +527,7 @@ func HashSemanticPath(repositoryRoot, relative string) (SemanticPathInput, error
 	}
 	hasher := sha256.New()
 	HashField(hasher, providerSemanticPathID)
+	HashField(hasher, []byte("repository"))
 	HashField(hasher, nil)
 	resolution, err := resolveSemanticPath(repositoryRoot, absolute)
 	if err != nil {
@@ -510,7 +540,7 @@ func HashSemanticPath(repositoryRoot, relative string) (SemanticPathInput, error
 		if currentErr != nil || current != resolution {
 			return SemanticPathInput{}, fmt.Errorf("semantic input changed while hashing: %s", relative)
 		}
-		return SemanticPathInput{Path: relative, Kind: "missing", IdentitySHA256: hex.EncodeToString(hasher.Sum(nil))}, nil
+		return SemanticPathInput{Root: "repository", Path: relative, Kind: "missing", IdentitySHA256: hex.EncodeToString(hasher.Sum(nil))}, nil
 	}
 	before, err := os.Stat(absolute)
 	if err != nil {
@@ -518,6 +548,7 @@ func HashSemanticPath(repositoryRoot, relative string) (SemanticPathInput, error
 	}
 	stamp := semanticMetadataStamp(before)
 	var input SemanticPathInput
+	input.Root = "repository"
 	input.Path = relative
 	switch {
 	case before.Mode().IsRegular():

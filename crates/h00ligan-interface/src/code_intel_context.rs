@@ -282,13 +282,17 @@ pub struct CodeIntelSnapshot {
 /// boundaries add the independently observed relation to the current
 /// worktree without rewriting generation-scoped authority.
 trait GenerationBoundResult {
+    const OPERATION: &'static str;
+
     fn repository_mut(&mut self) -> &mut h00ligan_engine::code_intel_domain::RepositoryBinding;
     fn warnings_mut(&mut self) -> &mut Vec<String>;
 }
 
 macro_rules! generation_bound_result {
-    ($result:ty) => {
+    ($result:ty, $operation:literal) => {
         impl GenerationBoundResult for $result {
+            const OPERATION: &'static str = $operation;
+
             fn repository_mut(
                 &mut self,
             ) -> &mut h00ligan_engine::code_intel_domain::RepositoryBinding {
@@ -302,18 +306,29 @@ macro_rules! generation_bound_result {
     };
 }
 
-generation_bound_result!(h00ligan_engine::code_intel_find::ExactFindResult);
-generation_bound_result!(h00ligan_engine::code_intel_assess::ExactAssessResult);
-generation_bound_result!(h00ligan_engine::code_intel_calls::ExactCallsResult);
-generation_bound_result!(h00ligan_engine::code_intel_tests::ExactTestsResult);
-generation_bound_result!(h00ligan_engine::code_intel_dead::ExactDeadResult);
-generation_bound_result!(h00ligan_engine::code_intel_type::ExactTypeResult);
-generation_bound_result!(h00ligan_engine::code_intel_read::ExactReadResult);
-generation_bound_result!(h00ligan_engine::code_intel_overview::ExactOverviewResult);
-generation_bound_result!(h00ligan_engine::code_intel_audit::ExactAuditResult);
-generation_bound_result!(h00ligan_engine::code_intel_dependencies::ExactDependenciesResult);
+generation_bound_result!(h00ligan_engine::code_intel_find::ExactFindResult, "find");
+generation_bound_result!(
+    h00ligan_engine::code_intel_assess::ExactAssessResult,
+    "assess"
+);
+generation_bound_result!(h00ligan_engine::code_intel_calls::ExactCallsResult, "calls");
+generation_bound_result!(h00ligan_engine::code_intel_tests::ExactTestsResult, "tests");
+generation_bound_result!(h00ligan_engine::code_intel_dead::ExactDeadResult, "dead");
+generation_bound_result!(h00ligan_engine::code_intel_type::ExactTypeResult, "type");
+generation_bound_result!(h00ligan_engine::code_intel_read::ExactReadResult, "read");
+generation_bound_result!(
+    h00ligan_engine::code_intel_overview::ExactOverviewResult,
+    "overview"
+);
+generation_bound_result!(h00ligan_engine::code_intel_audit::ExactAuditResult, "audit");
+generation_bound_result!(
+    h00ligan_engine::code_intel_dependencies::ExactDependenciesResult,
+    "dependencies"
+);
 
 impl GenerationBoundResult for h00ligan_engine::code_intel_inspect::ExactInspectResult {
+    const OPERATION: &'static str = "inspect";
+
     fn repository_mut(&mut self) -> &mut h00ligan_engine::code_intel_domain::RepositoryBinding {
         &mut self.repository
     }
@@ -558,16 +573,42 @@ impl CodeIntelSnapshot {
             .await
     }
 
-    async fn observe_generation_result<T>(&self, binding: &ProjectBinding, mut result: T) -> T
+    async fn observe_generation_result<T>(
+        &self,
+        binding: &ProjectBinding,
+        mut result: T,
+    ) -> Result<T, h00ligan_engine::code_intel_domain::DomainError>
     where
-        T: GenerationBoundResult,
+        T: GenerationBoundResult + serde::Serialize,
     {
         let observation = self.live_input_observation(binding).await;
         if let Some(qualification) = observation.generation_qualification() {
             result.warnings_mut().push(qualification);
         }
         result.repository_mut().live_inputs = Some(observation);
-        result
+        let actual_chars = serde_json::to_string(&result)
+            .map_err(|error| {
+                h00ligan_engine::code_intel_domain::DomainError::PublishedGenerationInvalid {
+                    reason: format!(
+                        "serialize {} result after live-input observation: {error}",
+                        T::OPERATION
+                    ),
+                }
+            })?
+            .chars()
+            .count();
+        let max_chars = h00ligan_engine::code_intel_domain::MAX_CODE_INTEL_RESULT_CHARS;
+        if actual_chars > max_chars {
+            return Err(
+                h00ligan_engine::code_intel_domain::DomainError::result_too_large(
+                    T::OPERATION,
+                    actual_chars,
+                    max_chars,
+                    "Narrow the query scope or request fewer optional sections; if the smallest page still fails, required fixed metadata exceeds the product envelope",
+                ),
+            );
+        }
+        Ok(result)
     }
 
     /// Observe the current repository inputs relative to this immutable
@@ -813,7 +854,7 @@ impl CodeIntelSnapshot {
                 graph, generation, binding, request,
             )?,
         };
-        Ok(self.observe_generation_result(binding, result).await)
+        self.observe_generation_result(binding, result).await
     }
 
     /// Execute provider-backed test-root reachability over the same immutable
@@ -837,7 +878,7 @@ impl CodeIntelSnapshot {
                 graph, generation, binding, request,
             )?,
         };
-        Ok(self.observe_generation_result(binding, result).await)
+        self.observe_generation_result(binding, result).await
     }
 
     /// Execute the shared authority-qualified change-impact use case over this
@@ -859,7 +900,7 @@ impl CodeIntelSnapshot {
                 graph, generation, binding, request,
             )?,
         };
-        Ok(self.observe_generation_result(binding, result).await)
+        self.observe_generation_result(binding, result).await
     }
 
     /// Execute the shared Dead v1 use case over one immutable graph,
@@ -900,7 +941,7 @@ impl CodeIntelSnapshot {
             reachability,
             request,
         )?;
-        Ok(self.observe_generation_result(binding, result).await)
+        self.observe_generation_result(binding, result).await
     }
 
     /// Compose the bounded Inspect dossier from this process's one immutable
@@ -937,7 +978,7 @@ impl CodeIntelSnapshot {
                 .await?
             }
         };
-        Ok(self.observe_generation_result(binding, result).await)
+        self.observe_generation_result(binding, result).await
     }
 
     /// Execute the shared structural Type use case over the same graph,
@@ -954,7 +995,7 @@ impl CodeIntelSnapshot {
         let result = h00ligan_engine::code_intel_type::query_published_type(
             graph, generation, binding, request,
         )?;
-        Ok(self.observe_generation_result(binding, result).await)
+        self.observe_generation_result(binding, result).await
     }
 
     /// Execute the shared generation-bound Find use case. Mode resolution,
@@ -971,7 +1012,7 @@ impl CodeIntelSnapshot {
         let result = h00ligan_engine::code_intel_find::query_published_find(
             graph, generation, binding, request,
         )?;
-        Ok(self.observe_generation_result(binding, result).await)
+        self.observe_generation_result(binding, result).await
     }
 
     /// Execute the shared bounded Read use case over one pinned graph,
@@ -994,7 +1035,7 @@ impl CodeIntelSnapshot {
             request,
         )
         .await?;
-        Ok(self.observe_generation_result(binding, result).await)
+        self.observe_generation_result(binding, result).await
     }
 
     /// Execute the shared architecture overview and attach the same live-input
@@ -1002,6 +1043,7 @@ impl CodeIntelSnapshot {
     pub async fn query_overview(
         &self,
         binding: &ProjectBinding,
+        request: &h00ligan_engine::code_intel_overview::OverviewRequest,
     ) -> Result<
         h00ligan_engine::code_intel_overview::ExactOverviewResult,
         h00ligan_engine::code_intel_domain::DomainError,
@@ -1012,8 +1054,9 @@ impl CodeIntelSnapshot {
             generation,
             binding,
             self.reachability_evidence.get().ok(),
+            request,
         )?;
-        Ok(self.observe_generation_result(binding, result).await)
+        self.observe_generation_result(binding, result).await
     }
 
     /// Execute the shared scoped Audit use case and attach the same live-input
@@ -1034,7 +1077,7 @@ impl CodeIntelSnapshot {
             self.reachability_evidence.get().ok(),
             request,
         )?;
-        Ok(self.observe_generation_result(binding, result).await)
+        self.observe_generation_result(binding, result).await
     }
 
     /// Execute the shared direct-dependency projection with one attached
@@ -1051,7 +1094,120 @@ impl CodeIntelSnapshot {
         let result = h00ligan_engine::code_intel_dependencies::query_published_dependencies(
             graph, generation, binding, request,
         )?;
-        Ok(self.observe_generation_result(binding, result).await)
+        self.observe_generation_result(binding, result).await
+    }
+
+    /// Compare this one pinned immutable structural generation with the live
+    /// worktree. The snapshot owns the complete baseline authority join and
+    /// blocking-task lifecycle so CLI and MCP cannot assemble subtly different
+    /// graph, generation, or indexed-source populations.
+    ///
+    /// Unlike generation-bound queries, Diff already reports its live
+    /// candidate authority and per-file non-atomic consistency explicitly. It
+    /// therefore does not attach the separate generation live-input witness.
+    pub async fn query_diff(
+        &self,
+        binding: &ProjectBinding,
+        request: &h00ligan_engine::code_intel_diff::DiffRequest,
+    ) -> Result<
+        h00ligan_engine::code_intel_diff::ExactDiffResult,
+        h00ligan_engine::code_intel_domain::DomainError,
+    > {
+        self.structural_query_parts()?;
+
+        let snapshot = self.clone();
+        let binding = binding.clone();
+        let request = request.clone();
+        tokio::task::spawn_blocking(move || {
+            let (graph, generation) = snapshot.structural_query_parts()?;
+            h00ligan_engine::code_intel_diff::query_live_diff(
+                graph,
+                generation,
+                &binding,
+                snapshot.indexed_sources.authority(),
+                request,
+            )
+        })
+        .await
+        .map_err(|error| {
+            h00ligan_engine::code_intel_domain::DomainError::CandidateObservationFailed {
+                operation: "diff",
+                reason: format!("diff task join: {error}"),
+            }
+        })?
+    }
+
+    /// Execute live, ignore-aware source search and bind graph context from
+    /// this snapshot's exact immutable generation. The snapshot owns both the
+    /// blocking task boundary and the search/generation join so CLI and MCP
+    /// cannot drift in path normalization, indexed-source authority, or error
+    /// classification.
+    pub async fn query_source_search(
+        &self,
+        binding: &ProjectBinding,
+        request: &h00ligan_engine::code_intel_source_search::SourceSearchRequest,
+    ) -> Result<
+        h00ligan_engine::code_intel_source_search::ExactSourceSearchResult,
+        h00ligan_engine::code_intel_domain::DomainError,
+    > {
+        h00ligan_engine::code_intel_source_search::validate_source_search_request(request)?;
+        self.structural_query_parts()?;
+
+        let search_root = binding
+            .resolve_existing_path(Path::new(&request.path))
+            .map_err(|error| {
+                h00ligan_engine::code_intel_domain::DomainError::SourcePath(error.to_string())
+            })?;
+        let relative_path = search_root
+            .strip_prefix(binding.root())
+            .map_err(|error| {
+                h00ligan_engine::code_intel_domain::DomainError::SourcePath(error.to_string())
+            })?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let mut request = request.clone();
+        request.path = if relative_path.is_empty() {
+            ".".into()
+        } else {
+            relative_path
+        };
+
+        let snapshot = self.clone();
+        let binding = binding.clone();
+        tokio::task::spawn_blocking(move || {
+            let (graph, generation) = snapshot.structural_query_parts()?;
+            let report = h00ligan_engine::source_search::search_registered_source(
+                &binding,
+                &search_root,
+                h00ligan_engine::source_search::SourcePattern::Regex(&request.pattern),
+                h00ligan_engine::code_intel_source_search::SourceSearchOptions {
+                    max_matches: request.limit,
+                    max_matches_per_file: request.limit,
+                    context_lines: request.context_lines,
+                },
+            )
+            .map_err(|error| {
+                h00ligan_engine::code_intel_domain::DomainError::CandidateObservationFailed {
+                    operation: "source_search",
+                    reason: error,
+                }
+            })?;
+            h00ligan_engine::code_intel_source_search::bind_source_search_result(
+                graph,
+                generation,
+                &binding,
+                snapshot.indexed_sources.files(),
+                request,
+                report,
+            )
+        })
+        .await
+        .map_err(|error| {
+            h00ligan_engine::code_intel_domain::DomainError::CandidateObservationFailed {
+                operation: "source_search",
+                reason: format!("source-search task join: {error}"),
+            }
+        })?
     }
 
     /// Load one coherent generation without creating either redb file.
@@ -1711,6 +1867,80 @@ mod tests {
     use h00ligan_engine::graph_store::{GraphGenerationMetadata, GraphStore};
     use h00ligan_engine::reachability::ReachabilityClass;
 
+    #[derive(Debug, serde::Serialize)]
+    struct ProductEnvelopeProbe {
+        repository: h00ligan_engine::code_intel_domain::RepositoryBinding,
+        warnings: Vec<String>,
+        payload: String,
+    }
+
+    impl GenerationBoundResult for ProductEnvelopeProbe {
+        const OPERATION: &'static str = "product_envelope_probe";
+
+        fn repository_mut(&mut self) -> &mut h00ligan_engine::code_intel_domain::RepositoryBinding {
+            &mut self.repository
+        }
+
+        fn warnings_mut(&mut self) -> &mut Vec<String> {
+            &mut self.warnings
+        }
+    }
+
+    fn product_envelope_probe(payload_chars: usize) -> ProductEnvelopeProbe {
+        ProductEnvelopeProbe {
+            repository: h00ligan_engine::code_intel_domain::RepositoryBinding {
+                repository_id: h00ligan_engine::code_intel_domain::RepositoryId::new(
+                    "product-envelope-probe",
+                ),
+                root_label: "repository".into(),
+                live_inputs: None,
+            },
+            warnings: Vec::new(),
+            payload: "x".repeat(payload_chars),
+        }
+    }
+
+    /// FALSIFIER for machine-surface parity: both CLI JSON and MCP consume
+    /// this snapshot boundary, so no successful generation result may leave
+    /// it above the product envelope and become an MCP-only transport error.
+    #[tokio::test]
+    async fn generation_result_bound_is_owned_before_transport_dispatch() {
+        let temporary = TempDir::new().expect("temporary directory");
+        let binding = test_binding(&temporary);
+        let snapshot = CodeIntelSnapshot::unindexed();
+
+        let small = snapshot
+            .observe_generation_result(&binding, product_envelope_probe(16))
+            .await
+            .expect("known-positive bounded result");
+        assert!(small.repository.live_inputs.is_some());
+
+        let error = snapshot
+            .observe_generation_result(
+                &binding,
+                product_envelope_probe(
+                    h00ligan_engine::code_intel_domain::MAX_CODE_INTEL_RESULT_CHARS + 1,
+                ),
+            )
+            .await
+            .expect_err("oversized result must fail before either transport sees it");
+        let h00ligan_engine::code_intel_domain::DomainError::ResultTooLarge {
+            operation,
+            actual_chars,
+            max_chars,
+            ..
+        } = &error
+        else {
+            panic!("expected typed result bound, got {error}");
+        };
+        assert_eq!(*operation, "product_envelope_probe");
+        assert!(*actual_chars > *max_chars, "positive oversize control");
+        let envelope = serde_json::to_value(error.envelope()).expect("typed error envelope");
+        assert_eq!(envelope["error"]["code"], "result_too_large");
+        assert_eq!(envelope["error"]["actual_chars"], *actual_chars);
+        assert_eq!(envelope["error"]["max_chars"], *max_chars);
+    }
+
     /// FALSIFIER: requests that overlap one exact live observation may share
     /// that work, but a request arriving after completion must observe again.
     /// The first caller's cancellation is covered separately because shared
@@ -1722,7 +1952,7 @@ mod tests {
         let coordinator = Arc::new(LiveInputObservationCoordinator::default());
         let executions = Arc::new(AtomicUsize::new(0));
         let first_started = Arc::new(tokio::sync::Notify::new());
-        let release_first = Arc::new(tokio::sync::Notify::new());
+        let (release_first, release_first_receiver) = tokio::sync::oneshot::channel();
         let fallback = StalenessVerdict::Unknown {
             reason: StalenessReason::SourceVerificationFailed,
             files_checked: 0,
@@ -1732,13 +1962,14 @@ mod tests {
             let coordinator = Arc::clone(&coordinator);
             let executions = Arc::clone(&executions);
             let first_started = Arc::clone(&first_started);
-            let release_first = Arc::clone(&release_first);
             tokio::spawn(async move {
                 coordinator
                     .observe(fallback, move || async move {
                         executions.fetch_add(1, Ordering::SeqCst);
                         first_started.notify_one();
-                        release_first.notified().await;
+                        release_first_receiver
+                            .await
+                            .expect("test owns the first observation release");
                         StalenessVerdict::Fresh
                     })
                     .await
@@ -1749,20 +1980,35 @@ mod tests {
         let second = {
             let coordinator = Arc::clone(&coordinator);
             let executions = Arc::clone(&executions);
-            async move {
+            tokio::spawn(async move {
                 coordinator
                     .observe(fallback, move || async move {
                         executions.fetch_add(1, Ordering::SeqCst);
                         StalenessVerdict::Stale
                     })
                     .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let joined = coordinator
+                    .state
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|in_flight| in_flight.result.receiver_count() == 2);
+                if joined {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-        };
-        let release = async {
-            tokio::task::yield_now().await;
-            release_first.notify_waiters();
-        };
-        let (second, ()) = tokio::join!(second, release);
+        })
+        .await
+        .expect("the overlapping waiter must join the in-flight observation");
+        release_first
+            .send(())
+            .expect("release the first observation exactly once");
+        let second = second.await.expect("second observation request");
         let first = first.await.expect("first observation request");
 
         assert_eq!(first, StalenessVerdict::Fresh);
@@ -1801,7 +2047,7 @@ mod tests {
         let coordinator = Arc::new(LiveInputObservationCoordinator::default());
         let executions = Arc::new(AtomicUsize::new(0));
         let producer_started = Arc::new(tokio::sync::Notify::new());
-        let release_producer = Arc::new(tokio::sync::Notify::new());
+        let (release_producer, release_producer_receiver) = tokio::sync::oneshot::channel();
         let fallback = StalenessVerdict::Unknown {
             reason: StalenessReason::SourceVerificationFailed,
             files_checked: 0,
@@ -1811,13 +2057,14 @@ mod tests {
             let coordinator = Arc::clone(&coordinator);
             let executions = Arc::clone(&executions);
             let producer_started = Arc::clone(&producer_started);
-            let release_producer = Arc::clone(&release_producer);
             tokio::spawn(async move {
                 coordinator
                     .observe(fallback, move || async move {
                         executions.fetch_add(1, Ordering::SeqCst);
                         producer_started.notify_one();
-                        release_producer.notified().await;
+                        release_producer_receiver
+                            .await
+                            .expect("test owns the producer release");
                         StalenessVerdict::Fresh
                     })
                     .await
@@ -1861,7 +2108,9 @@ mod tests {
         })
         .await
         .expect("surviving waiter must join the in-flight observation");
-        release_producer.notify_waiters();
+        release_producer
+            .send(())
+            .expect("release the snapshot-owned observation exactly once");
 
         assert_eq!(
             surviving_waiter.await.expect("surviving request"),

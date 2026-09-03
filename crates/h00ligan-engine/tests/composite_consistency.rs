@@ -500,13 +500,13 @@ fn t_cm3_shared_stats_produce_consistent_data() {
     // Edge count should be positive
     assert!(stats.edge_count > 0, "should have edges");
 
-    // Edge kinds should include Calls and Contains
+    // Edge kinds use stable machine labels rather than Debug formatting.
     assert!(
-        stats.edge_kinds.contains_key("Calls"),
+        stats.edge_kinds.contains_key("calls"),
         "should have Calls edges"
     );
     assert!(
-        stats.edge_kinds.contains_key("Contains"),
+        stats.edge_kinds.contains_key("contains"),
         "should have Contains edges"
     );
 

@@ -548,6 +548,7 @@ impl IndexedFixture {
     pub async fn run_overview(&self) -> Result<(), String> {
         let args = OverviewArgs {
             format: "json".to_string(),
+            limit: h00ligan_engine::code_intel_overview::DEFAULT_OVERVIEW_COLLECTION_LIMIT,
         };
         h00ligan::composite_cmd::run_overview(args, &self.binding())
             .await

@@ -25,12 +25,20 @@ impl LanguageExtractor for PythonExtractor {
         "python"
     }
 
+    fn source_file_is_test(&self, file_path: &str) -> bool {
+        python_test_file(file_path)
+    }
+
     fn ts_language_for_path(&self, _file_path: &str) -> tree_sitter::Language {
         tree_sitter_python::LANGUAGE.into()
     }
 
     fn named_callable_declaration_kinds(&self) -> &'static [&'static str] {
         &["function_definition"]
+    }
+
+    fn anonymous_callable_declaration_kinds(&self) -> &'static [&'static str] {
+        &["lambda"]
     }
 
     fn named_call_syntax<'tree>(&self, call: Node<'tree>) -> Option<NamedCallSyntax<'tree>> {

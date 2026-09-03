@@ -73,7 +73,7 @@ const REPOSITORY_SCHEMA: &str = "h00/code-intel/repository/v1";
 // The generation envelope versions every nested persisted contract. Bump it
 // whenever an embedded authority document changes incompatibly so readers can
 // distinguish authenticated obsolete derived state from damaged control data.
-const GENERATION_SCHEMA: &str = "h00/code-intel/generation/v9";
+pub const GENERATION_SCHEMA_VERSION: &str = "h00/code-intel/generation/v9";
 const HEAD_SCHEMA: &str = "h00/code-intel/head/v4";
 const MAX_CONTROL_FILE_BYTES: u64 = 64 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
@@ -610,11 +610,16 @@ fn enforce_capability_floor(
     }
 }
 
-/// Telemetry and immutable publication produced by one fresh indexing run.
+/// Telemetry and immutable publication selected or produced by one indexing run.
 #[derive(Debug)]
 pub struct PublishedIndexGeneration {
     pub telemetry: IndexReport,
     pub publication: PublishedGeneration,
+    /// Exact bounded control identity for the selected publication. Fresh
+    /// writers capture it while the one-writer lock is still held. `None` on
+    /// a durable write means its identity could not be re-read; consumers must
+    /// then fail closed rather than infer ownership from timing or sequence.
+    pub(crate) publication_control_token: Option<PublicationControlToken>,
     /// Compact, generation-authoritative Calls assessment computed while the
     /// exact graph, receipts, provider payloads, and inventory are co-resident.
     /// Terminal operation receipts retain this summary instead of retaining
@@ -1666,7 +1671,7 @@ impl SemanticPublisher {
         let manifest_write_start = Instant::now();
         let parent_generation_id = current.map(|resolved| resolved.manifest.generation_id.clone());
         let mut manifest = GenerationManifest {
-            schema_version: GENERATION_SCHEMA.into(),
+            schema_version: GENERATION_SCHEMA_VERSION.into(),
             generation_id: GenerationId::new("pending"),
             repository_id: self.repository.body.repository_id.clone(),
             parent_generation_id,
@@ -2292,19 +2297,22 @@ pub(crate) async fn publish_prepared_index_generation_with_live_basis(
         ),
         Some(publish_duration),
     );
-    let authority = publication_control_token(&publisher.publication_root.path, &config.root)
-        .ok()
-        .map(|control_token| LiveGenerationAuthority {
-            resolved: Arc::new(ResolvedGeneration {
-                slot: publication.slot,
-                head: publication.head.clone(),
-                manifest: publication.manifest.clone(),
-                project_inventory: Arc::clone(&publication.project_inventory),
-                provider_payloads: publication.provider_payloads.clone(),
-                database_path: publication.database_path.clone(),
-            }),
-            control_token,
-        });
+    let publication_control_token =
+        publication_control_token(&publisher.publication_root.path, &config.root).ok();
+    let authority =
+        publication_control_token
+            .clone()
+            .map(|control_token| LiveGenerationAuthority {
+                resolved: Arc::new(ResolvedGeneration {
+                    slot: publication.slot,
+                    head: publication.head.clone(),
+                    manifest: publication.manifest.clone(),
+                    project_inventory: Arc::clone(&publication.project_inventory),
+                    provider_payloads: publication.provider_payloads.clone(),
+                    database_path: publication.database_path.clone(),
+                }),
+                control_token,
+            });
     let calls_authority = assess_calls_capability(
         &structural_basis.graph,
         &publication.manifest.receipts,
@@ -2328,6 +2336,7 @@ pub(crate) async fn publish_prepared_index_generation_with_live_basis(
     let published = PublishedIndexGeneration {
         telemetry: *telemetry,
         publication,
+        publication_control_token,
         calls_authority,
         callable_liveness_authority,
         publication_timings,
@@ -3053,10 +3062,10 @@ fn validate_generation_profiled(
                     path: database_path.clone(),
                     reason: format!("parse generation manifest: {error}"),
                 })?;
-            if manifest.schema_version != GENERATION_SCHEMA {
+            if manifest.schema_version != GENERATION_SCHEMA_VERSION {
                 return Err(PublicationError::IncompatibleGenerationSchema {
                     path: database_path.clone(),
-                    expected: GENERATION_SCHEMA.into(),
+                    expected: GENERATION_SCHEMA_VERSION.into(),
                     actual: manifest.schema_version,
                 });
             }
@@ -3198,7 +3207,7 @@ fn validate_workspace(
 }
 
 fn validate_manifest(manifest: &mut GenerationManifest) -> Result<(), PublicationError> {
-    if manifest.schema_version != GENERATION_SCHEMA {
+    if manifest.schema_version != GENERATION_SCHEMA_VERSION {
         return Err(PublicationError::InvalidDraft(format!(
             "unsupported generation schema {}",
             manifest.schema_version
@@ -3667,6 +3676,7 @@ const fn provider_payload_record_count(payload: &ProviderPayload) -> usize {
             .saturating_add(payload.documents.len())
             .saturating_add(payload.symbols.len())
             .saturating_add(payload.calls.len())
+            .saturating_add(payload.root_invocations.len())
             .saturating_add(payload.callable_bindings.len())
             .saturating_add(payload.coverage_exclusions.len()),
         ProviderPayload::CallableLiveness(payload) => 1usize
@@ -5498,8 +5508,8 @@ mod tests {
     };
     use crate::code_intel_payload::{
         CallsProviderPayload, NormalizedSourceSpan, ProviderCall, ProviderDocument,
-        ProviderLocation, ProviderSymbol, ProviderSymbolRole, canonical_provider_payload_bytes,
-        provider_payload_descriptor,
+        ProviderLocation, ProviderRootInvocation, ProviderSymbol, ProviderSymbolRole,
+        canonical_provider_payload_bytes, provider_payload_descriptor,
     };
     use crate::graph::{GraphNode, KnowledgeGraph};
     use crate::graph_store::{
@@ -5760,9 +5770,30 @@ mod tests {
                 callee_symbol_id,
                 call_site: location(8, 14),
             }],
+            root_invocations: Vec::new(),
             callable_bindings: Vec::new(),
             coverage_exclusions: Vec::new(),
         })
+    }
+
+    #[test]
+    fn provider_payload_record_count_includes_root_invocations() {
+        let mut payload =
+            populated_calls_payload(complete_receipt("calls"), "src/lib.rs", "record-count");
+        let before = provider_payload_record_count(&payload);
+        let ProviderPayload::Calls(calls) = &mut payload else {
+            unreachable!("Calls fixture")
+        };
+        calls.root_invocations.push(ProviderRootInvocation {
+            callee_symbol_id: calls.calls[0].callee_symbol_id.clone(),
+            call_site: calls.calls[0].call_site.clone(),
+            context: crate::code_intel_domain::ExecutionRootContext::ModuleInitialization,
+        });
+        assert_eq!(
+            provider_payload_record_count(&payload),
+            before + 1,
+            "telemetry must count every canonical provider-evidence record"
+        );
     }
 
     fn graph_joining_populated_calls_payload(payload: &ProviderPayload) -> KnowledgeGraph {
@@ -8172,7 +8203,7 @@ mod tests {
             resolved.manifest.generation_id,
             replacement.manifest.generation_id
         );
-        assert_eq!(resolved.manifest.schema_version, GENERATION_SCHEMA);
+        assert_eq!(resolved.manifest.schema_version, GENERATION_SCHEMA_VERSION);
         assert_eq!(
             sha256_file(&repository_path).expect("repository digest after replacement"),
             repository_before,

@@ -55,6 +55,31 @@ fn h00ligan() -> Command {
     Command::new(env!("CARGO_BIN_EXE_h00ligan"))
 }
 
+#[test]
+fn readme_names_the_live_overview_and_audit_schemas() {
+    let readme = include_str!("../README.md");
+    for schema in [
+        h00ligan_engine::code_intel_overview::OVERVIEW_SCHEMA_VERSION,
+        h00ligan_engine::code_intel_audit::AUDIT_SCHEMA_VERSION,
+    ] {
+        assert_eq!(
+            readme.matches(schema).count(),
+            1,
+            "README must name live schema {schema} exactly once"
+        );
+    }
+    for retired in [
+        "h00/code-intel/overview/v2",
+        "h00/code-intel/overview/v3",
+        "h00/code-intel/audit/v1",
+    ] {
+        assert!(
+            !readme.contains(retired),
+            "README must not advertise retired schema {retired}"
+        );
+    }
+}
+
 #[cfg(unix)]
 fn canonical_fixture_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path)
@@ -1402,6 +1427,7 @@ async fn seed_calls_topology_bundle_with_documents_and_node_overrides_and_provid
             .collect(),
         symbols,
         calls,
+        root_invocations: Vec::new(),
         callable_bindings: Vec::new(),
         coverage_exclusions,
     });
@@ -1649,6 +1675,7 @@ async fn publish_metadata_authority_fixture(root: &Path, data_dir: &Path) {
             call_owner_extent: Some(location(extent)),
         }],
         calls: Vec::new(),
+        root_invocations: Vec::new(),
         callable_bindings: Vec::new(),
         coverage_exclusions: Vec::new(),
     });
@@ -1857,6 +1884,7 @@ async fn publish_mixed_calls_authority_fixture_with_configuration(
             call_owner_extent: Some(location(extent)),
         }],
         calls: Vec::new(),
+        root_invocations: Vec::new(),
         callable_bindings: Vec::new(),
         coverage_exclusions: Vec::new(),
     });
@@ -2297,6 +2325,16 @@ fn call_mcp(
     name: &str,
     arguments: Value,
 ) -> Value {
+    call_mcp_raw(stdin, stdout, id, name, arguments).0
+}
+
+fn call_mcp_raw(
+    stdin: &mut ChildStdin,
+    stdout: &mut BufReader<ChildStdout>,
+    id: u64,
+    name: &str,
+    arguments: Value,
+) -> (Value, String) {
     writeln!(
         stdin,
         "{}",
@@ -2304,7 +2342,14 @@ fn call_mcp(
             "jsonrpc": "2.0",
             "id": id,
             "method": "tools/call",
-            "params": {"name": name, "arguments": arguments},
+            "params": {
+                "name": name,
+                "arguments": arguments,
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": h00ligan_interface::mcp::CURRENT_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            },
         })
     )
     .expect("write MCP request");
@@ -2313,15 +2358,31 @@ fn call_mcp(
     let mut line = String::new();
     stdout.read_line(&mut line).expect("read MCP response");
     assert!(!line.is_empty(), "MCP closed before response {id}");
-    serde_json::from_str(&line).expect("JSON-RPC response")
+    let response = serde_json::from_str(&line).expect("JSON-RPC response");
+    (response, line)
 }
 
-fn mcp_text_payload(response: &Value) -> Value {
+fn mcp_typed_payload(response: &Value) -> Value {
     let text = response["result"]["content"][0]["text"]
         .as_str()
-        .unwrap_or_else(|| panic!("missing MCP text fallback: {response}"));
-    serde_json::from_str(text)
-        .unwrap_or_else(|error| panic!("MCP text fallback must contain JSON ({error}): {response}"))
+        .unwrap_or_else(|| panic!("missing MCP text content: {response}"));
+    if let Some(structured) = response["result"].get("structuredContent") {
+        if response["result"]["isError"] == true {
+            let text_value: Value = serde_json::from_str(text).unwrap_or_else(|error| {
+                panic!("current MCP error text must contain JSON ({error}): {response}")
+            });
+            assert_eq!(&text_value, structured, "typed MCP error parity");
+        } else {
+            assert_eq!(
+                text, "Full typed h00ligan result is available in structuredContent.",
+                "current MCP success must not duplicate the full typed payload"
+            );
+        }
+        return structured.clone();
+    }
+    serde_json::from_str(text).unwrap_or_else(|error| {
+        panic!("legacy MCP text content must contain JSON ({error}): {response}")
+    })
 }
 
 fn call_mcp_reindex_terminal(
@@ -2335,7 +2396,7 @@ fn call_mcp_reindex_terminal(
         started_response["result"]["isError"], true,
         "reindex must return an operation receipt: {started_response}"
     );
-    let started = mcp_text_payload(&started_response);
+    let started = mcp_typed_payload(&started_response);
     assert_eq!(started["terminal"], false, "{started}");
     let operation_id = started["operation_id"]
         .as_str()
@@ -2356,7 +2417,7 @@ fn call_mcp_reindex_terminal(
             json!({"operation_id": operation_id}),
         );
         assert_ne!(response["result"]["isError"], true, "{response}");
-        let terminal = mcp_text_payload(&response);
+        let terminal = mcp_typed_payload(&response);
         if terminal["terminal"] == true {
             return terminal;
         }
@@ -2733,7 +2794,7 @@ async fn shipped_tests_pages_one_shared_result_through_cli_and_mcp() {
         without_ephemeral_cursor_lease(mcp_first),
         "CLI and MCP must serialize one shared stable Tests result; independently minted cursor leases may differ"
     );
-    assert_eq!(cli_first["schema_version"], "h00/code-intel/tests/v2");
+    assert_eq!(cli_first["schema_version"], "h00/code-intel/tests/v4");
     assert_eq!(cli_first["generation_id"], seeded.generation_id);
     assert_eq!(
         cli_first["repository"]["repository_id"],
@@ -3257,7 +3318,7 @@ async fn shipped_cli_and_mcp_type_share_exact_field_cardinality() {
         json!({"symbol": "Counter", "file": "src/lib.rs"}),
     );
     let mcp_payload = mcp_response["result"]["structuredContent"].clone();
-    let mcp_text = mcp_text_payload(&mcp_response);
+    let mcp_text = mcp_typed_payload(&mcp_response);
     let mcp_output = stop_mcp(child, stdin);
     assert!(
         mcp_output.status.success(),
@@ -3270,9 +3331,9 @@ async fn shipped_cli_and_mcp_type_share_exact_field_cardinality() {
     );
     assert_eq!(
         mcp_text, mcp_payload,
-        "MCP text fallback must serialize that same Type result"
+        "MCP typed payload must serialize that same Type result"
     );
-    assert_eq!(cli_payload["schema_version"], "h00/code-intel/type/v1");
+    assert_eq!(cli_payload["schema_version"], "h00/code-intel/type/v2");
     assert_eq!(cli_payload["capability"], "structural_graph");
     assert_eq!(cli_payload["resolved_type"]["name"], "Counter");
     assert_eq!(cli_payload["totals"]["fields"], 1);
@@ -3288,6 +3349,580 @@ async fn shipped_cli_and_mcp_type_share_exact_field_cardinality() {
         roles,
         ["field", "field_type_reference"],
         "positive control: the shared result carries both independently measured structural roles"
+    );
+}
+
+#[tokio::test]
+async fn shipped_type_preserves_selected_truth_under_partial_language_coverage() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let root = temporary.path().join("repo");
+    std::fs::create_dir_all(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"type-partial-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("fixture manifest");
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub struct SelectedType { pub value: usize }\n",
+    )
+    .expect("represented type source");
+    std::fs::write(
+        root.join("src/broken.rs"),
+        "pub fn unfinished() -> usize {\n    let value =\n",
+    )
+    .expect("unrepresented source control");
+    let data_dir = temporary.path().join("bundle");
+
+    let indexed = h00ligan()
+        .arg("--root")
+        .arg(&root)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("index")
+        .output()
+        .expect("publish explicitly partial structural generation");
+    assert!(
+        indexed.status.success(),
+        "partial structural indexing must retain represented facts: stdout={} stderr={}",
+        String::from_utf8_lossy(&indexed.stdout),
+        String::from_utf8_lossy(&indexed.stderr),
+    );
+    let generation = resolve_generation(&data_dir, &root).expect("partial generation");
+    let receipt = generation
+        .manifest
+        .receipts
+        .iter()
+        .find(|receipt| receipt.capability_id == "structural_graph")
+        .expect("positive structural receipt control");
+    assert_eq!(receipt.status, CapabilityStatus::Partial);
+    assert_eq!(
+        receipt.reason_code.as_deref(),
+        Some("source_extraction_failed")
+    );
+
+    let cli = h00ligan()
+        .arg("--root")
+        .arg(&root)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args([
+            "type",
+            "SelectedType",
+            "--file",
+            "src/lib.rs",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("query represented type under partial language authority");
+    assert!(
+        cli.status.success(),
+        "an unrelated structural gap must qualify rather than suppress the represented type: stdout={} stderr={}",
+        String::from_utf8_lossy(&cli.stdout),
+        String::from_utf8_lossy(&cli.stderr),
+    );
+    let raw_cli = std::str::from_utf8(&cli.stdout)
+        .expect("CLI machine JSON is UTF-8")
+        .trim_end_matches(['\r', '\n']);
+    let raw_cli_chars = raw_cli.chars().count();
+    let cli = stdout_json(&cli);
+    assert_eq!(cli["schema_version"], "h00/code-intel/type/v2");
+    assert_eq!(cli["resolved_type"]["name"], "SelectedType");
+    assert_eq!(cli["totals"]["fields"], 1);
+    assert_eq!(cli["authority"]["status"], "qualified");
+    assert_eq!(cli["authority"]["population_complete"], false);
+    assert_eq!(cli["authority"]["structural_graph"]["status"], "partial");
+    assert_eq!(
+        cli["authority"]["structural_graph"]["languages"][0]["gaps"][0]["reason_code"],
+        "source_extraction_failed"
+    );
+    assert!(
+        cli["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings
+                .iter()
+                .any(|warning| warning.as_str().is_some_and(|warning| warning
+                    .contains("totals and missing-member conclusions are incomplete")))),
+        "qualified Type must explain which conclusions are unsafe: {cli}"
+    );
+
+    let (child, mut stdin, mut stdout) = spawn_mcp(&root, &data_dir);
+    let (mcp, raw_mcp) = call_mcp_raw(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "type",
+        json!({"symbol": "SelectedType", "file": "src/lib.rs"}),
+    );
+    let stopped = stop_mcp(child, stdin);
+    assert!(stopped.status.success());
+    let raw_mcp = raw_mcp.trim_end_matches(['\r', '\n']);
+    let raw_mcp_chars = raw_mcp.chars().count();
+    assert!(
+        raw_cli_chars <= h00ligan_engine::code_intel_domain::MAX_CODE_INTEL_RESULT_CHARS
+            && raw_mcp_chars <= h00ligan_interface::mcp::MAX_TOOL_RESULT_CHARS,
+        "actual machine surfaces exceed their envelopes: CLI={raw_cli_chars} chars, MCP={raw_mcp_chars} chars"
+    );
+    assert_ne!(mcp["result"]["isError"], true, "{mcp}");
+    assert_eq!(mcp["result"]["structuredContent"], cli);
+    assert_eq!(mcp_typed_payload(&mcp), cli);
+}
+
+#[test]
+fn shipped_read_exact_selector_owns_identity_under_unrelated_partial_language_coverage() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let root = temporary.path().join("repo");
+    std::fs::create_dir_all(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"read-exact-partial-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("fixture manifest");
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn selected_target() -> usize { 42 }\n",
+    )
+    .expect("represented target source");
+    std::fs::write(
+        root.join("src/broken.rs"),
+        "pub fn unfinished() -> usize {\n    let value =\n",
+    )
+    .expect("unrepresented source control");
+    let data_dir = temporary.path().join("bundle");
+
+    let indexed = h00ligan()
+        .arg("--root")
+        .arg(&root)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("index")
+        .output()
+        .expect("publish explicitly partial structural generation");
+    assert!(
+        indexed.status.success(),
+        "partial structural indexing must retain the represented target: stdout={} stderr={}",
+        String::from_utf8_lossy(&indexed.stdout),
+        String::from_utf8_lossy(&indexed.stderr),
+    );
+    let generation = resolve_generation(&data_dir, &root).expect("partial generation");
+    let receipt = generation
+        .manifest
+        .receipts
+        .iter()
+        .find(|receipt| receipt.capability_id == "structural_graph")
+        .expect("positive structural receipt control");
+    assert_eq!(receipt.status, CapabilityStatus::Partial);
+    assert_eq!(
+        receipt.reason_code.as_deref(),
+        Some("source_extraction_failed")
+    );
+
+    let selector = find_exact_selector(&root, &data_dir, "selected_target");
+    let bare_name = stdout_json(
+        &h00ligan()
+            .arg("--root")
+            .arg(&root)
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .args(["read", "selected_target", "--format", "json"])
+            .output()
+            .expect("read by repository-wide name under partial coverage"),
+    );
+    assert_eq!(bare_name["authority"]["status"], "qualified");
+    assert_eq!(
+        bare_name["authority"]["selection_scope"],
+        "repository_graph"
+    );
+    assert!(bare_name["warnings"].as_array().is_some_and(|warnings| {
+        warnings.iter().any(|warning| {
+            warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("Bare-symbol selection"))
+        })
+    }));
+    assert!(bare_name["warnings"].as_array().is_some_and(|warnings| {
+        warnings.iter().any(|warning| {
+            warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("returned resolved_symbol.symbol_id"))
+        })
+    }));
+
+    let exact_output = h00ligan()
+        .arg("--root")
+        .arg(&root)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["read", &selector, "--format", "json"])
+        .output()
+        .expect("read by exact generation-bound symbol identity");
+    assert!(
+        exact_output.status.success(),
+        "exact-ID Read must retain the represented source: stdout={} stderr={}",
+        String::from_utf8_lossy(&exact_output.stdout),
+        String::from_utf8_lossy(&exact_output.stderr),
+    );
+    let exact = stdout_json(&exact_output);
+    assert_eq!(exact["resolved_symbol"]["symbol_id"], selector);
+    assert_eq!(exact["authority"]["selection_scope"], "exact_symbol_id");
+    assert_eq!(
+        exact["authority"]["selected_symbol_identity_complete"],
+        true
+    );
+    assert_eq!(exact["authority"]["structural_graph"]["status"], "partial");
+    assert_eq!(
+        exact["authority"]["status"], "complete",
+        "an exact repository/generation/symbol identity must not inherit an unrelated language-wide extraction gap: {exact}"
+    );
+    assert!(
+        exact["warnings"]
+            .as_array()
+            .is_none_or(|warnings| warnings.iter().all(|warning| !warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("Bare-symbol selection")))),
+        "exact-ID selection must not ask for its already-implied file selector: {exact}"
+    );
+
+    let exact_file = stdout_json(
+        &h00ligan()
+            .arg("--root")
+            .arg(&root)
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .args([
+                "read",
+                &selector,
+                "--file",
+                "src/lib.rs",
+                "--format",
+                "json",
+            ])
+            .output()
+            .expect("read exact identity with redundant file selector"),
+    );
+    assert_eq!(exact_file["authority"]["status"], "complete");
+    for key in [
+        "source",
+        "source_span",
+        "resolved_symbol",
+        "indexed_file_blake3",
+        "observed_file_blake3",
+        "published_definition_blake3",
+    ] {
+        let (exact_value, exact_file_value) = if key.ends_with("blake3") {
+            (&exact["authority"][key], &exact_file["authority"][key])
+        } else {
+            (&exact[key], &exact_file[key])
+        };
+        assert_eq!(
+            exact_value, exact_file_value,
+            "the redundant file selector changed exact Read evidence at {key}"
+        );
+    }
+
+    let (child, mut stdin, mut stdout) = spawn_mcp(&root, &data_dir);
+    let mcp = call_mcp(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "read",
+        json!({"symbol": selector}),
+    );
+    let stopped = stop_mcp(child, stdin);
+    assert!(stopped.status.success());
+    assert_eq!(
+        mcp["result"]["structuredContent"], exact,
+        "CLI and MCP must share exact-ID selection authority"
+    );
+    assert_eq!(mcp_typed_payload(&mcp), exact);
+}
+
+#[test]
+fn shipped_read_exact_file_qualifies_a_same_file_structural_capture_gap() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let root = temporary.path().join("repo");
+    std::fs::create_dir_all(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"read-file-capture-gap-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("fixture manifest");
+    std::fs::write(
+        root.join("src/lib.rs"),
+        concat!(
+            "pub fn selected_target() -> usize { 42 }\n",
+            "macro_rules! generate { ($name:ident) => { pub struct $name; } }\n",
+            "generate!(Generated);\n",
+        ),
+    )
+    .expect("represented target beside an unavailable expansion");
+    let data_dir = temporary.path().join("bundle");
+
+    let indexed = h00ligan()
+        .arg("--root")
+        .arg(&root)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("index")
+        .output()
+        .expect("publish capture-gap fixture");
+    assert!(
+        indexed.status.success(),
+        "capture-gap indexing must retain represented definitions: stdout={} stderr={}",
+        String::from_utf8_lossy(&indexed.stdout),
+        String::from_utf8_lossy(&indexed.stderr),
+    );
+    let generation = resolve_generation(&data_dir, &root).expect("capture-gap generation");
+    let receipt = generation
+        .manifest
+        .receipts
+        .iter()
+        .find(|receipt| receipt.capability_id == "structural_graph")
+        .expect("positive structural receipt control");
+    assert_eq!(receipt.status, CapabilityStatus::Partial);
+    assert_eq!(
+        receipt.reason_code.as_deref(),
+        Some("structural_capture_incomplete")
+    );
+
+    let exact_file = stdout_json(
+        &h00ligan()
+            .arg("--root")
+            .arg(&root)
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .args([
+                "read",
+                "selected_target",
+                "--file",
+                "src/lib.rs",
+                "--format",
+                "json",
+            ])
+            .output()
+            .expect("read represented target through exact-file selection"),
+    );
+    assert_eq!(exact_file["authority"]["selection_scope"], "exact_file");
+    assert_eq!(
+        exact_file["authority"]["selected_file_population_complete"], false,
+        "a same-file uncaptured declaration must prevent complete file-selection authority: {exact_file}"
+    );
+    assert_eq!(exact_file["authority"]["status"], "qualified");
+    assert!(exact_file["warnings"].as_array().is_some_and(|warnings| {
+        warnings.iter().any(|warning| {
+            warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("uncaptured declaration"))
+        })
+    }));
+
+    let selector = find_exact_selector(&root, &data_dir, "selected_target");
+    let exact_id = stdout_json(
+        &h00ligan()
+            .arg("--root")
+            .arg(&root)
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .args(["read", &selector, "--format", "json"])
+            .output()
+            .expect("read represented target through exact generation identity"),
+    );
+    assert_eq!(exact_id["authority"]["selection_scope"], "exact_symbol_id");
+    assert_eq!(exact_id["authority"]["status"], "complete");
+    assert_eq!(
+        exact_id["authority"]["selected_file_population_complete"],
+        false
+    );
+
+    let (child, mut stdin, mut stdout) = spawn_mcp(&root, &data_dir);
+    let mcp = call_mcp(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "read",
+        json!({"symbol": "selected_target", "file": "src/lib.rs"}),
+    );
+    let stopped = stop_mcp(child, stdin);
+    assert!(stopped.status.success());
+    assert_eq!(
+        mcp["result"]["structuredContent"], exact_file,
+        "CLI and MCP must share capture-gap qualification"
+    );
+    assert_eq!(mcp_typed_payload(&mcp), exact_file);
+
+    std::fs::write(
+        root.join("src/lib.rs"),
+        concat!(
+            "pub fn selected_target() -> usize { 42 }\n",
+            "macro_rules! generate { ($name:ident) => { pub struct $name; } }\n",
+            "generate!(ChangedAfterIndex);\n",
+        ),
+    )
+    .expect("change only the uncaptured declaration after indexing");
+    let stale_file = h00ligan()
+        .arg("--root")
+        .arg(&root)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["read", &selector, "--format", "json"])
+        .output()
+        .expect("read unchanged exact definition after unrelated file drift");
+    assert!(
+        stale_file.status.success(),
+        "an unchanged exact definition must remain available with qualified live-file authority: stdout={} stderr={}",
+        String::from_utf8_lossy(&stale_file.stdout),
+        String::from_utf8_lossy(&stale_file.stderr),
+    );
+    let stale_file = stdout_json(&stale_file);
+    assert_eq!(stale_file["authority"]["status"], "qualified");
+    assert_eq!(
+        stale_file["authority"]["whole_file_matches_generation"],
+        false
+    );
+    assert_eq!(
+        stale_file["authority"]["selected_file_population_complete"],
+        false
+    );
+    assert_eq!(
+        stale_file["source"],
+        "pub fn selected_target() -> usize { 42 }"
+    );
+}
+
+#[tokio::test]
+async fn shipped_type_reduces_a_default_page_to_the_product_envelope() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let root = temporary.path().join("repo");
+    std::fs::create_dir_all(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"type-envelope-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("fixture manifest");
+    let long_suffix = "AuthorityBoundary".repeat(40);
+    let mut source = String::new();
+    for index in 0..60 {
+        source.push_str(&format!("pub struct FieldType{index}{long_suffix};\n"));
+    }
+    source.push_str("pub struct LargeType {\n");
+    for index in 0..60 {
+        source.push_str(&format!(
+            "    pub field_{index}: FieldType{index}{long_suffix},\n"
+        ));
+    }
+    source.push_str("}\n");
+    std::fs::write(root.join("src/lib.rs"), source).expect("large valid type source");
+    let data_dir = temporary.path().join("bundle");
+
+    let indexed = h00ligan()
+        .arg("--root")
+        .arg(&root)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("index")
+        .output()
+        .expect("publish large structural fixture");
+    assert!(
+        indexed.status.success(),
+        "large valid type must index: stdout={} stderr={}",
+        String::from_utf8_lossy(&indexed.stdout),
+        String::from_utf8_lossy(&indexed.stderr),
+    );
+
+    let cli = h00ligan()
+        .arg("--root")
+        .arg(&root)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args([
+            "type",
+            "LargeType",
+            "--file",
+            "src/lib.rs",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("query large type through shipped CLI");
+    assert!(
+        cli.status.success(),
+        "the default Type query must page instead of refusing a valid large result: stdout={} stderr={}",
+        String::from_utf8_lossy(&cli.stdout),
+        String::from_utf8_lossy(&cli.stderr),
+    );
+    let raw_cli = std::str::from_utf8(&cli.stdout)
+        .expect("CLI machine JSON is UTF-8")
+        .trim_end_matches(['\r', '\n']);
+    let raw_cli_chars = raw_cli.chars().count();
+    let cli = stdout_json(&cli);
+    let returned = cli["page"]["returned"]
+        .as_u64()
+        .expect("returned page population");
+    assert!(returned > 0, "positive non-vacuity control: {cli}");
+    assert!(
+        returned < h00ligan_engine::code_intel_domain::DEFAULT_TYPE_PAGE_SIZE as u64,
+        "fixture must force automatic reduction below the default page: {cli}"
+    );
+    assert_eq!(cli["page"]["has_more"], true);
+    assert!(cli["page"]["next_cursor"].as_str().is_some());
+    assert!(
+        cli["page"]["total_items"]
+            .as_u64()
+            .is_some_and(|total| total >= 60)
+    );
+    assert!(
+        cli["warnings"]
+            .as_array()
+            .is_some_and(
+                |warnings| warnings
+                    .iter()
+                    .any(|warning| warning
+                        .as_str()
+                        .is_some_and(|warning| warning
+                            .contains("serialized-result bounds reduced this page")))
+            ),
+        "automatic reduction must be explicit: {cli}"
+    );
+    assert!(
+        serde_json::to_string(&cli)
+            .expect("serialize compact Type result")
+            .chars()
+            .count()
+            <= h00ligan_engine::code_intel_domain::MAX_CODE_INTEL_RESULT_CHARS,
+        "shipped compact result must respect the final product envelope"
+    );
+
+    let (child, mut stdin, mut stdout) = spawn_mcp(&root, &data_dir);
+    let (mcp, raw_mcp) = call_mcp_raw(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "type",
+        json!({"symbol": "LargeType", "file": "src/lib.rs"}),
+    );
+    let stopped = stop_mcp(child, stdin);
+    assert!(stopped.status.success());
+    let raw_mcp = raw_mcp.trim_end_matches(['\r', '\n']);
+    let raw_mcp_chars = raw_mcp.chars().count();
+    assert!(
+        raw_cli_chars <= h00ligan_engine::code_intel_domain::MAX_CODE_INTEL_RESULT_CHARS
+            && raw_mcp_chars <= h00ligan_interface::mcp::MAX_TOOL_RESULT_CHARS,
+        "actual machine surfaces exceed their envelopes: CLI={raw_cli_chars} chars, MCP={raw_mcp_chars} chars"
+    );
+    assert_ne!(mcp["result"]["isError"], true, "{mcp}");
+    let mcp_result = mcp["result"]["structuredContent"].clone();
+    assert!(mcp_result["page"]["next_cursor"].is_string());
+    assert!(mcp_result["page"]["expires_at_unix_seconds"].is_u64());
+    assert_eq!(
+        without_ephemeral_cursor_lease(mcp_result),
+        without_ephemeral_cursor_lease(cli.clone()),
+        "independently minted cursor leases may expire at different seconds, but CLI and MCP result truth must otherwise match"
+    );
+    assert_eq!(
+        without_ephemeral_cursor_lease(mcp_typed_payload(&mcp)),
+        without_ephemeral_cursor_lease(cli),
+        "MCP text and structured payloads must carry the same non-ephemeral result truth"
     );
 }
 
@@ -3328,9 +3963,15 @@ async fn shipped_assess_derives_transitive_impact_from_the_immutable_provider_ca
     assert!(inner_calls.status.success());
     let inner_calls = stdout_json(&inner_calls);
     assert_eq!(result_count(&target_calls), Some(1));
-    assert_eq!(target_calls["items"][0]["caller"]["name"], "inner");
+    assert_eq!(
+        target_calls["items"][0]["origin"]["identity"]["name"],
+        "inner"
+    );
     assert_eq!(result_count(&inner_calls), Some(1));
-    assert_eq!(inner_calls["items"][0]["caller"]["name"], "outer");
+    assert_eq!(
+        inner_calls["items"][0]["origin"]["identity"]["name"],
+        "outer"
+    );
 
     let database = Arc::new(
         redb::ReadOnlyDatabase::open(&seeded.database_path).expect("open Assess generation"),
@@ -3362,7 +4003,7 @@ async fn shipped_assess_derives_transitive_impact_from_the_immutable_provider_ca
         String::from_utf8_lossy(&cli.stderr),
     );
     let cli = stdout_json(&cli);
-    assert_eq!(cli["schema_version"], "h00/code-intel/assess/v2");
+    assert_eq!(cli["schema_version"], "h00/code-intel/assess/v4");
     assert_eq!(
         cli["blast_radius"]["observed_affected_symbols"], 2,
         "Assess must not return a confident empty blast radius while the immutable provider proves a two-hop chain: {cli}"
@@ -3435,7 +4076,7 @@ async fn shipped_inspect_uses_provider_calls_instead_of_legacy_relationship_edge
 
     let calls = stdout_json(&run_calls(&root, &data_dir, &[]));
     assert_eq!(result_count(&calls), Some(1));
-    assert_eq!(calls["items"][0]["caller"]["name"], "caller");
+    assert_eq!(calls["items"][0]["origin"]["identity"]["name"], "caller");
 
     let database = Arc::new(
         redb::ReadOnlyDatabase::open(&seeded.database_path).expect("open Inspect generation"),
@@ -3474,13 +4115,13 @@ async fn shipped_inspect_uses_provider_calls_instead_of_legacy_relationship_edge
         String::from_utf8_lossy(&inspect.stderr),
     );
     let inspect = stdout_json(&inspect);
-    assert_eq!(inspect["schema_version"], "h00/code-intel/inspect/v2");
+    assert_eq!(inspect["schema_version"], "h00/code-intel/inspect/v3");
     assert_eq!(
         inspect["callers"]["result"]["total_callers"], 1,
         "Inspect must compose the canonical provider Calls result instead of returning a confident legacy-graph zero: {inspect}"
     );
     assert_eq!(
-        inspect["callers"]["result"]["items"][0]["caller"]["name"],
+        inspect["callers"]["result"]["items"][0]["origin"]["identity"]["name"],
         "caller"
     );
 
@@ -3497,7 +4138,7 @@ async fn shipped_inspect_uses_provider_calls_instead_of_legacy_relationship_edge
         "MCP Inspect must execute the same shared use case: {mcp}"
     );
     assert_eq!(mcp["result"]["structuredContent"], inspect);
-    assert_eq!(mcp_text_payload(&mcp), inspect);
+    assert_eq!(mcp_typed_payload(&mcp), inspect);
     let stopped = stop_mcp(child, stdin);
     assert!(stopped.status.success());
 }
@@ -3547,7 +4188,7 @@ async fn shipped_inspect_composes_one_complete_function_dossier_across_cli_and_m
         String::from_utf8_lossy(&cli.stderr),
     );
     let cli = stdout_json(&cli);
-    assert_eq!(cli["schema_version"], "h00/code-intel/inspect/v2");
+    assert_eq!(cli["schema_version"], "h00/code-intel/inspect/v3");
     assert_eq!(cli["authority"]["status"], "complete");
     assert_eq!(cli["authority"]["requested_facets_complete"], true);
     assert_eq!(cli["source"]["status"], "available");
@@ -3572,7 +4213,7 @@ async fn shipped_inspect_composes_one_complete_function_dossier_across_cli_and_m
             .expect("serialize Inspect dossier")
             .chars()
             .count()
-            <= h00ligan_engine::code_intel_inspect::MAX_INSPECT_RESULT_CHARS
+            <= h00ligan_engine::code_intel_domain::MAX_CODE_INTEL_RESULT_CHARS
     );
 
     let (child, mut stdin, mut stdout) = spawn_mcp(&root, &data_dir);
@@ -3584,7 +4225,7 @@ async fn shipped_inspect_composes_one_complete_function_dossier_across_cli_and_m
         json!({"symbol": "target"}),
     );
     assert_eq!(mcp["result"]["structuredContent"], cli);
-    assert_eq!(mcp_text_payload(&mcp), cli);
+    assert_eq!(mcp_typed_payload(&mcp), cli);
     let stopped = stop_mcp(child, stdin);
     assert!(stopped.status.success());
 }
@@ -3640,7 +4281,7 @@ async fn shipped_inspect_adapts_preview_population_to_the_serialized_product_bou
         .chars()
         .count();
     assert!(
-        serialized_chars <= h00ligan_engine::code_intel_inspect::MAX_INSPECT_RESULT_CHARS,
+        serialized_chars <= h00ligan_engine::code_intel_domain::MAX_CODE_INTEL_RESULT_CHARS,
         "Inspect serialized {serialized_chars} characters: {cli}"
     );
     assert_eq!(cli["callers"]["result"]["total_callers"], 24);
@@ -3683,7 +4324,7 @@ async fn shipped_inspect_adapts_preview_population_to_the_serialized_product_bou
             "{surface} Inspect must retain the nested time-bound cursor lease: {result}"
         );
     }
-    assert_eq!(mcp_text_payload(&mcp), mcp_result);
+    assert_eq!(mcp_typed_payload(&mcp), mcp_result);
     let stopped = stop_mcp(child, stdin);
     assert!(stopped.status.success());
 }
@@ -3717,7 +4358,7 @@ async fn shipped_dead_reconciles_provider_calls_before_reporting_a_symbol_dead()
 
     let calls = stdout_json(&run_calls(&root, &data_dir, &[]));
     assert_eq!(result_count(&calls), Some(1));
-    assert_eq!(calls["items"][0]["caller"]["name"], "caller");
+    assert_eq!(calls["items"][0]["origin"]["identity"]["name"], "caller");
 
     let database = Arc::new(
         redb::ReadOnlyDatabase::open(&seeded.database_path).expect("open Dead generation"),
@@ -3774,7 +4415,7 @@ async fn shipped_dead_reconciles_provider_calls_before_reporting_a_symbol_dead()
         json!({"symbol": "target"}),
     );
     assert_eq!(mcp["result"]["structuredContent"], cli);
-    assert_eq!(mcp_text_payload(&mcp), cli);
+    assert_eq!(mcp_typed_payload(&mcp), cli);
     let stopped = stop_mcp(child, stdin);
     assert!(stopped.status.success());
 }
@@ -3822,7 +4463,7 @@ async fn shipped_dead_does_not_treat_an_unrooted_caller_cycle_as_liveness() {
 
     let calls = stdout_json(&run_calls(&root, &data_dir, &["--filter", "all"]));
     assert_eq!(result_count(&calls), Some(1));
-    assert_eq!(calls["items"][0]["caller"]["name"], "caller");
+    assert_eq!(calls["items"][0]["origin"]["identity"]["name"], "caller");
 
     let cli = h00ligan()
         .arg("--root")
@@ -3852,7 +4493,7 @@ async fn shipped_dead_does_not_treat_an_unrooted_caller_cycle_as_liveness() {
         json!({"symbol": "target"}),
     );
     assert_eq!(mcp["result"]["structuredContent"], cli);
-    assert_eq!(mcp_text_payload(&mcp), cli);
+    assert_eq!(mcp_typed_payload(&mcp), cli);
     let stopped = stop_mcp(child, stdin);
     assert!(stopped.status.success());
 }
@@ -4066,7 +4707,7 @@ async fn shipped_dead_scopes_negative_authority_to_the_possible_caller_units() {
         json!({"symbol": "target"}),
     );
     assert_eq!(mcp["result"]["structuredContent"], complete);
-    assert_eq!(mcp_text_payload(&mcp), complete);
+    assert_eq!(mcp_typed_payload(&mcp), complete);
     let stopped = stop_mcp(child, stdin);
     assert!(stopped.status.success());
 
@@ -4331,7 +4972,7 @@ async fn shipped_dead_surfaces_an_unjoined_callable_even_when_its_old_label_says
         &["--filter", "all"],
     ));
     assert_eq!(result_count(&calls), Some(1));
-    assert_eq!(calls["items"][0]["caller"]["name"], "root");
+    assert_eq!(calls["items"][0]["origin"]["identity"]["name"], "root");
 
     let run_dead = |extra: &[&str]| {
         h00ligan()
@@ -4466,7 +5107,7 @@ async fn shipped_dead_preserves_positive_paths_but_withholds_excluded_negative_c
         &["--filter", "all"],
     ));
     assert_eq!(result_count(&calls), Some(1));
-    assert_eq!(calls["items"][0]["caller"]["name"], "root");
+    assert_eq!(calls["items"][0]["origin"]["identity"]["name"], "root");
     assert_eq!(calls["authority"]["status"], "qualified");
 
     let run_dead = |extra: &[&str]| {
@@ -4689,6 +5330,29 @@ fn shipped_dead_keeps_noncallable_candidates_qualified_and_non_destructive() {
     assert_eq!(dead["authority"]["structural_candidates_qualified"], true);
     assert_eq!(dead["authority"]["item_evidence_complete"], false);
     assert_eq!(dead["authority"]["population_complete"], false);
+    let warnings = dead["warnings"]
+        .as_array()
+        .expect("typed Dead warnings")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(!warnings.is_empty(), "positive warning control: {dead}");
+    let human_dead = h00ligan()
+        .arg("--root")
+        .arg(&root)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["dead", "Dormant"])
+        .output()
+        .expect("render exact-symbol Dead result");
+    assert!(human_dead.status.success());
+    let human_dead = String::from_utf8_lossy(&human_dead.stdout);
+    for warning in warnings {
+        assert!(
+            human_dead.contains(warning),
+            "exact-symbol human output hid result warning '{warning}': {human_dead}"
+        );
+    }
 
     let full_output = h00ligan()
         .arg("--root")
@@ -4754,11 +5418,11 @@ fn shipped_dead_keeps_noncallable_candidates_qualified_and_non_destructive() {
         json!({"symbol": "Default"}),
     );
     assert_eq!(mcp["result"]["structuredContent"], dead);
-    assert_eq!(mcp_text_payload(&mcp), dead);
+    assert_eq!(mcp_typed_payload(&mcp), dead);
     assert_eq!(mcp_full["result"]["structuredContent"], full);
-    assert_eq!(mcp_text_payload(&mcp_full), full);
+    assert_eq!(mcp_typed_payload(&mcp_full), full);
     assert_eq!(mcp_external["result"]["structuredContent"], external);
-    assert_eq!(mcp_text_payload(&mcp_external), external);
+    assert_eq!(mcp_typed_payload(&mcp_external), external);
     let stopped = stop_mcp(child, stdin);
     assert!(stopped.status.success());
 }
@@ -4956,7 +5620,7 @@ async fn shipped_dead_pages_the_full_population_and_bounds_cli_and_mcp_results()
         .chars()
         .count();
     assert!(
-        bounded_chars <= h00ligan_engine::code_intel_dead::MAX_DEAD_RESULT_CHARS,
+        bounded_chars <= h00ligan_engine::code_intel_domain::MAX_CODE_INTEL_RESULT_CHARS,
         "Dead result must apply its product bound before transport: {bounded_chars}"
     );
     assert_eq!(bounded["page"]["total_items"], 49);
@@ -5007,7 +5671,7 @@ async fn shipped_dead_pages_the_full_population_and_bounds_cli_and_mcp_results()
         without_ephemeral_cursor_lease(bounded)
     );
     assert_eq!(
-        mcp_text_payload(&mcp_bounded),
+        mcp_typed_payload(&mcp_bounded),
         mcp_bounded["result"]["structuredContent"]
     );
     let stopped = stop_mcp(child, stdin);
@@ -5359,9 +6023,9 @@ fn shipped_inspect_keeps_structural_facets_useful_without_inventing_field_usage_
         }),
     );
     assert_eq!(mcp["result"]["structuredContent"], cli);
-    assert_eq!(mcp_text_payload(&mcp), cli);
+    assert_eq!(mcp_typed_payload(&mcp), cli);
     assert_eq!(callable_mcp["result"]["structuredContent"], callable_cli);
-    assert_eq!(mcp_text_payload(&callable_mcp), callable_cli);
+    assert_eq!(mcp_typed_payload(&callable_mcp), callable_cli);
     for (label, response) in [
         ("unknown section", unknown_section),
         ("duplicate section", duplicate_section),
@@ -5620,6 +6284,88 @@ async fn shipped_assess_pages_one_bound_provider_impact_population_and_exposes_d
     );
 }
 
+/// RIGHT-REASON REGRESSION: `blast_radius` is Assess's cursor-paged primary
+/// population. Caller and test items are explicitly previews with their own
+/// counts and completeness flags, so an oversized preview must be shed before
+/// the product refuses an otherwise representable one-item impact page.
+#[tokio::test]
+async fn shipped_assess_sheds_optional_facet_previews_before_refusing_one_impact_item() {
+    let temporary = TempDir::new().expect("temporary directory");
+    // Exercise the result envelope with source content, not a filesystem path
+    // that exceeds Darwin's substantially smaller PATH_MAX.
+    let long_test = format!("test_{}", "t".repeat(10_000));
+    let long_test_document = "tests/facet_budget.rs".to_owned();
+    let root = create_source_root(
+        &temporary,
+        "assess-facet-budget-repo",
+        "pub fn target() {}\npub fn caller() { target(); }\n",
+    );
+    let test_path = root.join(&long_test_document);
+    std::fs::create_dir_all(test_path.parent().expect("long test document parent"))
+        .expect("long test document directory");
+    std::fs::write(
+        &test_path,
+        format!("pub fn {long_test}() {{ caller(); }}\n"),
+    )
+    .expect("long-path test document");
+    let data_dir = temporary.path().join("bundle");
+    let edges = [
+        CallsFixtureEdge {
+            caller: "caller",
+            callee: "target",
+            is_test_only: false,
+            is_test_root: false,
+        },
+        CallsFixtureEdge {
+            caller: &long_test,
+            callee: "caller",
+            is_test_only: true,
+            is_test_root: true,
+        },
+    ];
+    let symbol_documents = BTreeMap::from([(long_test.clone(), long_test_document)]);
+    seed_calls_topology_bundle_with_documents(&root, &data_dir, &edges, true, &symbol_documents)
+        .await;
+
+    let output = h00ligan()
+        .arg("--root")
+        .arg(&root)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["assess", "target", "--limit", "1", "--format", "json"])
+        .output()
+        .expect("query bounded Assess composite");
+    assert!(
+        output.status.success(),
+        "a representable impact page was refused because of an optional preview: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let result = stdout_json(&output);
+    let result_chars = serde_json::to_string(&result)
+        .expect("serialize bounded Assess result")
+        .chars()
+        .count();
+    assert_eq!(result["blast_radius"]["page"]["returned"], 1);
+    assert_eq!(
+        result["blast_radius"]["items"][0]["symbol"]["name"],
+        "caller"
+    );
+    assert_eq!(result["tests"]["observed_runnable_test_roots"], 1);
+    assert_eq!(
+        result["tests"]["items_complete"], false,
+        "optional test preview was retained in a {result_chars}-character result"
+    );
+    assert_eq!(result["tests"]["items"], json!([]));
+    assert!(result["warnings"].as_array().is_some_and(|warnings| {
+        warnings.iter().any(|warning| {
+            warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("tests section is a bounded preview"))
+        })
+    }));
+}
+
 #[test]
 fn structural_index_status_uses_generation_receipts_without_inventing_provider_installation() {
     let temporary = TempDir::new().expect("temporary directory");
@@ -5769,9 +6515,9 @@ fn structural_index_status_uses_generation_receipts_without_inventing_provider_i
     );
     let structured = &mcp_status["result"]["structuredContent"];
     assert_eq!(
-        mcp_text_payload(&mcp_status),
+        mcp_typed_payload(&mcp_status),
         structured.clone(),
-        "MCP text content and native structuredContent must share one status DTO"
+        "MCP typed payload and native structuredContent must share one status DTO"
     );
     assert_eq!(
         structured["recommendation"], recommendation,
@@ -5886,7 +6632,7 @@ fn shipped_index_publishes_the_exact_calls_authority_it_generated() {
     );
     let calls = stdout_json(&calls);
     assert_eq!(result_count(&calls), Some(1));
-    assert_eq!(calls["items"][0]["caller"]["name"], "caller");
+    assert_eq!(calls["items"][0]["origin"]["identity"]["name"], "caller");
     assert_eq!(calls["items"][0]["call_span"]["start_line"], 1);
     assert_eq!(calls["items"][0]["call_span"]["start_column"], 18);
 
@@ -6353,7 +7099,7 @@ fn shipped_index_publishes_runnable_test_roots_for_the_shared_tests_contract() {
         "MCP Tests must consume the same indexed generation: {mcp}"
     );
     assert_eq!(mcp["result"]["structuredContent"], cli);
-    assert_eq!(mcp_text_payload(&mcp), cli);
+    assert_eq!(mcp_typed_payload(&mcp), cli);
     let stopped = stop_mcp(child, stdin);
     assert!(
         stopped.status.success(),
@@ -6412,7 +7158,7 @@ fn shipped_calls_joins_provider_callable_vocabulary_to_structural_function_ident
     let calls = stdout_json(&calls);
     assert_eq!(result_count(&calls), Some(1));
     assert_eq!(calls["resolved_symbol"]["kind"], "function");
-    assert_eq!(calls["items"][0]["caller"]["kind"], "function");
+    assert_eq!(calls["items"][0]["origin"]["identity"]["kind"], "function");
 }
 
 #[cfg(unix)]
@@ -6465,7 +7211,7 @@ fn shipped_cli_and_mcp_admit_explicit_macro_invocations_without_global_qualifica
     );
     let cli = stdout_json(&cli);
     assert_eq!(result_count(&cli), Some(1));
-    assert_eq!(cli["schema_version"], "h00/code-intel/calls/v9");
+    assert_eq!(cli["schema_version"], "h00/code-intel/calls/v11");
     assert_eq!(cli["authority"]["status"], "complete");
     assert_eq!(
         cli["authority"]["population"],
@@ -6488,7 +7234,7 @@ fn shipped_cli_and_mcp_admit_explicit_macro_invocations_without_global_qualifica
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(response["result"]["structuredContent"], cli);
-    assert_eq!(mcp_text_payload(&response), cli);
+    assert_eq!(mcp_typed_payload(&response), cli);
 }
 
 #[cfg(unix)]
@@ -6613,16 +7359,18 @@ fn shipped_go_calls_distinguishes_missing_module_root_from_provider_failure() {
         without_module_status["capabilities"],
     );
     assert_eq!(
-        without_module_status["action_needed"], false,
-        "a stable missing execution root cannot be repaired by repeating the satisfied best-effort request"
+        without_module_status["action_needed"], true,
+        "an indexed loose-source callable remains unclassified even though repeating the same request is inert"
     );
     assert!(
         without_module_status["recommendation"]
             .as_str()
             .is_some_and(
-                |recommendation| recommendation.contains("measured capabilities are ready")
+                |recommendation| recommendation.contains("unclassified graph node")
+                    && recommendation.contains("project ownership")
+                    && recommendation.contains("same unchanged indexing request")
             ),
-        "status should describe the complete applicable scope without prescribing inert Go setup: {without_module_status}"
+        "status should name the unclassified population and its owning seam without prescribing an inert retry: {without_module_status}"
     );
     let run_query = |data_dir: &Path, args: &[&str]| {
         h00ligan()
@@ -6644,12 +7392,15 @@ fn shipped_go_calls_distinguishes_missing_module_root_from_provider_failure() {
     );
     let without_module_overview = stdout_json(&without_module_overview);
     assert_eq!(
-        without_module_overview["health_action_needed"], false,
-        "structural-only overview must not prescribe an impossible semantic repair: {without_module_overview}"
+        without_module_overview["health_action_needed"], true,
+        "structural-only overview must not present unclassified source as healthy: {without_module_overview}"
     );
     assert!(
-        without_module_overview.get("health_guidance").is_none(),
-        "complete applicable scope needs no remediation guidance: {without_module_overview}"
+        without_module_overview["health_guidance"]
+            .as_str()
+            .is_some_and(|guidance| guidance.contains("unclassified graph node")
+                && guidance.contains("project ownership")),
+        "overview must disclose why structural-only source is not authoritative: {without_module_overview}"
     );
     assert!(
         without_module_overview
@@ -6665,10 +7416,17 @@ fn shipped_go_calls_distinguishes_missing_module_root_from_provider_failure() {
         String::from_utf8_lossy(&without_module_audit.stderr),
     );
     let without_module_audit = stdout_json(&without_module_audit);
-    assert_eq!(without_module_audit["dead_code"]["action_needed"], false);
+    assert_eq!(without_module_audit["dead_code"]["action_needed"], true);
+    assert_eq!(
+        without_module_audit["dead_code"]["status"], "unavailable",
+        "loose-source callables must remain a withheld dead-code population"
+    );
     assert!(
-        without_module_audit["dead_code"].get("guidance").is_none(),
-        "complete applicable scope needs no audit remediation guidance: {without_module_audit}"
+        without_module_audit["dead_code"]["guidance"]
+            .as_str()
+            .is_some_and(|guidance| guidance.contains("unclassified graph node")
+                && guidance.contains("project ownership")),
+        "audit must retain the structural-only callable population as an explicit qualification: {without_module_audit}"
     );
     assert!(
         without_module_audit["dead_code"]
@@ -6687,11 +7445,11 @@ fn shipped_go_calls_distinguishes_missing_module_root_from_provider_failure() {
     );
     assert_eq!(
         overview_response["result"]["structuredContent"], without_module_overview,
-        "CLI and MCP Overview must share the non-actionable capability decision"
+        "CLI and MCP Overview must share the unclassified-population decision"
     );
     assert_eq!(
         audit_response["result"]["structuredContent"], without_module_audit,
-        "CLI and MCP Audit must share the non-actionable capability decision"
+        "CLI and MCP Audit must share the unclassified-population decision"
     );
 
     std::fs::write(
@@ -7032,7 +7790,7 @@ fn shipped_go_callable_bindings_are_qualified_execution_paths_across_cli_and_mcp
         String::from_utf8_lossy(&calls.stderr),
     );
     let calls = stdout_json(&calls);
-    assert_eq!(calls["schema_version"], "h00/code-intel/calls/v9");
+    assert_eq!(calls["schema_version"], "h00/code-intel/calls/v11");
     assert_eq!(calls["authority"]["status"], "complete");
     assert_eq!(calls["total_callers"], 0);
     assert_eq!(calls["items"].as_array().map(Vec::len), Some(0));
@@ -7049,7 +7807,10 @@ fn shipped_go_callable_bindings_are_qualified_execution_paths_across_cli_and_mcp
     assert!(seam_calls.status.success());
     let seam_calls = stdout_json(&seam_calls);
     assert_eq!(seam_calls["total_callers"], 1);
-    assert_eq!(seam_calls["items"][0]["caller"]["name"], "caller");
+    assert_eq!(
+        seam_calls["items"][0]["origin"]["identity"]["name"],
+        "caller"
+    );
     assert_eq!(seam_calls["callable_value_bindings"], 0);
 
     let run_assess = |cursor: Option<&str>| {
@@ -7076,7 +7837,7 @@ fn shipped_go_callable_bindings_are_qualified_execution_paths_across_cli_and_mcp
         String::from_utf8_lossy(&assess.stderr),
     );
     let assess = stdout_json(&assess);
-    assert_eq!(assess["schema_version"], "h00/code-intel/assess/v2");
+    assert_eq!(assess["schema_version"], "h00/code-intel/assess/v4");
     assert_eq!(assess["authority"]["status"], "qualified");
     assert_eq!(assess["authority"]["population_complete"], true);
     assert_eq!(assess["callers"]["observed_direct_callers"], 0);
@@ -7165,7 +7926,7 @@ fn shipped_go_callable_bindings_are_qualified_execution_paths_across_cli_and_mcp
     let inspect = run_symbol_verb(&root, &data_dir, "inspect", "target", &[]);
     assert!(inspect.status.success());
     let inspect = stdout_json(&inspect);
-    assert_eq!(inspect["schema_version"], "h00/code-intel/inspect/v2");
+    assert_eq!(inspect["schema_version"], "h00/code-intel/inspect/v3");
     assert_eq!(inspect["authority"]["status"], "qualified");
     assert_eq!(inspect["callers"]["result"]["total_callers"], 0);
     assert_eq!(inspect["callers"]["result"]["callable_value_bindings"], 1);
@@ -7180,7 +7941,7 @@ fn shipped_go_callable_bindings_are_qualified_execution_paths_across_cli_and_mcp
     let tests = run_symbol_verb(&root, &data_dir, "tests", "target", &[]);
     assert!(tests.status.success());
     let tests = stdout_json(&tests);
-    assert_eq!(tests["schema_version"], "h00/code-intel/tests/v2");
+    assert_eq!(tests["schema_version"], "h00/code-intel/tests/v4");
     assert_eq!(tests["authority"]["status"], "qualified");
     assert_eq!(tests["authority"]["population_complete"], true);
     assert_eq!(tests["authority"]["qualified_path_count"], 1);
@@ -7293,7 +8054,7 @@ fn shipped_go_callable_bindings_are_qualified_execution_paths_across_cli_and_mcp
     assert_eq!(mcp_inspect["result"]["structuredContent"], inspect);
     assert_eq!(mcp_tests["result"]["structuredContent"], tests);
     assert_eq!(
-        without_ephemeral_cursor_lease(mcp_text_payload(&mcp_assess)),
+        without_ephemeral_cursor_lease(mcp_typed_payload(&mcp_assess)),
         without_ephemeral_cursor_lease(assess),
         "MCP text and structured payloads must agree apart from cursor lease identity",
     );
@@ -8939,7 +9700,7 @@ fn every_rust_execution_root_is_rebased_into_one_repository_authority() {
             .as_array()
             .expect("Calls items")
             .iter()
-            .any(|item| item["caller"]["name"] == "detached_only"),
+            .any(|item| item["origin"]["identity"]["name"] == "detached_only"),
         "the cross-artifact caller must survive provider-set composition: {root_calls}"
     );
 
@@ -9740,12 +10501,20 @@ fn shipped_read_applies_its_serialized_bound_before_mcp_transport() {
         .expect("run product-bound Read");
     assert!(!too_large_cli.status.success());
     let too_large_cli = stdout_json(&too_large_cli);
-    assert_eq!(too_large_cli["error"]["code"], "invalid_request");
+    assert_eq!(too_large_cli["error"]["code"], "result_too_large");
+    assert_eq!(too_large_cli["error"]["operation"], "read");
+    assert_eq!(too_large_cli["error"]["max_chars"], 27_232);
     assert!(
-        too_large_cli["error"]["message"]
+        too_large_cli["error"]["actual_chars"]
+            .as_u64()
+            .is_some_and(|actual| actual > 27_232),
+        "the refusal must report the measured oversized result: {too_large_cli}"
+    );
+    assert!(
+        too_large_cli["error"]["remedy"]
             .as_str()
-            .is_some_and(|message| message.contains("product bound")),
-        "the shared product contract must explain the bound: {too_large_cli}"
+            .is_some_and(|remedy| remedy.contains("Lower the Read limit")),
+        "the shared product contract must provide an actionable remedy: {too_large_cli}"
     );
 
     let usable_cli = h00ligan()
@@ -10767,6 +11536,9 @@ fn grep_context_never_labels_changed_live_bytes_with_a_stale_indexed_symbol() {
         String::from_utf8_lossy(&cli_zero_limit.stdout),
         String::from_utf8_lossy(&cli_zero_limit.stderr),
     );
+    let cli_zero_limit = stdout_json(&cli_zero_limit);
+    assert_eq!(cli_zero_limit["error"]["code"], "invalid_request");
+    assert_eq!(cli_zero_limit["error"]["operation"], "source_search");
 
     let large_live_source = (0..20)
         .map(|index| format!("// live_marker_{index} {}\n", "x".repeat(1_800)))
@@ -10789,12 +11561,14 @@ fn grep_context_never_labels_changed_live_bytes_with_a_stale_indexed_symbol() {
         .expect("run product-bounded CLI search");
     assert!(
         !cli_oversized.status.success()
-            && String::from_utf8_lossy(&cli_oversized.stderr)
-                .contains("above the 28000-character product bound"),
+            && String::from_utf8_lossy(&cli_oversized.stderr).contains("maximum is 28000"),
         "CLI must reject an oversized typed result instead of emitting an untransportable success; stdout={} stderr={}",
         String::from_utf8_lossy(&cli_oversized.stdout),
         String::from_utf8_lossy(&cli_oversized.stderr),
     );
+    let cli_oversized = stdout_json(&cli_oversized);
+    assert_eq!(cli_oversized["error"]["code"], "result_too_large");
+    assert_eq!(cli_oversized["error"]["operation"], "source_search");
 
     let (child, mut stdin, mut stdout) = spawn_mcp(&root, &data_dir);
     let mcp_oversized = call_mcp(
@@ -10808,8 +11582,26 @@ fn grep_context_never_labels_changed_live_bytes_with_a_stale_indexed_symbol() {
     assert!(output.status.success());
     assert_eq!(mcp_oversized["result"]["isError"], true);
     assert_eq!(
-        mcp_oversized["result"]["structuredContent"]["error"]["code"], "invalid_request",
+        mcp_oversized["result"]["structuredContent"], cli_oversized,
+        "CLI and MCP must expose one typed source-search overflow"
+    );
+    assert_eq!(
+        mcp_oversized["result"]["structuredContent"]["error"]["code"], "result_too_large",
         "the domain bound must fire before the generic MCP result cap: {mcp_oversized}"
+    );
+    assert_eq!(
+        mcp_oversized["result"]["structuredContent"]["error"]["operation"],
+        "source_search"
+    );
+    assert_eq!(
+        mcp_oversized["result"]["structuredContent"]["error"]["max_chars"],
+        28_000
+    );
+    assert!(
+        mcp_oversized["result"]["structuredContent"]["error"]["actual_chars"]
+            .as_u64()
+            .is_some_and(|actual| actual > 28_000),
+        "the refusal must report the measured oversized result: {mcp_oversized}"
     );
 }
 
@@ -11354,10 +12146,13 @@ fn shipped_diff_applies_its_product_bound_before_mcp_transport() {
         "oversized CLI result must fail"
     );
     assert!(
-        String::from_utf8_lossy(&oversized.stderr).contains("28000-character product bound"),
+        String::from_utf8_lossy(&oversized.stderr).contains("maximum is 28000"),
         "CLI must expose the product-domain bound: {}",
         String::from_utf8_lossy(&oversized.stderr)
     );
+    let oversized = stdout_json(&oversized);
+    assert_eq!(oversized["error"]["code"], "result_too_large");
+    assert_eq!(oversized["error"]["operation"], "diff");
 
     let (child, mut stdin, mut stdout) = spawn_mcp(&root, &data_dir);
     let mcp_oversized = call_mcp(
@@ -11371,13 +12166,31 @@ fn shipped_diff_applies_its_product_bound_before_mcp_transport() {
     assert!(stopped.status.success());
     assert_eq!(mcp_oversized["result"]["isError"], true, "{mcp_oversized}");
     assert_eq!(
-        mcp_oversized["result"]["structuredContent"]["error"]["code"], "invalid_request",
+        mcp_oversized["result"]["structuredContent"], oversized,
+        "CLI and MCP must expose one typed Diff overflow"
+    );
+    assert_eq!(
+        mcp_oversized["result"]["structuredContent"]["error"]["code"], "result_too_large",
         "the domain bound must fire before the generic MCP result cap: {mcp_oversized}"
+    );
+    assert_eq!(
+        mcp_oversized["result"]["structuredContent"]["error"]["operation"],
+        "diff"
+    );
+    assert_eq!(
+        mcp_oversized["result"]["structuredContent"]["error"]["max_chars"],
+        28_000
+    );
+    assert!(
+        mcp_oversized["result"]["structuredContent"]["error"]["actual_chars"]
+            .as_u64()
+            .is_some_and(|actual| actual > 28_000),
+        "the refusal must report the measured oversized result: {mcp_oversized}"
     );
     assert!(
         mcp_oversized["result"]["content"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.contains("28000-character product bound")),
+            .is_some_and(|text| text.contains("maximum is 28000")),
         "MCP refusal must expose the actionable product bound: {mcp_oversized}"
     );
 }
@@ -11705,7 +12518,7 @@ async fn shipped_audit_scopes_page_and_match_across_cli_and_mcp() {
             .expect("serialize Audit page")
             .chars()
             .count()
-            <= h00ligan_engine::code_intel_audit::MAX_AUDIT_RESULT_CHARS
+            <= h00ligan_engine::code_intel_domain::MAX_CODE_INTEL_RESULT_CHARS
     );
 
     let human = h00ligan()
@@ -12012,14 +12825,14 @@ async fn overview_and_audit_do_not_splice_live_topology_or_dry_evidence() {
     let structured_overview = mcp_overview["result"]["structuredContent"].clone();
     let structured_audit = mcp_audit["result"]["structuredContent"].clone();
     assert_eq!(
-        mcp_text_payload(&mcp_overview),
+        mcp_typed_payload(&mcp_overview),
         structured_overview,
-        "MCP overview text fallback and native structuredContent must share one DTO"
+        "MCP overview typed payload and native structuredContent must share one DTO"
     );
     assert_eq!(
-        mcp_text_payload(&mcp_audit),
+        mcp_typed_payload(&mcp_audit),
         structured_audit,
-        "MCP audit text fallback and native structuredContent must share one DTO"
+        "MCP audit typed payload and native structuredContent must share one DTO"
     );
     assert_eq!(
         overview_json, structured_overview,
@@ -12188,7 +13001,7 @@ async fn composite_queries_use_metadata_from_the_same_immutable_generation() {
         String::from_utf8_lossy(&status.stderr),
     );
     let status_json = stdout_json(&status);
-    assert_eq!(status_json["schema_version"], "h00/code-intel/status/v3");
+    assert_eq!(status_json["schema_version"], "h00/code-intel/status/v4");
     assert_eq!(status_json["capabilities"]["calls"]["status"], "complete");
     assert!(
         status_json.get("envelope").is_none(),
@@ -12204,7 +13017,7 @@ async fn composite_queries_use_metadata_from_the_same_immutable_generation() {
         String::from_utf8_lossy(&dead.stderr),
     );
     let dead_json = stdout_json(&dead);
-    assert_eq!(dead_json["schema_version"], "h00/code-intel/dead/v1");
+    assert_eq!(dead_json["schema_version"], "h00/code-intel/dead/v2");
     assert_eq!(dead_json["generation_id"], immutable_generation_id);
     assert_eq!(dead_json["authority"]["calls"]["status"], "complete");
     assert_eq!(
@@ -12232,7 +13045,7 @@ async fn composite_queries_use_metadata_from_the_same_immutable_generation() {
     let overview_json = stdout_json(&overview);
     assert_eq!(
         overview_json["schema_version"],
-        "h00/code-intel/overview/v3"
+        "h00/code-intel/overview/v4"
     );
     assert_eq!(overview_json["dead_code_count"], 0);
     assert_eq!(overview_json["health_status"], "complete");
@@ -12321,7 +13134,7 @@ async fn mixed_language_receipts_partition_cli_and_mcp_dead_code_authority() {
         String::from_utf8_lossy(&dead.stderr),
     );
     let dead_json = stdout_json(&dead);
-    assert_eq!(dead_json["schema_version"], "h00/code-intel/dead/v1");
+    assert_eq!(dead_json["schema_version"], "h00/code-intel/dead/v2");
     assert_eq!(dead_json["authority"]["status"], "qualified");
     assert_eq!(dead_json["authority"]["calls"]["status"], "partial");
     assert_eq!(dead_language(&dead_json, "rust")["status"], "complete");
@@ -13268,6 +14081,11 @@ fn deps_does_not_count_inverse_trait_navigation_as_a_reverse_dependency() {
         String::from_utf8_lossy(&missing.stdout),
         String::from_utf8_lossy(&missing.stderr),
     );
+    let missing_cli = stdout_json(&missing);
+    assert_eq!(
+        missing_cli["error"]["code"], "source_path_invalid",
+        "every JSON query command must emit its typed domain refusal on stdout: {missing_cli}"
+    );
 
     let (child, mut stdin, mut stdout) = spawn_mcp(&root, &data_dir);
     let response = call_mcp(
@@ -13296,13 +14114,17 @@ fn deps_does_not_count_inverse_trait_navigation_as_a_reverse_dependency() {
     );
     assert_eq!(
         result,
-        mcp_text_payload(&response),
-        "MCP text fallback must serialize the same Dependencies result"
+        mcp_typed_payload(&response),
+        "MCP typed payload must serialize the same Dependencies result"
     );
     assert_eq!(missing_response["result"]["isError"], true);
     assert_eq!(
         missing_response["result"]["structuredContent"]["error"]["code"],
         "source_path_invalid"
+    );
+    assert_eq!(
+        missing_response["result"]["structuredContent"], missing_cli,
+        "CLI and MCP must expose one typed Dependencies refusal"
     );
 }
 
@@ -13413,7 +14235,7 @@ async fn deps_projects_persisted_cross_file_calls_at_the_shipped_boundary() {
             .expect("read cross-file graph status"),
     );
     assert_eq!(
-        status["stats"]["edge_kinds"]["Calls"], 1,
+        status["stats"]["edge_kinds"]["calls"], 1,
         "positive control: the published graph must contain one cross-file call: {status}"
     );
 
@@ -13491,7 +14313,7 @@ fn deps_reports_the_generation_graphs_literal_project_dependency() {
             .expect("read workspace graph status"),
     );
     assert!(
-        status["stats"]["edge_kinds"]["DependsOn"]
+        status["stats"]["edge_kinds"]["depends_on"]
             .as_u64()
             .is_some_and(|count| count > 0),
         "positive control: the published graph must contain the literal project dependency: {status}"
@@ -13670,7 +14492,7 @@ fn cli_json_and_mcp_status_share_one_typed_result_contract() {
             .output()
             .expect("run CLI status"),
     );
-    assert_eq!(cli["schema_version"], "h00/code-intel/status/v3");
+    assert_eq!(cli["schema_version"], "h00/code-intel/status/v4");
     assert_eq!(cli["publication_state"], "published");
     assert_eq!(cli["graph_loaded"], true);
 
@@ -13825,7 +14647,7 @@ fn shipped_assess_qualifies_non_callable_impact_without_reference_authority() {
         mcp["result"]["structuredContent"], cli,
         "CLI JSON and MCP structuredContent must share the qualified Assess contract"
     );
-    assert_eq!(mcp_text_payload(&mcp), cli);
+    assert_eq!(mcp_typed_payload(&mcp), cli);
 }
 
 #[tokio::test]
@@ -13901,8 +14723,8 @@ async fn status_bounds_missing_provider_evidence_across_cli_and_mcp() {
     );
     assert_eq!(
         cli,
-        mcp_text_payload(&response),
-        "MCP text fallback must share the same bounded Status DTO"
+        mcp_typed_payload(&response),
+        "MCP typed payload must share the same bounded Status DTO"
     );
 }
 
@@ -13989,7 +14811,7 @@ async fn status_preserves_applicable_typescript_health_failure_across_cli_and_mc
         cli, response["result"]["structuredContent"],
         "CLI JSON and MCP must preserve the same applicable failure"
     );
-    assert_eq!(cli, mcp_text_payload(&response));
+    assert_eq!(cli, mcp_typed_payload(&response));
 }
 
 #[test]
@@ -14018,7 +14840,7 @@ fn status_reports_a_malformed_publication_instead_of_calling_it_unindexed() {
         String::from_utf8_lossy(&cli_output.stderr)
     );
     let cli = stdout_json(&cli_output);
-    assert_eq!(cli["schema_version"], "h00/code-intel/status/v3");
+    assert_eq!(cli["schema_version"], "h00/code-intel/status/v4");
     assert_eq!(cli["publication_state"], "invalid");
     assert_eq!(cli["availability"], "load_failed");
     assert_eq!(cli["graph_loaded"], false);
@@ -14065,6 +14887,10 @@ async fn overview_health_is_unknown_without_calls_authority_and_numeric_with_it(
         "known-positive control: Overview help must expose its real output selector"
     );
     assert!(
+        help.contains("--limit"),
+        "known-positive control: Overview help must expose its bounded collection selector"
+    );
+    assert!(
         !help.contains("--max-depth"),
         "Overview must not advertise an ignored module-depth option"
     );
@@ -14080,6 +14906,33 @@ async fn overview_health_is_unknown_without_calls_authority_and_numeric_with_it(
         "[package]\nname = \"overview_authority\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
     )
     .expect("Cargo manifest");
+
+    for limit in ["0", "101"] {
+        let rejected_data = temporary.path().join(format!("rejected-overview-{limit}"));
+        let rejected = h00ligan()
+            .arg("--root")
+            .arg(&root)
+            .arg("--data-dir")
+            .arg(&rejected_data)
+            .args(["overview", "--format", "json", "--limit", limit])
+            .output()
+            .expect("run invalid Overview request");
+        assert!(!rejected.status.success());
+        let error = stdout_json(&rejected);
+        assert_eq!(error["error"]["code"], "invalid_request");
+        assert_eq!(error["error"]["operation"], "overview");
+        assert_eq!(error["error"]["field"], "limit");
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains("between 1 and 100"),
+            "Overview limit {limit} failed for the wrong reason: stdout={} stderr={}",
+            String::from_utf8_lossy(&rejected.stdout),
+            String::from_utf8_lossy(&rejected.stderr),
+        );
+        assert!(
+            !rejected_data.exists(),
+            "Overview request validation must precede publication access"
+        );
+    }
 
     let structural_data = temporary.path().join("structural-bundle");
     let indexed = h00ligan()
@@ -14115,7 +14968,7 @@ async fn overview_health_is_unknown_without_calls_authority_and_numeric_with_it(
         String::from_utf8_lossy(&structural_output.stderr),
     );
     let structural = stdout_json(&structural_output);
-    assert_eq!(structural["schema_version"], "h00/code-intel/overview/v3");
+    assert_eq!(structural["schema_version"], "h00/code-intel/overview/v4");
     assert!(structural["generation_id"].is_string());
     assert!(structural["repository"]["repository_id"].is_string());
     assert!(
@@ -14172,7 +15025,7 @@ async fn overview_health_is_unknown_without_calls_authority_and_numeric_with_it(
         String::from_utf8_lossy(&semantic_output.stderr),
     );
     let semantic = stdout_json(&semantic_output);
-    assert_eq!(semantic["schema_version"], "h00/code-intel/overview/v3");
+    assert_eq!(semantic["schema_version"], "h00/code-intel/overview/v4");
     assert_eq!(semantic["capabilities"]["calls"]["status"], "complete");
     assert_eq!(semantic["health_status"], "complete");
     assert!(
@@ -14184,6 +15037,118 @@ async fn overview_health_is_unknown_without_calls_authority_and_numeric_with_it(
                     .is_some_and(|count| count > 0)
             })),
         "non-vacuity control: complete Calls authority must expose measured unit health: {semantic}"
+    );
+}
+
+#[test]
+fn overview_does_not_claim_zero_dead_code_for_structural_only_callables() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let root = create_source_root(
+        &temporary,
+        "loose-sources",
+        "pub fn structurally_visible_but_semantically_unowned() {}\n",
+    );
+    let data_dir = temporary.path().join("bundle");
+
+    let indexed = h00ligan()
+        .arg("--root")
+        .arg(&root)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["index", "--format", "json"])
+        .output()
+        .expect("publish loose-source structural generation");
+    assert!(
+        indexed.status.success(),
+        "known-positive control: loose Rust source must be structurally indexed: stdout={} stderr={}",
+        String::from_utf8_lossy(&indexed.stdout),
+        String::from_utf8_lossy(&indexed.stderr),
+    );
+    let indexed = stdout_json(&indexed);
+    assert!(
+        indexed["symbols_extracted"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "known-positive control: fixture must contain an extracted symbol: {indexed}"
+    );
+    assert_eq!(
+        indexed["capabilities"]["calls"]["status"], "not_applicable",
+        "loose sources deliberately do not grant semantic Calls authority"
+    );
+
+    let output = h00ligan()
+        .arg("--root")
+        .arg(&root)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["overview", "--format", "json"])
+        .output()
+        .expect("query loose-source Overview");
+    assert!(
+        output.status.success(),
+        "Overview must remain available: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let overview = stdout_json(&output);
+    assert_eq!(
+        overview["capabilities"]["calls"]["status"],
+        "not_applicable"
+    );
+    assert_eq!(
+        overview["health_status"], "unclassified",
+        "the structural-only callable remains unclassified without reachability evidence"
+    );
+    assert!(
+        overview["dead_code_count"].is_null(),
+        "structural extraction alone cannot authorize a zero dead-code claim: {overview}"
+    );
+}
+
+#[test]
+fn audit_does_not_authorize_a_structural_only_zero_callable_unit() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let root = create_source_root(&temporary, "loose-data", "pub struct Data;\n");
+    let data_dir = temporary.path().join("bundle");
+
+    let indexed = h00ligan()
+        .arg("--root")
+        .arg(&root)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["index", "--format", "json"])
+        .output()
+        .expect("publish loose structural generation");
+    assert!(indexed.status.success());
+    let indexed = stdout_json(&indexed);
+    assert!(
+        indexed["symbols_extracted"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "known-positive control: the loose type must be structurally extracted: {indexed}"
+    );
+
+    let output = h00ligan()
+        .arg("--root")
+        .arg(&root)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["audit", "--format", "json"])
+        .output()
+        .expect("query loose-source Audit");
+    assert!(
+        output.status.success(),
+        "Audit must remain available: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let audit = stdout_json(&output);
+    assert_eq!(audit["dead_code"]["status"], "unavailable");
+    assert_eq!(audit["dead_code"]["authoritative_project_units"], 0);
+    assert_eq!(audit["dead_code"]["withheld_project_units"], 1);
+    assert!(
+        audit["dead_code"]["total"].is_null(),
+        "structural-only ownership cannot certify a dead-code zero: {audit}"
     );
 }
 
@@ -14382,7 +15347,7 @@ async fn cli_json_and_mcp_structured_content_are_the_same_calls_result() {
         .as_object()
         .unwrap_or_else(|| panic!("calls must return native structuredContent: {response}"));
     let structured = Value::Object(structured.clone());
-    assert_eq!(mcp_text_payload(&response), structured);
+    assert_eq!(mcp_typed_payload(&response), structured);
     assert_eq!(
         cli_result, structured,
         "CLI JSON and MCP must share one DTO"
@@ -14567,7 +15532,7 @@ async fn long_lived_mcp_serves_last_good_while_a_candidate_is_incomplete() {
         before["result"]["isError"], true,
         "positive control: {before}"
     );
-    let before = mcp_text_payload(&before);
+    let before = mcp_typed_payload(&before);
     assert_eq!(result_count(&before), Some(1));
     assert_eq!(
         before["repository"]["live_inputs"]["freshness"], "fresh",
@@ -14597,7 +15562,7 @@ async fn long_lived_mcp_serves_last_good_while_a_candidate_is_incomplete() {
         during["result"]["isError"], true,
         "an unpublished candidate must not revoke the last good generation: {during}"
     );
-    assert_eq!(mcp_text_payload(&during), before);
+    assert_eq!(mcp_typed_payload(&during), before);
 }
 
 #[tokio::test]
@@ -14620,7 +15585,7 @@ async fn long_lived_mcp_serves_last_good_when_a_changed_candidate_is_rejected() 
         before["result"]["isError"], true,
         "positive control: {before}"
     );
-    let before = mcp_text_payload(&before);
+    let before = mcp_typed_payload(&before);
     assert_eq!(result_count(&before), Some(1));
     assert_eq!(
         before["repository"]["live_inputs"]["freshness"], "fresh",
@@ -14658,7 +15623,7 @@ async fn long_lived_mcp_serves_last_good_when_a_changed_candidate_is_rejected() 
         after["result"]["isError"], true,
         "a rejected candidate must not revoke the last good generation: {after}"
     );
-    let after = mcp_text_payload(&after);
+    let after = mcp_typed_payload(&after);
     assert_eq!(
         after["repository"]["live_inputs"]["freshness"], "stale",
         "the retained generation must disclose that the rejected candidate's source bytes remain live"
@@ -14698,7 +15663,7 @@ async fn long_lived_mcp_serves_last_good_when_candidate_graph_disappears() {
         before["result"]["isError"], true,
         "positive control: {before}"
     );
-    let before = mcp_text_payload(&before);
+    let before = mcp_typed_payload(&before);
     assert_eq!(
         before["repository"]["live_inputs"]["freshness"], "fresh",
         "positive control: the original generation must match live source"
@@ -14733,7 +15698,7 @@ async fn long_lived_mcp_serves_last_good_when_candidate_graph_disappears() {
         after["result"]["isError"], true,
         "an absent candidate graph is not a new publication: {after}"
     );
-    let after = mcp_text_payload(&after);
+    let after = mcp_typed_payload(&after);
     assert_eq!(
         after["repository"]["live_inputs"]["freshness"], "stale",
         "the retained generation must disclose that the absent candidate's source bytes remain live"
@@ -14773,7 +15738,7 @@ async fn query_and_mutation_fail_closed_when_publication_control_is_unsafe() {
         before["result"]["isError"], true,
         "positive control: {before}"
     );
-    let before = mcp_text_payload(&before);
+    let before = mcp_typed_payload(&before);
     assert_eq!(
         result_count(&before),
         Some(1),
@@ -14894,7 +15859,7 @@ async fn long_lived_mcp_reindex_publishes_and_loads_one_immutable_generation() {
         before["result"]["isError"], true,
         "positive control must establish immutable Calls authority: {before}"
     );
-    let before_payload = mcp_text_payload(&before);
+    let before_payload = mcp_typed_payload(&before);
     assert_eq!(result_count(&before_payload), Some(1));
     assert_eq!(
         before_payload["generation_id"],
@@ -14931,9 +15896,12 @@ async fn long_lived_mcp_reindex_publishes_and_loads_one_immutable_generation() {
         after["result"]["isError"], true,
         "the same MCP process must load the newly published Calls authority: {after}"
     );
-    let after_payload = mcp_text_payload(&after);
+    let after_payload = mcp_typed_payload(&after);
     assert_eq!(result_count(&after_payload), Some(1));
-    assert_eq!(after_payload["items"][0]["caller"]["name"], "caller");
+    assert_eq!(
+        after_payload["items"][0]["origin"]["identity"]["name"],
+        "caller"
+    );
     assert_ne!(
         after_payload["generation_id"], before_payload["generation_id"],
         "successful reindex must advance the immutable generation"
@@ -14986,9 +15954,12 @@ async fn long_lived_mcp_observes_external_publication_on_the_next_request() {
         "calls",
         json!({"symbol": "target"}),
     );
-    let before = mcp_text_payload(&before);
+    let before = mcp_typed_payload(&before);
     assert_eq!(before["generation_id"], initial.generation_id);
-    assert_eq!(before["items"][0]["caller"]["name"], "before_caller");
+    assert_eq!(
+        before["items"][0]["origin"]["identity"]["name"],
+        "before_caller"
+    );
 
     std::fs::write(
         root.join("src/lib.rs"),
@@ -15005,7 +15976,7 @@ async fn long_lived_mcp_observes_external_publication_on_the_next_request() {
         "calls",
         json!({"symbol": "target"}),
     );
-    let after = mcp_text_payload(&after);
+    let after = mcp_typed_payload(&after);
     let output = stop_mcp(child, stdin);
     assert!(
         output.status.success(),
@@ -15014,7 +15985,10 @@ async fn long_lived_mcp_observes_external_publication_on_the_next_request() {
     );
 
     assert_eq!(after["generation_id"], external.generation_id);
-    assert_eq!(after["items"][0]["caller"]["name"], "after_caller");
+    assert_eq!(
+        after["items"][0]["origin"]["identity"]["name"],
+        "after_caller"
+    );
     assert_eq!(std::fs::read(&sentinel).expect("sentinel"), b"unchanged");
     assert!(!root.join("index.scip").exists());
     assert!(!root.join("Cargo.lock").exists());

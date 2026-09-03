@@ -15,7 +15,7 @@ import time
 
 
 SOURCE_POPULATION_SCHEMA = b"h00/semantic-provider/source-population/v1\0"
-FRAME_MAGIC = b"H00SP13\0"
+FRAME_MAGIC = b"H00SP15\0"
 MAX_FRAME_BYTES = 128 * 1024 * 1024
 
 

@@ -1,9 +1,13 @@
 # Releasing h00ligan
 
-h00ligan has one release train. A release contains one self-contained binary
-for each supported target, plus checksums, a target-specific CycloneDX SBOM,
-third-party notices, and build metadata. The automation does not publish any
-crate to crates.io.
+h00ligan has one release train. A release contains one product executable for
+each supported target, with all private semantic-provider implementations
+embedded, plus checksums, a target-specific CycloneDX SBOM, third-party notices,
+and build metadata. Compiler-backed semantic analysis of Go and Rust projects
+currently resolves a compatible project Go or Cargo/Rust toolchain; users do not
+install separate provider executables. Structural indexing and the Python and
+TypeScript/JavaScript semantic providers do not require ambient language
+toolchains. The automation does not publish any crate to crates.io.
 
 ## Normal release
 

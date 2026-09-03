@@ -9,12 +9,12 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context as _, bail};
 use h00ligan_provider_protocol::{
-    H00_RUST_ANALYZER_IMPLEMENTATION_V5, H00_RUST_ANALYZER_LANGUAGE,
+    H00_RUST_ANALYZER_IMPLEMENTATION_V6, H00_RUST_ANALYZER_LANGUAGE,
     H00_RUST_ANALYZER_PROVIDER_ID, ProviderAuthority, ProviderComponentHealth,
     ProviderDocumentOutcome, ProviderFrame, ProviderFrameLimits, ProviderHealthEvidence,
     ProviderIdentity, ProviderRequest, ProviderRequestBody, ProviderResponse, ProviderResponseBody,
@@ -22,7 +22,8 @@ use h00ligan_provider_protocol::{
     ProviderSemanticInputs, ProviderSourceChange, ProviderSourceIdentity,
     PROVIDER_PARENT_PID_ENV, RESOLVED_CARGO_SHA256_ENV, RESOLVED_RUSTC_SHA256_ENV,
     RESOLVED_TOOLCHAIN_SHA256_ENV, RUST_SEMANTIC_PROFILE_ENV, RustCargoFeatures,
-    RustSemanticProfile, SEMANTIC_PROVIDER_PROTOCOL, capture_provider_semantic_inputs,
+    RustSemanticProfile, SEMANTIC_PROVIDER_PROTOCOL,
+    capture_provider_semantic_inputs_at_coordinates, classify_provider_semantic_input_path,
     provider_semantic_inputs_sha256, read_provider_frame, rust_analyzer_runtime_configuration,
     rust_analyzer_source_components, sha256_hex, source_population_sha256,
     validate_provider_request, validate_runtime_configuration, write_provider_frame,
@@ -628,7 +629,7 @@ impl WorkspaceInputPlan {
             // machine-local absolute path.
             if package.is_local && !package_root.starts_with(execution_root.as_str()) {
                 paths.insert(package_root.clone());
-                durable_paths.insert(repository_relative_input(
+                durable_paths.insert(classify_provider_semantic_input_path(
                     repository_root.as_ref(),
                     &package_root,
                 )?);
@@ -667,8 +668,10 @@ impl WorkspaceInputPlan {
                         });
                     }
                     for path in rerun_paths {
-                        durable_paths
-                            .insert(repository_relative_input(repository_root.as_ref(), &path)?);
+                        durable_paths.insert(classify_provider_semantic_input_path(
+                            repository_root.as_ref(),
+                            &path,
+                        )?);
                     }
                 }
                 paths.insert(fingerprint);
@@ -680,7 +683,7 @@ impl WorkspaceInputPlan {
         }
 
         let paths = coalesce_workspace_input_paths(paths);
-        let mut semantic_inputs = capture_provider_semantic_inputs(
+        let mut semantic_inputs = capture_provider_semantic_inputs_at_coordinates(
             repository_root.as_ref(),
             &durable_paths,
             &durable_environment,
@@ -740,51 +743,14 @@ impl WorkspaceInputPlan {
 }
 
 fn repository_relative_input(repository_root: &Path, path: &Path) -> anyhow::Result<String> {
-    let path = normalize_absolute_input(path)?;
-    let relative = path.strip_prefix(repository_root).with_context(|| {
-        format!(
-            "editable Cargo semantic input escapes repository root: {}",
+    let coordinate = classify_provider_semantic_input_path(repository_root, path)?;
+    if coordinate.root != h00ligan_provider_protocol::ProviderSemanticPathRoot::Repository {
+        bail!(
+            "Cargo semantic-input issue path is not repository-relative: {}",
             path.display()
-        )
-    })?;
-    if relative.as_os_str().is_empty() {
-        bail!("Cargo semantic input cannot claim the entire repository root");
+        );
     }
-    let relative = relative
-        .to_str()
-        .with_context(|| format!("Cargo semantic input is not UTF-8: {}", path.display()))?
-        .replace('\\', "/");
-    if relative
-        .split('/')
-        .any(|component| component.is_empty() || matches!(component, "." | ".."))
-    {
-        bail!("Cargo semantic input is not a safe repository-relative path: {relative}");
-    }
-    Ok(relative)
-}
-
-fn normalize_absolute_input(path: &Path) -> anyhow::Result<PathBuf> {
-    if !path.is_absolute() {
-        bail!("Cargo semantic input is not absolute: {}", path.display());
-    }
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    bail!(
-                        "Cargo semantic input escapes filesystem root: {}",
-                        path.display()
-                    );
-                }
-            }
-            Component::Normal(component) => normalized.push(component),
-        }
-    }
-    Ok(normalized)
+    Ok(coordinate.path)
 }
 
 fn merge_cargo_environment(
@@ -1324,7 +1290,7 @@ pub fn executable_identity() -> anyhow::Result<ProviderIdentity> {
         protocol: SEMANTIC_PROVIDER_PROTOCOL.into(),
         provider_id: H00_RUST_ANALYZER_PROVIDER_ID.into(),
         language: H00_RUST_ANALYZER_LANGUAGE.into(),
-        implementation_version: H00_RUST_ANALYZER_IMPLEMENTATION_V5.into(),
+        implementation_version: H00_RUST_ANALYZER_IMPLEMENTATION_V6.into(),
         source_components: rust_analyzer_source_components(),
         patch_sha256: PATCH_SHA256.into(),
         executable_sha256: sha256_hex(&bytes),

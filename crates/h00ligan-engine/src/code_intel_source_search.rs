@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::code_intel_domain::{DomainError, GenerationId, LanguageId, RepositoryBinding};
+use crate::code_intel_domain::{
+    DomainError, GenerationId, LanguageId, MAX_CODE_INTEL_RESULT_CHARS, RepositoryBinding,
+};
 use crate::code_intel_publication::ResolvedGeneration;
 use crate::code_intel_query::repository_binding;
 use crate::graph::KnowledgeGraph;
@@ -23,9 +25,6 @@ pub const DEFAULT_SOURCE_SEARCH_LIMIT: usize = 50;
 pub const MAX_SOURCE_SEARCH_LIMIT: usize = 100;
 pub const MAX_SOURCE_SEARCH_CONTEXT_LINES: usize = 10;
 pub const MAX_SOURCE_SEARCH_PATTERN_BYTES: usize = 4_096;
-/// Stay below the MCP adapter's 30,000-character final-result ceiling so a
-/// successful source-search DTO is never replaced by a transport envelope.
-pub const MAX_SOURCE_SEARCH_RESULT_CHARS: usize = 28_000;
 
 /// Bounds and context controls consumed by the filesystem search kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -405,14 +404,13 @@ pub fn bind_source_search_result(
         })?
         .chars()
         .count();
-    if result_chars > MAX_SOURCE_SEARCH_RESULT_CHARS {
-        return Err(DomainError::InvalidRequest {
-            operation: "source_search",
-            field: "limit",
-            reason: format!(
-                "result would contain {result_chars} serialized characters, above the {MAX_SOURCE_SEARCH_RESULT_CHARS}-character product bound; lower limit or context_lines, narrow path, or use a more selective pattern"
-            ),
-        });
+    if result_chars > MAX_CODE_INTEL_RESULT_CHARS {
+        return Err(DomainError::result_too_large(
+            "source_search",
+            result_chars,
+            MAX_CODE_INTEL_RESULT_CHARS,
+            "Lower the source-search limit or context_lines, narrow the path, or use a more selective pattern",
+        ));
     }
     Ok(result)
 }

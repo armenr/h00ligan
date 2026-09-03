@@ -1627,6 +1627,7 @@ if ((machine_output)); then
     printf 'H00_PYREFLY_PROVIDER_BINARY=%s\n' "$python_provider_binary"
     printf 'H00_PYREFLY_PROVIDER_RECEIPT=%s\n' "$python_provider_receipt"
     printf 'H00_PYREFLY_PROVIDER_BINARY_SHA256=%s\n' "$python_provider_binary_sha256"
+    printf 'H00_PYREFLY_SOURCE_ROOT=%s\n' "$python_provider_source_root"
     printf 'H00_PYREFLY_SOURCE_KEY=%s\n' "$python_provider_source_key"
     printf 'H00_PYREFLY_PATCH_SHA256=%s\n' "$python_provider_patch_sha256"
     printf 'H00_PYREFLY_BUILDER_SHA256=%s\n' "$python_provider_builder_sha256"

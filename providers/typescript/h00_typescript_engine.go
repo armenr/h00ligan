@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/microsoft/typescript-go/internal/ast"
 	"github.com/microsoft/typescript-go/internal/bundled"
 	"github.com/microsoft/typescript-go/internal/diagnostics"
 	"github.com/microsoft/typescript-go/internal/lsp/lsproto"
@@ -382,16 +383,21 @@ func (engine *h00TypeScriptEngine) authorityEvidence(
 				return "", h00SemanticInputs{}, h00Health{}, err
 			}
 		}
-		// GetUnresolvedImports exists for automatic type acquisition and
-		// deliberately omits unresolved relative imports. Health authority must
-		// instead inspect the compiler's complete per-file resolution cache so a
-		// missing local module cannot be certified as a healthy project graph.
-		for _, resolutions := range program.GetResolvedModules() {
-			for key, resolution := range resolutions {
-				if !resolution.IsResolved() {
-					unresolved[key.Name] = struct{}{}
-				}
+		file := program.GetSourceFile(absolute)
+		if file == nil {
+			return "", h00SemanticInputs{}, h00Health{}, fmt.Errorf("TypeScript program omitted admitted source %q", path)
+		}
+		// A program's raw resolution cache includes failed probes that are
+		// intentionally satisfied by ambient modules (CSS, bundler assets, and
+		// similar non-code imports), and overlapping configured projects can hold
+		// different cache entries for the same file. The semantic diagnostic for
+		// this document is the compiler-owned verdict used by export as well.
+		for _, diagnostic := range program.GetSemanticDiagnostics(ctx, file) {
+			moduleReference, missing := h00TypeScriptUnresolvedModuleReference(diagnostic)
+			if !missing {
+				continue
 			}
+			unresolved[moduleReference] = struct{}{}
 		}
 	}
 	for _, directory := range h00AncestorDirectories(engine.executionRoot, engine.repositoryRoot) {
@@ -442,8 +448,42 @@ func (engine *h00TypeScriptEngine) authorityEvidence(
 		semanticLabels = append(semanticLabels, path)
 	}
 	sort.Strings(semanticLabels)
-	if len(semanticLabels) > h00MaxDocumentPaths {
-		return "", h00SemanticInputs{}, h00Health{}, fmt.Errorf("TypeScript semantic-input population exceeds the provider bound")
+	if len(semanticLabels) > h00MaxSemanticInputPaths {
+		dependencyLabels := 0
+		dependencyFiles := 0
+		dependencyDirectories := 0
+		dependencyBytes := int64(0)
+		for path := range semanticPaths {
+			dependency := false
+			for _, component := range strings.Split(filepath.ToSlash(path), "/") {
+				if component == "node_modules" {
+					dependencyLabels++
+					dependency = true
+					break
+				}
+			}
+			if !dependency {
+				continue
+			}
+			if info, err := os.Lstat(filepath.Join(engine.repositoryRoot, filepath.FromSlash(path))); err == nil {
+				switch {
+				case info.Mode().IsRegular():
+					dependencyFiles++
+					dependencyBytes += info.Size()
+				case info.IsDir():
+					dependencyDirectories++
+				}
+			}
+		}
+		return "", h00SemanticInputs{}, h00Health{}, fmt.Errorf(
+			"TypeScript semantic-input population exceeds the provider bound: total=%d dependency=%d dependency_files=%d dependency_directories=%d dependency_bytes=%d project=%d",
+			len(semanticLabels),
+			dependencyLabels,
+			dependencyFiles,
+			dependencyDirectories,
+			dependencyBytes,
+			len(semanticLabels)-dependencyLabels,
+		)
 	}
 	inputs := h00SemanticInputs{
 		SchemaVersion: h00ProviderSemanticInputsSchema,
@@ -478,6 +518,24 @@ func (engine *h00TypeScriptEngine) authorityEvidence(
 		health.Components["module_resolution"] = "healthy"
 	}
 	return h00SHA256(workspace.Bytes()), inputs, health, nil
+}
+
+func h00TypeScriptUnresolvedModuleReference(diagnostic *ast.Diagnostic) (string, bool) {
+	if diagnostic == nil {
+		return "", false
+	}
+	code := diagnostic.Code()
+	if code != diagnostics.Cannot_find_module_0_or_its_corresponding_type_declarations.Code() &&
+		code != diagnostics.Cannot_find_module_0_Consider_using_resolveJsonModule_to_import_module_with_json_extension.Code() &&
+		code != diagnostics.Cannot_find_module_0_Did_you_mean_to_set_the_moduleResolution_option_to_nodenext_or_to_add_aliases_to_the_paths_option.Code() &&
+		code != diagnostics.Cannot_find_module_or_type_declarations_for_side_effect_import_of_0.Code() {
+		return "", false
+	}
+	arguments := diagnostic.MessageArgs()
+	if len(arguments) == 0 || strings.TrimSpace(arguments[0]) == "" {
+		return "", false
+	}
+	return arguments[0], true
 }
 
 func (engine *h00TypeScriptEngine) observeTrackedTypeScriptPath(

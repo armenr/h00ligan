@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::structural_ir::{SymbolRole, symbol_kind_has_role};
 
-pub const CALLS_CONFIGURATION_ID: &str = "calls-v8";
+pub const CALLS_CONFIGURATION_ID: &str = "calls-v9";
 pub const CALLABLE_LIVENESS_CONFIGURATION_ID: &str = "callable-liveness-v1";
 pub const STRUCTURAL_GRAPH_CONFIGURATION_ID: &str = "structural-v2";
 pub const PROJECT_DEPENDENCIES_CONFIGURATION_ID: &str = "project-dependencies-v1";
@@ -26,6 +26,17 @@ pub const MAX_TYPE_PAGE_SIZE: usize = 100;
 /// filesystem observation, so bounded use cases must leave this space before
 /// crossing that boundary.
 pub const LIVE_INPUT_RESULT_RESERVE_CHARS: usize = 768;
+/// Final serialized-character ceiling for one successful code-intelligence
+/// result on every machine-readable product surface.
+///
+/// Engine operations may reserve space below this ceiling for adapter-owned
+/// live-input evidence; the shared CLI/MCP snapshot boundary enforces the final
+/// value.
+pub const MAX_CODE_INTEL_RESULT_CHARS: usize = 28_000;
+/// Engine-owned generation-result ceiling before the adapter attaches its
+/// independently observed live-input evidence.
+pub const MAX_GENERATION_ENGINE_RESULT_CHARS: usize =
+    MAX_CODE_INTEL_RESULT_CHARS - LIVE_INPUT_RESULT_RESERVE_CHARS;
 
 /// The exact source population over which a complete Calls result has
 /// authority. This is intentionally narrower than runtime dispatch or fully
@@ -38,6 +49,29 @@ pub enum CallsPopulation {
     /// calls; inside opaque Rust macro-invocation token trees, the provider
     /// callee token must be followed only by source trivia and then `(`.
     ProviderResolvedExplicitSourceInvocations,
+}
+
+/// Syntactic execution context for a provider-resolved call that has no
+/// published structural caller.
+///
+/// This is orthogonal to production/test source classification: module
+/// initialization executes when the module is loaded, while an anonymous
+/// callable body executes only if that callable runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionRootContext {
+    ModuleInitialization,
+    AnonymousCallable,
+}
+
+impl ExecutionRootContext {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ModuleInitialization => "module_initialization",
+            Self::AnonymousCallable => "anonymous_callable",
+        }
+    }
 }
 
 impl std::fmt::Display for CallsPopulation {
@@ -217,6 +251,10 @@ pub enum ProjectUnitKind {
     Workspace,
     Package,
     Module,
+    /// An executable application environment that is a semantic-provider
+    /// unit but not a distributable language package. Python repositories
+    /// rooted by requirements files or a Pipfile use this shape.
+    Application,
     /// Repository-owned source with no language project-system execution unit.
     /// It remains structurally searchable but cannot authorize semantic facts.
     LooseSources,
@@ -335,7 +373,65 @@ pub enum ProjectInventoryCoverage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectInventoryIssueScope {
+    Repository,
+    Language {
+        language_id: LanguageId,
+    },
+    Ecosystem {
+        language_id: LanguageId,
+        ecosystem_id: EcosystemId,
+    },
+}
+
+impl ProjectInventoryIssueScope {
+    #[must_use]
+    pub fn applies_to_language(&self, language_id: &LanguageId) -> bool {
+        match self {
+            Self::Repository => true,
+            Self::Language {
+                language_id: affected,
+            }
+            | Self::Ecosystem {
+                language_id: affected,
+                ..
+            } => affected == language_id,
+        }
+    }
+
+    #[must_use]
+    pub fn applies_to_provider(
+        &self,
+        language_id: &LanguageId,
+        ecosystem_id: &EcosystemId,
+    ) -> bool {
+        match self {
+            Self::Repository => true,
+            Self::Language {
+                language_id: affected,
+            } => affected == language_id,
+            Self::Ecosystem {
+                language_id: affected_language,
+                ecosystem_id: affected_ecosystem,
+            } => affected_language == language_id && affected_ecosystem == ecosystem_id,
+        }
+    }
+
+    #[must_use]
+    pub fn applies_to_languages(&self, language_ids: &BTreeSet<LanguageId>) -> bool {
+        match self {
+            Self::Repository => true,
+            Self::Language { language_id } | Self::Ecosystem { language_id, .. } => {
+                language_ids.contains(language_id)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ProjectInventoryIssue {
+    pub scope: ProjectInventoryIssueScope,
     pub code: String,
     pub path: String,
     pub detail: String,
@@ -478,6 +574,74 @@ pub struct ProjectInventory {
 }
 
 impl ProjectInventory {
+    #[must_use]
+    pub fn issues_for_language(&self, language_id: &LanguageId) -> Vec<&ProjectInventoryIssue> {
+        self.issues
+            .iter()
+            .filter(|issue| issue.scope.applies_to_language(language_id))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn coverage_for_language(&self, language_id: &LanguageId) -> ProjectInventoryCoverage {
+        if self.issues_for_language(language_id).is_empty() {
+            ProjectInventoryCoverage::IndexedSourcePopulationComplete
+        } else {
+            ProjectInventoryCoverage::IndexedSourcePopulationPartial
+        }
+    }
+
+    #[must_use]
+    pub fn issues_for_languages(
+        &self,
+        language_ids: &BTreeSet<LanguageId>,
+    ) -> Vec<&ProjectInventoryIssue> {
+        self.issues
+            .iter()
+            .filter(|issue| issue.scope.applies_to_languages(language_ids))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn coverage_for_languages(
+        &self,
+        language_ids: &BTreeSet<LanguageId>,
+    ) -> ProjectInventoryCoverage {
+        if self.issues_for_languages(language_ids).is_empty() {
+            ProjectInventoryCoverage::IndexedSourcePopulationComplete
+        } else {
+            ProjectInventoryCoverage::IndexedSourcePopulationPartial
+        }
+    }
+
+    #[must_use]
+    pub fn issues_for_provider(
+        &self,
+        language_id: &LanguageId,
+        ecosystem_id: &EcosystemId,
+    ) -> Vec<&ProjectInventoryIssue> {
+        self.issues
+            .iter()
+            .filter(|issue| issue.scope.applies_to_provider(language_id, ecosystem_id))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn coverage_for_provider(
+        &self,
+        language_id: &LanguageId,
+        ecosystem_id: &EcosystemId,
+    ) -> ProjectInventoryCoverage {
+        if self
+            .issues_for_provider(language_id, ecosystem_id)
+            .is_empty()
+        {
+            ProjectInventoryCoverage::IndexedSourcePopulationComplete
+        } else {
+            ProjectInventoryCoverage::IndexedSourcePopulationPartial
+        }
+    }
+
     /// Whether the exact document has a validated structural-only source owner.
     /// Missing or malformed ownership is never classified this way, so it
     /// remains in fail-closed provider validation instead of disappearing.
@@ -1096,6 +1260,36 @@ pub fn assess_structural_graph_capability(
     )
 }
 
+/// Resolve structural-graph authority for exactly one represented language.
+///
+/// Structural queries select a concrete source language before interpreting
+/// completeness. Keeping that projection here prevents each query from
+/// inventing a different aggregate-authority rule while preserving the exact
+/// persisted gaps for the selected language.
+pub fn assess_structural_graph_language_capability(
+    graph: &crate::graph::KnowledgeGraph,
+    receipts: &[CapabilityReceipt],
+    inventory: &ProjectInventory,
+    language_id: &LanguageId,
+) -> Result<CapabilityCoverage, DomainError> {
+    let mut coverage = assess_structural_graph_capability(graph, receipts, inventory);
+    coverage
+        .languages
+        .retain(|language| language.language_id == *language_id);
+    coverage.status = match coverage.languages.as_slice() {
+        [] => CapabilityCoverageStatus::Unavailable,
+        [language] => language.status,
+        _ => {
+            return Err(DomainError::PublishedGenerationInvalid {
+                reason: format!(
+                    "structural authority contains duplicate language rows for {language_id}"
+                ),
+            });
+        }
+    };
+    Ok(coverage)
+}
+
 /// Resolve authority for repository-local project/package dependency facts.
 ///
 /// The current Cargo edge builder can contribute observed `DependsOn` rows,
@@ -1680,6 +1874,18 @@ pub enum CallerFilter {
     TestOnly,
 }
 
+impl CallerFilter {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::All => "all",
+            Self::Dead => "dead",
+            Self::TestOnly => "test_only",
+        }
+    }
+}
+
 impl std::str::FromStr for CallerFilter {
     type Err = String;
 
@@ -1808,6 +2014,12 @@ pub struct DomainErrorBody {
     pub candidates: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<CapabilityEvidenceGap>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual_chars: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_chars: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remedy: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1908,14 +2120,38 @@ pub enum DomainError {
         field: &'static str,
         reason: String,
     },
+    #[error(
+        "{operation} result contains {actual_chars} serialized characters; maximum is {max_chars}: {remedy}"
+    )]
+    ResultTooLarge {
+        operation: &'static str,
+        actual_chars: usize,
+        max_chars: usize,
+        remedy: String,
+    },
 }
 
 impl DomainError {
+    pub fn result_too_large(
+        operation: &'static str,
+        actual_chars: usize,
+        max_chars: usize,
+        remedy: impl Into<String>,
+    ) -> Self {
+        Self::ResultTooLarge {
+            operation,
+            actual_chars,
+            max_chars,
+            remedy: remedy.into(),
+        }
+    }
+
     pub fn envelope(&self) -> DomainErrorEnvelope {
         let (operation, field) = match self {
             Self::InvalidRequest {
                 operation, field, ..
             } => (Some((*operation).into()), Some((*field).into())),
+            Self::ResultTooLarge { operation, .. } => (Some((*operation).into()), None),
             _ => (None, None),
         };
         let (code, capability, scopes, candidates, evidence) = match self {
@@ -2079,6 +2315,18 @@ impl DomainError {
             Self::InvalidRequest { .. } => {
                 ("invalid_request", None, Vec::new(), Vec::new(), Vec::new())
             }
+            Self::ResultTooLarge { .. } => {
+                ("result_too_large", None, Vec::new(), Vec::new(), Vec::new())
+            }
+        };
+        let (actual_chars, max_chars, remedy) = match self {
+            Self::ResultTooLarge {
+                actual_chars,
+                max_chars,
+                remedy,
+                ..
+            } => (Some(*actual_chars), Some(*max_chars), Some(remedy.clone())),
+            _ => (None, None, None),
         };
         DomainErrorEnvelope {
             error: DomainErrorBody {
@@ -2090,6 +2338,9 @@ impl DomainError {
                 scopes,
                 candidates,
                 evidence,
+                actual_chars,
+                max_chars,
+                remedy,
             },
         }
     }
@@ -2177,6 +2428,74 @@ pub fn capability_resolution_domain_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inventory_issue_authority_is_scoped_to_affected_languages_and_ecosystems() {
+        let mut inventory = ProjectInventory {
+            coverage: ProjectInventoryCoverage::IndexedSourcePopulationPartial,
+            project_topology: ProjectTopology {
+                units: Vec::new(),
+                memberships: Vec::new(),
+                relationships: Vec::new(),
+                exact_workspace_member_sets: Vec::new(),
+                dependency_graphs: Vec::new(),
+            },
+            analysis_context_graphs: Vec::new(),
+            inputs: Vec::new(),
+            issues: vec![ProjectInventoryIssue {
+                scope: ProjectInventoryIssueScope::Ecosystem {
+                    language_id: LanguageId::new("go"),
+                    ecosystem_id: EcosystemId::new("go"),
+                },
+                code: "manifest_unreadable".into(),
+                path: "go/go.mod".into(),
+                detail: "positive scoped-issue control".into(),
+            }],
+        };
+        let rust = LanguageId::new("rust");
+        let go = LanguageId::new("go");
+
+        assert_eq!(
+            inventory.coverage_for_language(&rust),
+            ProjectInventoryCoverage::IndexedSourcePopulationComplete,
+            "a Go-only issue must not downgrade Rust authority"
+        );
+        assert_eq!(
+            inventory.coverage_for_language(&go),
+            ProjectInventoryCoverage::IndexedSourcePopulationPartial,
+            "positive affected-language control"
+        );
+        assert_eq!(
+            inventory.coverage_for_provider(&go, &EcosystemId::new("other")),
+            ProjectInventoryCoverage::IndexedSourcePopulationComplete,
+            "an ecosystem issue must not cross provider ecosystems"
+        );
+        assert_eq!(
+            inventory.coverage_for_provider(&go, &EcosystemId::new("go")),
+            ProjectInventoryCoverage::IndexedSourcePopulationPartial,
+            "positive affected-provider control"
+        );
+        assert_eq!(
+            inventory.coverage_for_languages(&BTreeSet::from([rust.clone()])),
+            ProjectInventoryCoverage::IndexedSourcePopulationComplete
+        );
+        assert_eq!(
+            inventory.coverage_for_languages(&BTreeSet::from([rust, go])),
+            ProjectInventoryCoverage::IndexedSourcePopulationPartial
+        );
+
+        inventory.issues.push(ProjectInventoryIssue {
+            scope: ProjectInventoryIssueScope::Repository,
+            code: "repository_population_unknown".into(),
+            path: ".".into(),
+            detail: "positive repository-wide control".into(),
+        });
+        assert_eq!(
+            inventory.coverage_for_language(&LanguageId::new("rust")),
+            ProjectInventoryCoverage::IndexedSourcePopulationPartial,
+            "repository issues must qualify every narrower projection"
+        );
+    }
 
     fn scoped_complete_receipt(
         provider: &str,

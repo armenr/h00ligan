@@ -24,6 +24,7 @@ use crate::code_intel_cancellation::IndexCancellation;
 use crate::code_intel_indexing::{
     BoundIndexAdmission, BoundIndexPlan, BoundIndexPlanError, BoundIndexRequest, ProviderIntent,
 };
+use crate::code_intel_payload::NormalizedProviderPayload;
 use crate::code_intel_publication::{
     CapabilityFloorPolicy, IndexGenerationPublicationError, LiveGenerationBasis,
     PublicationControlToken, PublicationControlWitness, PublicationError, PublicationRecovery,
@@ -150,6 +151,18 @@ pub struct IndexScheduleSnapshot {
     pub active_trigger: Option<IndexOperationTrigger>,
     pub manual_queued: bool,
     pub watch_enabled: bool,
+}
+
+/// One coherent local-owner observation for publication drift probing.
+///
+/// WATCH must join durable control bytes to all three coordinates from the
+/// same supervisor lock acquisition. Named fields keep schedule quiescence,
+/// write sequence, and exact owned token from becoming independent authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PublicationProbeSnapshot {
+    pub schedule: IndexScheduleSnapshot,
+    pub owned_publication_revision: u64,
+    pub owned_publication_control_token: Option<PublicationControlToken>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -696,6 +709,27 @@ impl From<&PublishedIndexGeneration> for IndexPublicationReceipt {
     }
 }
 
+/// Minimal immutable authority needed to update a long-lived WATCH
+/// population after publication. Keeping only the shared normalized payloads
+/// avoids pinning an entire published generation in the notification channel.
+#[derive(Clone)]
+pub(crate) struct IndexWatchPublication {
+    pub provider_payloads: Arc<[NormalizedProviderPayload]>,
+}
+
+impl From<&PublishedIndexGeneration> for IndexWatchPublication {
+    fn from(published: &PublishedIndexGeneration) -> Self {
+        Self {
+            provider_payloads: published
+                .publication
+                .provider_payloads
+                .iter()
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
 /// Exact process-local status for one operation ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexOperationSnapshot {
@@ -1047,6 +1081,15 @@ struct ActiveRuntime {
 #[derive(Default)]
 struct SupervisorRuntimeState {
     schedule: IndexSchedule,
+    /// Monotonic count of durable head writes performed by this supervisor.
+    /// One source epoch may publish structural truth and then final semantic
+    /// truth, so source-epoch coordinates cannot identify publication
+    /// ownership for WATCH drift detection.
+    owned_publication_revision: u64,
+    /// Exact control identity returned by the latest durable write while its
+    /// cross-process writer lock was still held. A revision without a token is
+    /// intentionally uncertain and must never suppress drift.
+    owned_publication_control_token: Option<PublicationControlToken>,
     watch_request: Option<IndexSupervisorRequest>,
     pending: HashMap<IndexOperationId, PendingOperation>,
     active: Option<ActiveRuntime>,
@@ -1062,7 +1105,7 @@ struct SupervisorInner {
     state: Mutex<SupervisorRuntimeState>,
     wake: Arc<Notify>,
     worker_done: Arc<Notify>,
-    publication_updates: watch::Sender<Option<Arc<PublishedIndexGeneration>>>,
+    publication_updates: watch::Sender<Option<IndexWatchPublication>>,
     worker_running: AtomicBool,
 }
 
@@ -1339,16 +1382,37 @@ impl IndexSupervisor {
         self.inner.state.lock().schedule.snapshot()
     }
 
+    /// Atomically capture quiescence and the exact process-local durable-write
+    /// identity used by WATCH drift detection.
+    pub(crate) fn publication_probe_snapshot(&self) -> PublicationProbeSnapshot {
+        let state = self.inner.state.lock();
+        PublicationProbeSnapshot {
+            schedule: state.schedule.snapshot(),
+            owned_publication_revision: state.owned_publication_revision,
+            owned_publication_control_token: state.owned_publication_control_token.clone(),
+        }
+    }
+
     /// Subscribe to exact successful final publications from this supervisor.
     ///
     /// The channel retains the latest immutable result so a WATCH consumer
     /// cannot miss the transition between subscription and its first await.
     /// Structural staging publications are intentionally excluded: their
     /// provider input authority is not final yet.
-    pub(crate) fn subscribe_publications(
-        &self,
-    ) -> watch::Receiver<Option<Arc<PublishedIndexGeneration>>> {
+    pub(crate) fn subscribe_publications(&self) -> watch::Receiver<Option<IndexWatchPublication>> {
         self.inner.publication_updates.subscribe()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_watch_publication_for_test(
+        &self,
+        provider_payloads: Vec<NormalizedProviderPayload>,
+    ) {
+        self.inner
+            .publication_updates
+            .send_replace(Some(IndexWatchPublication {
+                provider_payloads: provider_payloads.into(),
+            }));
     }
 
     /// Read the bounded publication-control token for WATCH drift detection.
@@ -1781,6 +1845,7 @@ fn retain_structural_publication(
         .schedule
         .mark_active_publication(operation_id)
         .expect("only the active operation may retain a structural publication");
+    record_owned_durable_publication(&mut state, published);
     if let Some(record) = record_mut(&mut state, operation_id) {
         record.structural_publication = Some(IndexPublicationReceipt::from(published));
     }
@@ -1841,6 +1906,9 @@ fn finish_runtime_operation(
     if attempt_result != IndexAttemptResult::Published {
         retain_unpublished_change_hints(&mut state, &active);
     }
+    if let Some(published) = publication_update.as_deref() {
+        record_owned_durable_publication(&mut state, published);
+    }
     if let Some(record) = record_mut(&mut state, operation_id) {
         record.state = operation_state;
         record.finished_at_unix_ms = Some(unix_ms());
@@ -1860,9 +1928,22 @@ fn finish_runtime_operation(
     trim_records(&mut state.records);
     drop(state);
     if let Some(published) = publication_update {
-        inner.publication_updates.send_replace(Some(published));
+        inner
+            .publication_updates
+            .send_replace(Some(IndexWatchPublication::from(published.as_ref())));
     }
     inner.wake.notify_one();
+}
+
+fn record_owned_durable_publication(
+    state: &mut SupervisorRuntimeState,
+    published: &PublishedIndexGeneration,
+) {
+    if published.telemetry.reused_generation {
+        return;
+    }
+    state.owned_publication_revision = state.owned_publication_revision.saturating_add(1);
+    state.owned_publication_control_token = published.publication_control_token.clone();
 }
 
 /// Return bounded source-change evidence to the supervisor when its private
@@ -2166,6 +2247,84 @@ mod tests {
             schedule.snapshot().published_epoch,
             1,
             "cancelling enrichment must not erase an already-visible structural generation"
+        );
+    }
+
+    /// RIGHT-REASON REGRESSION: an operation result can report current truth
+    /// without writing a head. Both structural staging and final publication
+    /// use this one owner, so reused generations must not advance the
+    /// process-local durable-write identity.
+    #[tokio::test]
+    async fn owned_publication_identity_advances_only_for_a_durable_head_write() {
+        let temporary = TempDir::new().expect("owned publication scratch");
+        let root = temporary.path().join("repo");
+        let data = temporary.path().join("data");
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        std::fs::create_dir_all(&data).expect("data directory");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"owned-publication\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        )
+        .expect("manifest fixture");
+        std::fs::write(root.join("src/lib.rs"), "pub fn current() -> u8 { 1 }\n")
+            .expect("source fixture");
+        let binding = ProjectBinding::explicit(&root, &data).expect("explicit binding");
+        let runner = BoundIndexRunner::default();
+        let (progress, _events) = mpsc::unbounded_channel();
+
+        let fresh = runner
+            .run(
+                binding.clone(),
+                IndexSupervisorRequest::default(),
+                Arc::default(),
+                IndexCancellation::new(),
+                progress.clone(),
+            )
+            .await;
+        let fresh = match fresh {
+            RunnerOutcome::Published(published) => published,
+            RunnerOutcome::Failed(failure) => panic!("fresh publication failed: {failure:?}"),
+            RunnerOutcome::Cancelled => panic!("fresh publication was cancelled"),
+        };
+        assert!(!fresh.telemetry.reused_generation);
+        assert!(
+            fresh.publication_control_token.is_some(),
+            "positive control: the durable write must retain its locked control identity"
+        );
+        let mut state = SupervisorRuntimeState::default();
+        record_owned_durable_publication(&mut state, &fresh);
+        assert_eq!(state.owned_publication_revision, 1);
+        assert_eq!(
+            state.owned_publication_control_token,
+            fresh.publication_control_token
+        );
+
+        let reused = runner
+            .run(
+                binding,
+                IndexSupervisorRequest::default(),
+                Arc::default(),
+                IndexCancellation::new(),
+                progress,
+            )
+            .await;
+        let reused = match reused {
+            RunnerOutcome::Published(published) => published,
+            RunnerOutcome::Failed(failure) => panic!("exact reuse failed: {failure:?}"),
+            RunnerOutcome::Cancelled => panic!("exact reuse was cancelled"),
+        };
+        assert!(
+            reused.telemetry.reused_generation,
+            "positive control requires a no-write current-generation result"
+        );
+        record_owned_durable_publication(&mut state, &reused);
+        assert_eq!(
+            state.owned_publication_revision, 1,
+            "a reused generation performed no durable head write"
+        );
+        assert_eq!(
+            state.owned_publication_control_token,
+            fresh.publication_control_token
         );
     }
 
@@ -2861,7 +3020,7 @@ mod tests {
             protocol: receipt_text("protocol"),
             provider_id: receipt_text("provider_id"),
             language: receipt_text("language"),
-            implementation_version: h00ligan_provider_protocol::H00_RUST_ANALYZER_IMPLEMENTATION_V5
+            implementation_version: h00ligan_provider_protocol::H00_RUST_ANALYZER_IMPLEMENTATION_V6
                 .into(),
             source_components: h00ligan_provider_protocol::rust_analyzer_source_components(),
             patch_sha256: receipt_text("patch_sha256"),

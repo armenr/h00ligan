@@ -125,6 +125,29 @@ impl LiganCommand {
             | Self::Diff(_) => false,
         }
     }
+
+    fn requests_machine_json(&self) -> bool {
+        let format = match self {
+            Self::Index(args) => &args.format,
+            Self::Watch(args) => &args.format,
+            Self::Type(args) => &args.format,
+            Self::Read(args) => &args.format,
+            Self::Calls(args) => &args.format,
+            Self::Assess(args) => &args.format,
+            Self::Inspect(args) => &args.format,
+            Self::Dead(args) => &args.format,
+            Self::Status(args) => &args.format,
+            Self::Find(args) => &args.format,
+            Self::Tests(args) => &args.format,
+            Self::Overview(args) => &args.format,
+            Self::Audit(args) => &args.format,
+            Self::Deps(args) => &args.format,
+            Self::GrepContext(args) => &args.format,
+            Self::Diff(args) => &args.format,
+            Self::McpServe => return false,
+        };
+        format.eq_ignore_ascii_case("json")
+    }
 }
 
 pub fn run() {
@@ -181,6 +204,7 @@ pub async fn run_with_runtime_factory(
         }
     };
 
+    let machine_json = cli.command.requests_machine_json();
     let result = match cli.command {
         LiganCommand::Index(args) => {
             index_cmd::run_index_with_runtime(
@@ -224,6 +248,13 @@ pub async fn run_with_runtime_factory(
     };
 
     if let Err(e) = result {
+        if machine_json
+            && let LiganError::Domain(error) = &e
+            && let Err(serialization_error) = crate::output::print_domain_error(error)
+        {
+            eprintln!("Error: {serialization_error}");
+            std::process::exit(1);
+        }
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
@@ -326,5 +357,26 @@ mod tests {
             Ok(_) => panic!("index skipped the semantic runtime factory"),
         }
         assert_eq!(calls.get(), 1, "index must invoke the runtime factory once");
+    }
+
+    #[test]
+    fn every_previously_distributed_query_error_surface_reports_machine_json() {
+        for arguments in [
+            vec!["h00ligan", "overview", "--format", "json"],
+            vec!["h00ligan", "deps", "src/lib.rs", "--format", "json"],
+            vec!["h00ligan", "diff", "src/lib.rs", "--format", "json"],
+            vec!["h00ligan", "grep-context", "needle", "--format", "json"],
+        ] {
+            let cli = LiganCli::try_parse_from(arguments.clone())
+                .unwrap_or_else(|error| panic!("parse {arguments:?}: {error}"));
+            assert!(
+                cli.command.requests_machine_json(),
+                "{arguments:?} must route typed failures through the central JSON owner"
+            );
+        }
+
+        let human = LiganCli::try_parse_from(["h00ligan", "overview"])
+            .expect("parse human Overview positive control");
+        assert!(!human.command.requests_machine_json());
     }
 }

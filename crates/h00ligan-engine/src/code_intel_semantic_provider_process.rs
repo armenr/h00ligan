@@ -685,7 +685,7 @@ pub(crate) mod test_fixture {
     use std::os::unix::fs::PermissionsExt as _;
 
     use h00ligan_provider_protocol::{
-        H00_RUST_ANALYZER_IMPLEMENTATION_V5, H00_RUST_ANALYZER_LANGUAGE,
+        H00_RUST_ANALYZER_IMPLEMENTATION_V6, H00_RUST_ANALYZER_LANGUAGE,
         H00_RUST_ANALYZER_PROVIDER_ID, SEMANTIC_PROVIDER_FRAME_MAGIC, SEMANTIC_PROVIDER_PROTOCOL,
         rust_analyzer_source_components,
     };
@@ -703,11 +703,12 @@ import time
 MAGIC = bytes.fromhex("__H00_FRAME_MAGIC_HEX__")
 LIMITS = {
     "max_frame_bytes": 128 * 1024 * 1024,
-    "max_metadata_bytes": 1024 * 1024,
+    "max_metadata_bytes": 4 * 1024 * 1024,
     "max_attachments": 4096,
     "max_attachment_bytes": 64 * 1024 * 1024,
     "max_total_attachment_bytes": 120 * 1024 * 1024,
     "max_document_paths": 4096,
+    "max_semantic_input_paths": 8192,
     "max_outstanding_requests": 64,
 }
 def sha256(value):
@@ -814,14 +815,14 @@ while True:
                             handle.write("open_session_barrier_timeout\n")
                     raise SystemExit(73)
             semantic_inputs = {
-                "schema_version": "h00/semantic-provider/semantic-inputs/v3",
+                "schema_version": "h00/semantic-provider/semantic-inputs/v4",
                 "coverage": "complete",
                 "paths": [],
                 "environment": [],
                 "issues": [],
             }
             semantic_hasher = hashlib.sha256()
-            field(semantic_hasher, b"h00/semantic-provider/semantic-inputs-digest/v3\0")
+            field(semantic_hasher, b"h00/semantic-provider/semantic-inputs-digest/v4\0")
             field(semantic_hasher, b"complete")
             authority = request["body"]["authority"].copy()
             authority["workspace_resolution_sha256"] = sha256(b"fake-workspace-resolution")
@@ -911,7 +912,7 @@ while True:
                 protocol: SEMANTIC_PROVIDER_PROTOCOL.into(),
                 provider_id: H00_RUST_ANALYZER_PROVIDER_ID.into(),
                 language: H00_RUST_ANALYZER_LANGUAGE.into(),
-                implementation_version: H00_RUST_ANALYZER_IMPLEMENTATION_V5.into(),
+                implementation_version: H00_RUST_ANALYZER_IMPLEMENTATION_V6.into(),
                 source_components: rust_analyzer_source_components(),
                 patch_sha256: "a".repeat(64),
                 executable_sha256: binary_sha256,
@@ -987,7 +988,7 @@ mod tests {
     use std::fs;
 
     use h00ligan_provider_protocol::{
-        ExpectedFullCertification, ExpectedProviderDocument, H00_RUST_ANALYZER_IMPLEMENTATION_V5,
+        ExpectedFullCertification, ExpectedProviderDocument, H00_RUST_ANALYZER_IMPLEMENTATION_V6,
         H00_RUST_ANALYZER_LANGUAGE, ProviderAuthority, ProviderSourceIdentity,
         RESOLVED_CARGO_SHA256_ENV, RESOLVED_RUSTC_SHA256_ENV, RUST_SEMANTIC_PROFILE_ENV,
         RustSemanticProfile, rust_analyzer_source_components, sha256_hex, source_population_sha256,
@@ -1244,7 +1245,7 @@ mod tests {
             protocol: receipt_text("protocol"),
             provider_id: receipt_text("provider_id"),
             language: receipt_text("language"),
-            implementation_version: H00_RUST_ANALYZER_IMPLEMENTATION_V5.into(),
+            implementation_version: H00_RUST_ANALYZER_IMPLEMENTATION_V6.into(),
             source_components: rust_analyzer_source_components(),
             patch_sha256: receipt_text("patch_sha256"),
             executable_sha256: sha256_file(&binary).expect("installed provider binary digest"),

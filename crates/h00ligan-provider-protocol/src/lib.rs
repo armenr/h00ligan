@@ -15,12 +15,12 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub const SEMANTIC_PROVIDER_PROTOCOL: &str = "h00/semantic-provider/v13";
+pub const SEMANTIC_PROVIDER_PROTOCOL: &str = "h00/semantic-provider/v15";
 pub const H00_RUST_ANALYZER_PROVIDER_ID: &str = "h00-rust-analyzer-scip";
 pub const H00_RUST_ANALYZER_LANGUAGE: &str = "rust";
 pub const H00_RUST_ANALYZER_UPSTREAM_VERSION: &str = "1.97.1";
 pub const H00_RUST_ANALYZER_UPSTREAM_COMMIT: &str = "8bab26f4f68e0e26f0bb7960be334d5b520ea452";
-pub const H00_RUST_ANALYZER_IMPLEMENTATION_V5: &str = "rust-analyzer-1.97.1/cargo-profile=explicit/cargo-lockfile=private-redirect/workspace-resolution=bound/build-scripts=required/proc-macros=required/runtime-executables=exact/durable-semantic-inputs=v1/v5";
+pub const H00_RUST_ANALYZER_IMPLEMENTATION_V6: &str = "rust-analyzer-1.97.1/cargo-profile=explicit/cargo-lockfile=private-redirect/workspace-resolution=bound/build-scripts=required/proc-macros=required/runtime-executables=exact/durable-semantic-inputs=v2/v6";
 pub const H00_GO_PROVIDER_ID: &str = "h00-gopls-scip";
 pub const H00_GO_LANGUAGE: &str = "go";
 pub const H00_GOPLS_UPSTREAM_VERSION: &str = "v0.23.0";
@@ -39,8 +39,8 @@ pub const H00_TYPESCRIPT_UPSTREAM_VERSION: &str = "7.0.2";
 pub const H00_TYPESCRIPT_UPSTREAM_COMMIT: &str = "2bd066d87f5bafd315be9f40889d0a60b9e58e0b";
 pub const H00_SCIP_BINDINGS_UPSTREAM_VERSION: &str = "v0.9.0";
 pub const H00_SCIP_BINDINGS_UPSTREAM_COMMIT: &str = "e8ee0ae6038f8298e2195812eea9d7b1196748ae";
-pub const H00_TYPESCRIPT_IMPLEMENTATION_V1: &str =
-    "typescript-native-7.0.2+scip-v0.9.0/h00-semantic-provider-v1";
+pub const H00_TYPESCRIPT_IMPLEMENTATION_V2: &str =
+    "typescript-native-7.0.2+scip-v0.9.0/independent-semantic-input-bound/h00-semantic-provider-v2";
 pub const GO_PROVIDER_SEMANTIC_ENVIRONMENT: &[&str] = &[
     "CGO_ENABLED",
     "GOCACHE",
@@ -72,7 +72,7 @@ pub const RESOLVED_GO_SHA256_ENV: &str = "H00_RESOLVED_GO_SHA256";
 pub const SEMANTIC_PROVIDER_CACHE_DIR_ENV: &str = "H00_SEMANTIC_PROVIDER_CACHE_DIR";
 pub const RUST_SEMANTIC_PROFILE_ENV: &str = "H00_RUST_SEMANTIC_PROFILE";
 pub const RUST_SEMANTIC_PROFILE_SCHEMA: &str = "h00/rust-semantic-profile/v1";
-pub const SEMANTIC_PROVIDER_FRAME_MAGIC: &[u8; 8] = b"H00SP13\0";
+pub const SEMANTIC_PROVIDER_FRAME_MAGIC: &[u8; 8] = b"H00SP15\0";
 pub const CALLABLE_LIVENESS_ANALYSIS_ID: &str = "callable_liveness";
 pub const CALLABLE_LIVENESS_ANALYSIS_SCHEMA_V1: &str = "h00/semantic-provider/callable-liveness/v1";
 pub const GO_CALLABLE_LIVENESS_CONFIGURATION_V1: &str =
@@ -83,12 +83,12 @@ const PROVIDER_RUNTIME_CONFIGURATION_SCHEMA: &[u8] =
     b"h00/semantic-provider/runtime-configuration/v1\0";
 const RESOLVED_AUTHORITY_CONFIGURATION_SCHEMA: &[u8] =
     b"h00/semantic-provider/resolved-authority-configuration/v2\0";
-const PROVIDER_SEMANTIC_INPUTS_SCHEMA: &str = "h00/semantic-provider/semantic-inputs/v3";
+const PROVIDER_SEMANTIC_INPUTS_SCHEMA: &str = "h00/semantic-provider/semantic-inputs/v4";
 const PROVIDER_SEMANTIC_INPUTS_DIGEST_SCHEMA: &[u8] =
-    b"h00/semantic-provider/semantic-inputs-digest/v3\0";
+    b"h00/semantic-provider/semantic-inputs-digest/v4\0";
 const PROVIDER_IDENTITY_DIGEST_SCHEMA: &[u8] =
     b"h00/semantic-provider/provider-identity-digest/v2\0";
-const PROVIDER_SEMANTIC_PATH_SCHEMA: &[u8] = b"h00/semantic-provider/semantic-path/v2\0";
+const PROVIDER_SEMANTIC_PATH_SCHEMA: &[u8] = b"h00/semantic-provider/semantic-path/v3\0";
 const MAX_PROVIDER_SEMANTIC_INPUT_ENTRIES: u64 = 2_000_000;
 const MAX_PROVIDER_SEMANTIC_INPUT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_RUST_SEMANTIC_PROFILE_BYTES: usize = 16 * 1024;
@@ -249,6 +249,7 @@ pub struct ProviderFrameLimits {
     pub max_attachment_bytes: usize,
     pub max_total_attachment_bytes: usize,
     pub max_document_paths: usize,
+    pub max_semantic_input_paths: usize,
     pub max_outstanding_requests: usize,
 }
 
@@ -256,11 +257,12 @@ impl Default for ProviderFrameLimits {
     fn default() -> Self {
         Self {
             max_frame_bytes: 128 * 1024 * 1024,
-            max_metadata_bytes: 1024 * 1024,
+            max_metadata_bytes: 4 * 1024 * 1024,
             max_attachments: 4096,
             max_attachment_bytes: 64 * 1024 * 1024,
             max_total_attachment_bytes: 120 * 1024 * 1024,
             max_document_paths: 4096,
+            max_semantic_input_paths: 8192,
             max_outstanding_requests: 64,
         }
     }
@@ -453,12 +455,64 @@ pub enum ProviderSemanticPathKind {
     DirectoryListing,
 }
 
-/// Exact repository-relative non-source input observed by a semantic
-/// provider. The identity digest covers the complete bounded file/directory
-/// population, not timestamps.
+/// Stable authority root for a semantic input path.
+///
+/// Linked Git worktrees keep their per-worktree and shared control files
+/// outside the checked-out source directory. Persisting those absolute paths
+/// would bind one machine layout and leak it into the generation. These typed
+/// roots instead re-resolve the current checkout's own `.git`/`commondir`
+/// control plane on every freshness check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSemanticPathRoot {
+    Repository,
+    GitWorktree,
+    GitCommon,
+}
+
+impl ProviderSemanticPathRoot {
+    const fn digest_label(self) -> &'static [u8] {
+        match self {
+            Self::Repository => b"repository",
+            Self::GitWorktree => b"git_worktree",
+            Self::GitCommon => b"git_common",
+        }
+    }
+}
+
+/// Canonical, machine-independent coordinate supplied by a provider before
+/// it observes an exact semantic input.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProviderSemanticPathCoordinate {
+    pub root: ProviderSemanticPathRoot,
+    pub path: String,
+}
+
+impl ProviderSemanticPathCoordinate {
+    #[must_use]
+    pub fn repository(path: impl Into<String>) -> Self {
+        Self {
+            root: ProviderSemanticPathRoot::Repository,
+            path: path.into(),
+        }
+    }
+}
+
+/// Transient local resolution of one persisted semantic coordinate. Absolute
+/// paths never enter the serialized manifest or its user-facing diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderSemanticPathLocation {
+    pub authority_root: PathBuf,
+    pub absolute_path: PathBuf,
+}
+
+/// Exact authority-relative non-source input observed by a semantic provider.
+/// The identity digest covers the complete bounded file/directory population,
+/// not timestamps or a machine-local absolute path.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderSemanticPathInput {
+    pub root: ProviderSemanticPathRoot,
     pub path: String,
     pub kind: ProviderSemanticPathKind,
     pub identity_sha256: String,
@@ -1516,6 +1570,376 @@ pub fn source_population_sha256(
     Ok(hex_digest(&hasher.finalize()))
 }
 
+const MAX_GIT_CONTROL_POINTER_BYTES: u64 = 16 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitControlRoots {
+    /// Canonical roots used when persisted coordinates are re-resolved.
+    worktree: PathBuf,
+    common: PathBuf,
+    /// Exact normalized spellings mechanically declared by the repository's
+    /// `.git` and `commondir` pointers. On Darwin these may be below `/var`
+    /// while the canonical roots are below `/private/var`.
+    declared_worktree: PathBuf,
+    declared_common: PathBuf,
+    linked: bool,
+}
+
+fn read_git_control_pointer(
+    path: &Path,
+    label: &str,
+) -> Result<String, SemanticProviderProtocolError> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| SemanticProviderProtocolError::Io(format!("{label}: {error}")))?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() == 0
+        || metadata.len() > MAX_GIT_CONTROL_POINTER_BYTES
+    {
+        return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+            format!("{label} is not a bounded regular file"),
+        ));
+    }
+    let value = std::fs::read_to_string(path)
+        .map_err(|error| SemanticProviderProtocolError::Io(format!("{label}: {error}")))?;
+    let value = value.trim();
+    if value.is_empty() || value.contains('\0') || value.lines().count() != 1 {
+        return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+            format!("{label} is not one bounded path"),
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn canonical_git_directory(
+    path: &Path,
+    label: &str,
+) -> Result<PathBuf, SemanticProviderProtocolError> {
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| SemanticProviderProtocolError::Io(format!("{label}: {error}")))?;
+    let metadata = std::fs::symlink_metadata(&canonical)
+        .map_err(|error| SemanticProviderProtocolError::Io(format!("{label}: {error}")))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+            format!("{label} is not a plain directory"),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn canonical_git_file(path: &Path, label: &str) -> Result<PathBuf, SemanticProviderProtocolError> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| SemanticProviderProtocolError::Io(format!("{label}: {error}")))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+            format!("{label} is not a plain file"),
+        ));
+    }
+    std::fs::canonicalize(path)
+        .map_err(|error| SemanticProviderProtocolError::Io(format!("{label}: {error}")))
+}
+
+fn resolve_git_control_roots(
+    repository_root: &Path,
+) -> Result<GitControlRoots, SemanticProviderProtocolError> {
+    let marker = repository_root.join(".git");
+    let metadata = std::fs::symlink_metadata(&marker)
+        .map_err(|error| SemanticProviderProtocolError::Io(error.to_string()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+            "Git control marker is a symlink".into(),
+        ));
+    }
+    if metadata.file_type().is_dir() {
+        let root = canonical_git_directory(&marker, "Git control directory")?;
+        return Ok(GitControlRoots {
+            worktree: root.clone(),
+            common: root.clone(),
+            declared_worktree: root.clone(),
+            declared_common: root,
+            linked: false,
+        });
+    }
+    if !metadata.file_type().is_file() {
+        return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+            "Git control marker is neither a directory nor a file".into(),
+        ));
+    }
+
+    let marker_value = read_git_control_pointer(&marker, "linked-worktree .git marker")?;
+    let git_dir = marker_value
+        .strip_prefix("gitdir:")
+        .map(str::trim)
+        .ok_or_else(|| {
+            SemanticProviderProtocolError::InvalidSemanticInputs(
+                "linked-worktree .git marker lacks gitdir".into(),
+            )
+        })?;
+    if git_dir.is_empty() {
+        return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+            "linked-worktree .git marker has an empty gitdir".into(),
+        ));
+    }
+    let git_dir = PathBuf::from(git_dir);
+    let git_dir = if git_dir.is_absolute() {
+        git_dir
+    } else {
+        repository_root.join(git_dir)
+    };
+    let declared_worktree = normalize_absolute_semantic_input(&git_dir)?;
+    let worktree = canonical_git_directory(&declared_worktree, "linked-worktree gitdir")?;
+    let head = std::fs::symlink_metadata(worktree.join("HEAD"))
+        .map_err(|error| SemanticProviderProtocolError::Io(error.to_string()))?;
+    if !head.file_type().is_file() || head.file_type().is_symlink() {
+        return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+            "linked-worktree gitdir has no plain HEAD file".into(),
+        ));
+    }
+
+    let reciprocal_marker = worktree.join("gitdir");
+    let reciprocal_value =
+        read_git_control_pointer(&reciprocal_marker, "linked-worktree gitdir backpointer")?;
+    let reciprocal_value = PathBuf::from(reciprocal_value);
+    let reciprocal_path = if reciprocal_value.is_absolute() {
+        reciprocal_value
+    } else {
+        worktree.join(reciprocal_value)
+    };
+    let expected_marker = canonical_git_file(&marker, "linked-worktree .git marker")?;
+    let observed_marker = canonical_git_file(&reciprocal_path, "linked-worktree gitdir target")?;
+    if observed_marker != expected_marker {
+        return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+            "linked-worktree gitdir does not point back to the repository .git marker".into(),
+        ));
+    }
+
+    let commondir_marker = worktree.join("commondir");
+    match std::fs::symlink_metadata(&commondir_marker) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+                "linked-worktree gitdir has no commondir pointer".into(),
+            ));
+        }
+        Err(error) => return Err(SemanticProviderProtocolError::Io(error.to_string())),
+    }
+    let value = read_git_control_pointer(&commondir_marker, "Git commondir pointer")?;
+    let value = PathBuf::from(value);
+    let candidate = if value.is_absolute() {
+        value.clone()
+    } else {
+        worktree.join(&value)
+    };
+    let common = canonical_git_directory(&candidate, "Git common directory")?;
+    let declared_common_candidate = if value.is_absolute() {
+        value
+    } else {
+        declared_worktree.join(value)
+    };
+    let declared_common = normalize_absolute_semantic_input(&declared_common_candidate)?;
+    let declared_common_target =
+        canonical_git_directory(&declared_common, "declared Git common directory")?;
+    if declared_common_target != common {
+        return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+            "Git commondir spelling resolves outside its proven common directory".into(),
+        ));
+    }
+    if common == worktree {
+        return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+            "linked-worktree gitdir does not identify a distinct common Git directory".into(),
+        ));
+    }
+    let worktrees = common.join("worktrees");
+    let relative = worktree.strip_prefix(&worktrees).map_err(|_| {
+        SemanticProviderProtocolError::InvalidSemanticInputs(
+            "linked-worktree gitdir is not owned by its common Git directory".into(),
+        )
+    })?;
+    let mut components = relative.components();
+    if components.next().is_none() || components.next().is_some() {
+        return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+            "linked-worktree gitdir has an invalid common-directory coordinate".into(),
+        ));
+    }
+    Ok(GitControlRoots {
+        worktree,
+        common,
+        declared_worktree,
+        declared_common,
+        linked: true,
+    })
+}
+
+fn normalize_absolute_semantic_input(
+    path: &Path,
+) -> Result<PathBuf, SemanticProviderProtocolError> {
+    if !path.is_absolute() {
+        return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+            format!("semantic input is not absolute: {}", path.display()),
+        ));
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+                        format!("semantic input escapes filesystem root: {}", path.display()),
+                    ));
+                }
+            }
+            std::path::Component::Normal(component) => normalized.push(component),
+        }
+    }
+    Ok(normalized)
+}
+
+fn coordinate_below(
+    root: ProviderSemanticPathRoot,
+    authority_root: &Path,
+    path: &Path,
+) -> Result<Option<ProviderSemanticPathCoordinate>, SemanticProviderProtocolError> {
+    let Ok(relative) = path.strip_prefix(authority_root) else {
+        return Ok(None);
+    };
+    let label = semantic_repository_relative_label(Path::new(""), relative)?;
+    if label.is_empty() {
+        return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+            "semantic input cannot claim an entire authority root".into(),
+        ));
+    }
+    Ok(Some(ProviderSemanticPathCoordinate { root, path: label }))
+}
+
+/// Convert an absolute compiler-observed input into a machine-independent
+/// coordinate. Only the selected repository and its mechanically proven Git
+/// worktree/common directories are admissible.
+pub fn classify_provider_semantic_input_path(
+    repository_root: &Path,
+    path: &Path,
+) -> Result<ProviderSemanticPathCoordinate, SemanticProviderProtocolError> {
+    let path = normalize_absolute_semantic_input(path)?;
+    let repository_root = normalize_absolute_semantic_input(repository_root)?;
+    if let Some(coordinate) = coordinate_below(
+        ProviderSemanticPathRoot::Repository,
+        &repository_root,
+        &path,
+    )? {
+        return Ok(coordinate);
+    }
+    let roots = resolve_git_control_roots(&repository_root)?;
+    if !roots.linked {
+        return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+            format!(
+                "semantic input escapes repository authority: {}",
+                path.display()
+            ),
+        ));
+    }
+    for authority_root in [&roots.declared_worktree, &roots.worktree] {
+        if let Some(coordinate) =
+            coordinate_below(ProviderSemanticPathRoot::GitWorktree, authority_root, &path)?
+        {
+            return Ok(coordinate);
+        }
+    }
+    for authority_root in [&roots.declared_common, &roots.common] {
+        if let Some(coordinate) =
+            coordinate_below(ProviderSemanticPathRoot::GitCommon, authority_root, &path)?
+        {
+            return Ok(coordinate);
+        }
+    }
+    Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+        format!(
+            "semantic input escapes repository and Git authority: {}",
+            path.display()
+        ),
+    ))
+}
+
+fn validate_semantic_coordinate(
+    coordinate: &ProviderSemanticPathCoordinate,
+) -> Result<(), SemanticProviderProtocolError> {
+    match coordinate.root {
+        ProviderSemanticPathRoot::Repository => validate_semantic_input_path(&coordinate.path),
+        ProviderSemanticPathRoot::GitWorktree | ProviderSemanticPathRoot::GitCommon => {
+            validate_document_path(&coordinate.path)
+        }
+    }
+}
+
+/// Resolve one persisted coordinate to the current checkout without accepting
+/// a serialized absolute path.
+pub fn resolve_provider_semantic_path_location(
+    repository_root: &Path,
+    root: ProviderSemanticPathRoot,
+    relative_path: &str,
+) -> Result<ProviderSemanticPathLocation, SemanticProviderProtocolError> {
+    let coordinate = ProviderSemanticPathCoordinate {
+        root,
+        path: relative_path.to_owned(),
+    };
+    validate_semantic_coordinate(&coordinate)?;
+    let authority_root = match root {
+        ProviderSemanticPathRoot::Repository => repository_root.to_path_buf(),
+        ProviderSemanticPathRoot::GitWorktree | ProviderSemanticPathRoot::GitCommon => {
+            let roots = resolve_git_control_roots(repository_root)?;
+            if !roots.linked {
+                return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+                    "external Git semantic root requires a linked worktree".into(),
+                ));
+            }
+            match root {
+                ProviderSemanticPathRoot::GitWorktree => roots.worktree,
+                ProviderSemanticPathRoot::GitCommon => roots.common,
+                ProviderSemanticPathRoot::Repository => unreachable!(),
+            }
+        }
+    };
+    let absolute_path = authority_root.join(relative_path);
+    Ok(ProviderSemanticPathLocation {
+        authority_root,
+        absolute_path,
+    })
+}
+
+fn semantic_coordinates_with_addressing_inputs(
+    repository_root: &Path,
+    coordinates: &BTreeSet<ProviderSemanticPathCoordinate>,
+) -> Result<BTreeSet<ProviderSemanticPathCoordinate>, SemanticProviderProtocolError> {
+    let mut expanded = coordinates.clone();
+    for coordinate in coordinates {
+        validate_semantic_coordinate(coordinate)?;
+    }
+    if coordinates
+        .iter()
+        .all(|coordinate| coordinate.root == ProviderSemanticPathRoot::Repository)
+    {
+        return Ok(expanded);
+    }
+    let roots = resolve_git_control_roots(repository_root)?;
+    if !roots.linked {
+        return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+            "external Git semantic inputs require a linked worktree".into(),
+        ));
+    }
+    expanded.insert(ProviderSemanticPathCoordinate::repository(".git"));
+    expanded.insert(ProviderSemanticPathCoordinate {
+        root: ProviderSemanticPathRoot::GitWorktree,
+        path: "gitdir".into(),
+    });
+    debug_assert_ne!(roots.common, roots.worktree);
+    expanded.insert(ProviderSemanticPathCoordinate {
+        root: ProviderSemanticPathRoot::GitWorktree,
+        path: "commondir".into(),
+    });
+    Ok(expanded)
+}
+
 /// Capture exact bounded repository-local semantic inputs.
 ///
 /// All supplied paths are canonical repository-relative labels; no machine
@@ -1526,9 +1950,35 @@ pub fn capture_provider_semantic_inputs(
     environment_names: &BTreeSet<String>,
     limits: &ProviderFrameLimits,
 ) -> Result<ProviderSemanticInputs, SemanticProviderProtocolError> {
+    let coordinates = paths
+        .iter()
+        .cloned()
+        .map(ProviderSemanticPathCoordinate::repository)
+        .collect();
+    capture_provider_semantic_inputs_at_coordinates(
+        repository_root,
+        &coordinates,
+        environment_names,
+        limits,
+    )
+}
+
+/// Capture exact semantic inputs from repository or mechanically resolved Git
+/// control roots. Any path outside those three authorities is rejected before
+/// bytes are read.
+///
+/// Linked-worktree addressing files are included automatically so changing
+/// `.git` or `commondir` also invalidates the generation.
+pub fn capture_provider_semantic_inputs_at_coordinates(
+    repository_root: &Path,
+    coordinates: &BTreeSet<ProviderSemanticPathCoordinate>,
+    environment_names: &BTreeSet<String>,
+    limits: &ProviderFrameLimits,
+) -> Result<ProviderSemanticInputs, SemanticProviderProtocolError> {
     validate_limits(limits)?;
-    if paths.len() > limits.max_document_paths
-        || environment_names.len() > limits.max_document_paths
+    let coordinates = semantic_coordinates_with_addressing_inputs(repository_root, coordinates)?;
+    if coordinates.len() > limits.max_semantic_input_paths
+        || environment_names.len() > limits.max_semantic_input_paths
     {
         return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
             "semantic input population exceeds negotiated path bounds".into(),
@@ -1542,11 +1992,11 @@ pub fn capture_provider_semantic_inputs(
         ));
     }
     let mut budget = SemanticInputBudget::default();
-    let mut observed_paths = Vec::with_capacity(paths.len());
-    for path in paths {
-        observed_paths.push(observe_provider_semantic_path_with_budget(
+    let mut observed_paths = Vec::with_capacity(coordinates.len());
+    for coordinate in &coordinates {
+        observed_paths.push(observe_provider_semantic_coordinate_with_budget(
             repository_root,
-            path,
+            coordinate,
             &mut budget,
         )?);
     }
@@ -1677,7 +2127,7 @@ fn recapture_provider_semantic_paths(
     expected: &ProviderSemanticInputs,
     limits: &ProviderFrameLimits,
 ) -> Result<ProviderSemanticInputs, SemanticProviderProtocolError> {
-    if expected.paths.len() > limits.max_document_paths {
+    if expected.paths.len() > limits.max_semantic_input_paths {
         return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
             "semantic input population exceeds negotiated path bounds".into(),
         ));
@@ -1692,9 +2142,12 @@ fn recapture_provider_semantic_paths(
     let mut budget = SemanticInputBudget::default();
     let mut paths = Vec::with_capacity(expected.paths.len());
     for input in &expected.paths {
-        paths.push(observe_provider_semantic_path_for_kind_with_budget(
+        paths.push(observe_provider_semantic_coordinate_for_kind_with_budget(
             repository_root,
-            &input.path,
+            &ProviderSemanticPathCoordinate {
+                root: input.root,
+                path: input.path.clone(),
+            },
             input.kind,
             &mut budget,
         )?);
@@ -1725,6 +2178,7 @@ pub fn provider_semantic_inputs_sha256(
         },
     );
     for input in &inputs.paths {
+        hash_field(&mut hasher, input.root.digest_label());
         hash_field(&mut hasher, input.path.as_bytes());
         hash_field(
             &mut hasher,
@@ -1767,9 +2221,9 @@ pub fn validate_provider_semantic_inputs(
             "semantic input schema mismatch".into(),
         ));
     }
-    if inputs.paths.len() > limits.max_document_paths
-        || inputs.environment.len() > limits.max_document_paths
-        || inputs.issues.len() > limits.max_document_paths
+    if inputs.paths.len() > limits.max_semantic_input_paths
+        || inputs.environment.len() > limits.max_semantic_input_paths
+        || inputs.issues.len() > limits.max_semantic_input_paths
     {
         return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
             "semantic input population exceeds negotiated path bounds".into(),
@@ -1777,8 +2231,22 @@ pub fn validate_provider_semantic_inputs(
     }
     let mut previous_path = None;
     for input in &inputs.paths {
-        validate_semantic_input_path(&input.path)?;
-        if previous_path.is_some_and(|previous| previous >= input.path.as_str())
+        match input.root {
+            ProviderSemanticPathRoot::Repository => validate_semantic_input_path(&input.path)?,
+            ProviderSemanticPathRoot::GitWorktree | ProviderSemanticPathRoot::GitCommon => {
+                validate_document_path(&input.path)?;
+                if !matches!(
+                    input.kind,
+                    ProviderSemanticPathKind::Missing | ProviderSemanticPathKind::File
+                ) {
+                    return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+                        format!("Git semantic input {} is not a file", input.path),
+                    ));
+                }
+            }
+        }
+        let coordinate = (input.root, input.path.as_str());
+        if previous_path.is_some_and(|previous| previous >= coordinate)
             || !is_sha256(&input.identity_sha256)
             || (input.kind == ProviderSemanticPathKind::Missing
                 && (input.entry_count != 0 || input.byte_length != 0))
@@ -1790,7 +2258,7 @@ pub fn validate_provider_semantic_inputs(
                 format!("invalid semantic path input {}", input.path),
             ));
         }
-        previous_path = Some(input.path.as_str());
+        previous_path = Some(coordinate);
     }
     let mut previous_name = None;
     for input in &inputs.environment {
@@ -1861,27 +2329,43 @@ impl SemanticInputBudget {
     }
 }
 
-fn observe_provider_semantic_path_with_budget(
+fn observe_provider_semantic_coordinate_with_budget(
     repository_root: &Path,
-    relative_path: &str,
+    coordinate: &ProviderSemanticPathCoordinate,
     budget: &mut SemanticInputBudget,
 ) -> Result<ProviderSemanticPathInput, SemanticProviderProtocolError> {
-    validate_semantic_input_path(relative_path)?;
-    let absolute = repository_root.join(relative_path);
+    validate_semantic_coordinate(coordinate)?;
+    let location = resolve_provider_semantic_path_location(
+        repository_root,
+        coordinate.root,
+        &coordinate.path,
+    )?;
     let before_entries = budget.entries;
     let before_bytes = budget.bytes;
     let mut hasher = Sha256::new();
     hash_field(&mut hasher, PROVIDER_SEMANTIC_PATH_SCHEMA);
+    hash_field(&mut hasher, coordinate.root.digest_label());
     let kind = hash_provider_semantic_path(
         &mut hasher,
-        repository_root,
-        &absolute,
-        &absolute,
+        &location.authority_root,
+        &location.absolute_path,
+        &location.absolute_path,
         budget,
         &mut BTreeSet::new(),
     )?;
+    if coordinate.root != ProviderSemanticPathRoot::Repository
+        && !matches!(
+            kind,
+            ProviderSemanticPathKind::Missing | ProviderSemanticPathKind::File
+        )
+    {
+        return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+            format!("Git semantic input {} is not a file", coordinate.path),
+        ));
+    }
     Ok(ProviderSemanticPathInput {
-        path: relative_path.into(),
+        root: coordinate.root,
+        path: coordinate.path.clone(),
         kind,
         identity_sha256: hex_digest(&hasher.finalize()),
         entry_count: budget.entries.saturating_sub(before_entries),
@@ -1923,26 +2407,60 @@ fn observe_provider_semantic_path_for_kind_with_budget(
     expected_kind: ProviderSemanticPathKind,
     budget: &mut SemanticInputBudget,
 ) -> Result<ProviderSemanticPathInput, SemanticProviderProtocolError> {
-    validate_semantic_input_path(relative_path)?;
-    let absolute = repository_root.join(relative_path);
+    observe_provider_semantic_coordinate_for_kind_with_budget(
+        repository_root,
+        &ProviderSemanticPathCoordinate::repository(relative_path),
+        expected_kind,
+        budget,
+    )
+}
+
+fn observe_provider_semantic_coordinate_for_kind_with_budget(
+    repository_root: &Path,
+    coordinate: &ProviderSemanticPathCoordinate,
+    expected_kind: ProviderSemanticPathKind,
+    budget: &mut SemanticInputBudget,
+) -> Result<ProviderSemanticPathInput, SemanticProviderProtocolError> {
+    validate_semantic_coordinate(coordinate)?;
+    if coordinate.root != ProviderSemanticPathRoot::Repository
+        || expected_kind != ProviderSemanticPathKind::DirectoryListing
+    {
+        return observe_provider_semantic_coordinate_with_budget(
+            repository_root,
+            coordinate,
+            budget,
+        );
+    }
+    let location = resolve_provider_semantic_path_location(
+        repository_root,
+        coordinate.root,
+        &coordinate.path,
+    )?;
+    let absolute = location.absolute_path;
     if expected_kind != ProviderSemanticPathKind::DirectoryListing
         || !std::fs::metadata(&absolute).is_ok_and(|metadata| metadata.is_dir())
     {
-        return observe_provider_semantic_path_with_budget(repository_root, relative_path, budget);
+        return observe_provider_semantic_coordinate_with_budget(
+            repository_root,
+            coordinate,
+            budget,
+        );
     }
     let before_entries = budget.entries;
     let before_bytes = budget.bytes;
     let mut hasher = Sha256::new();
     hash_field(&mut hasher, PROVIDER_SEMANTIC_PATH_SCHEMA);
+    hash_field(&mut hasher, coordinate.root.digest_label());
     hash_provider_semantic_directory_listing(
         &mut hasher,
-        repository_root,
+        &location.authority_root,
         &absolute,
         &absolute,
         budget,
     )?;
     Ok(ProviderSemanticPathInput {
-        path: relative_path.into(),
+        root: coordinate.root,
+        path: coordinate.path.clone(),
         kind: ProviderSemanticPathKind::DirectoryListing,
         identity_sha256: hex_digest(&hasher.finalize()),
         entry_count: budget.entries.saturating_sub(before_entries),
@@ -2909,6 +3427,7 @@ fn validate_limits(limits: &ProviderFrameLimits) -> Result<(), SemanticProviderP
         || limits.max_total_attachment_bytes == 0
         || limits.max_total_attachment_bytes > limits.max_frame_bytes
         || limits.max_document_paths == 0
+        || limits.max_semantic_input_paths == 0
         || limits.max_outstanding_requests == 0
     {
         return Err(SemanticProviderProtocolError::InvalidLimits(
@@ -3087,6 +3606,10 @@ pub fn provider_semantic_file_identity_sha256(
     }
     let mut hasher = Sha256::new();
     hash_field(&mut hasher, PROVIDER_SEMANTIC_PATH_SCHEMA);
+    hash_field(
+        &mut hasher,
+        ProviderSemanticPathRoot::Repository.digest_label(),
+    );
     hash_field(&mut hasher, b"");
     hash_field(&mut hasher, b"");
     hash_field(&mut hasher, b"file");

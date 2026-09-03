@@ -11,13 +11,13 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::code_intel_calls::{
-    CallablePathStep, ExactCapabilityAuthority, PublishedCallsGraph, resolve_invocation_target,
-    resolve_invocation_target_indexed,
+    CallablePathStep, ExactCapabilityAuthority, ExecutionRootClass, PublishedCallsGraph,
+    resolve_invocation_target, resolve_invocation_target_indexed,
 };
 use crate::code_intel_cursor::{page_window, request_digest};
 use crate::code_intel_domain::{
     AuthorityStatus, CapabilityCoverage, CapabilityCoverageStatus, DomainError, GenerationId,
-    LIVE_INPUT_RESULT_RESERVE_CHARS, Page, ProjectInventoryCoverage, RepositoryBinding,
+    MAX_GENERATION_ENGINE_RESULT_CHARS, Page, ProjectInventoryCoverage, RepositoryBinding,
     SymbolIdentity, UnitGraph, assess_structural_graph_capability,
 };
 use crate::code_intel_inventory::project_unit_graph;
@@ -29,13 +29,12 @@ use crate::code_intel_query_index::GenerationQueryIndex;
 use crate::graph::KnowledgeGraph;
 use crate::project_binding::ProjectBinding;
 
-pub const TESTS_SCHEMA_VERSION: &str = "h00/code-intel/tests/v2";
+pub const TESTS_SCHEMA_VERSION: &str = "h00/code-intel/tests/v4";
 pub const DEFAULT_TESTS_PAGE_SIZE: usize = 50;
 pub const MAX_TESTS_PAGE_SIZE: usize = 100;
 pub const MAX_TESTS_SYMBOL_BYTES: usize = 4_096;
 pub const MAX_TESTS_FILE_BYTES: usize = 4_096;
 pub const MAX_TESTS_CURSOR_BYTES: usize = 8_192;
-pub const MAX_TESTS_RESULT_CHARS: usize = 28_000;
 pub const MAX_TESTS_CALL_DEPTH: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +83,10 @@ pub struct TestsAuthority {
     pub traversal_complete: bool,
     pub population_complete: bool,
     pub qualified_path_count: usize,
+    /// Exact test-source execution-root paths that cannot be identified as a
+    /// named runnable structural test entry. These remain positive execution
+    /// evidence while qualifying the Tests population.
+    pub unnamed_test_execution_root_paths: usize,
     pub depth_cutoff_nodes: usize,
 }
 
@@ -233,6 +236,11 @@ fn query_published_tests_with_index(
         .iter()
         .filter(|item| item.chain.iter().any(CallablePathStep::is_qualified))
         .count();
+    let unnamed_test_execution_root_paths = traversal
+        .root_paths
+        .iter()
+        .filter(|path| path.root.class == ExecutionRootClass::Test)
+        .count();
     let calls_authority = calls.authority();
     let structural_graph = assess_structural_graph_capability(
         graph,
@@ -241,13 +249,17 @@ fn query_published_tests_with_index(
     );
     let structural_classification_complete = structural_graph.language_status(&target_language.0)
         == Some(CapabilityCoverageStatus::Complete);
-    let inventory_complete = generation.project_inventory.coverage
-        == ProjectInventoryCoverage::IndexedSourcePopulationComplete;
+    let inventory_coverage = generation
+        .project_inventory
+        .coverage_for_language(&target_language);
+    let inventory_complete =
+        inventory_coverage == ProjectInventoryCoverage::IndexedSourcePopulationComplete;
     let traversal_complete = traversal.depth_cutoff_nodes == 0;
     let population_complete = calls_authority.status == AuthorityStatus::Complete
         && structural_classification_complete
         && inventory_complete
-        && traversal_complete;
+        && traversal_complete
+        && unnamed_test_execution_root_paths == 0;
     let authority_status = if population_complete && qualified_path_count == 0 {
         AuthorityStatus::Complete
     } else {
@@ -283,6 +295,11 @@ fn query_published_tests_with_index(
                 "{qualified_path_count} runnable test path(s) include provider-resolved callable-value assignments; those paths are qualified possible dispatch, not exact invocation-only chains"
             ));
         }
+        if unnamed_test_execution_root_paths > 0 {
+            warnings.push(format!(
+                "{unnamed_test_execution_root_paths} exact provider path(s) begin in test-source execution roots that cannot be tied to named runnable structural tests; execution evidence is retained but the runnable-test population is qualified"
+            ));
+        }
         warnings
     };
 
@@ -314,7 +331,7 @@ fn query_published_tests_with_index(
         for item in &items {
             projected_documents.push(item.test.document_path.as_str());
             for step in &item.chain {
-                projected_documents.push(step.source().document_path.as_str());
+                projected_documents.push(step.source_document());
                 projected_documents.push(step.target().document_path.as_str());
             }
         }
@@ -338,11 +355,12 @@ fn query_published_tests_with_index(
                     TestRootPopulation::PersistedStructuralTestRootsReachableThroughProviderExecutionPaths,
                 calls: calls_authority.clone(),
                 structural_graph: structural_graph.clone(),
-                project_inventory_coverage: generation.project_inventory.coverage,
+                project_inventory_coverage: inventory_coverage,
                 max_call_depth: MAX_TESTS_CALL_DEPTH,
                 traversal_complete,
                 population_complete,
                 qualified_path_count,
+                unnamed_test_execution_root_paths,
                 depth_cutoff_nodes: traversal.depth_cutoff_nodes,
             },
             items,
@@ -358,15 +376,15 @@ fn query_published_tests_with_index(
             .chars()
             .count();
         smallest_result_chars = result_chars;
-        if result_chars <= MAX_TESTS_RESULT_CHARS - LIVE_INPUT_RESULT_RESERVE_CHARS {
+        if result_chars <= MAX_GENERATION_ENGINE_RESULT_CHARS {
             return Ok(result);
         }
     }
-    Err(invalid_request(
-        "symbol",
-        format!(
-            "even a one-item Tests page would contain {smallest_result_chars} serialized characters and cannot leave room for required live-input evidence within the {MAX_TESTS_RESULT_CHARS}-character product bound; query a closer target or reduce call-chain depth"
-        ),
+    Err(DomainError::result_too_large(
+        "tests",
+        smallest_result_chars,
+        MAX_GENERATION_ENGINE_RESULT_CHARS,
+        "Query a closer target or reduce call-chain depth; required Tests identity, authority, and unit metadata do not fit even when the page limit is one",
     ))
 }
 

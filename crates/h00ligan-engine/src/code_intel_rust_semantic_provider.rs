@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use h00ligan_provider_protocol::{
-    H00_RUST_ANALYZER_IMPLEMENTATION_V5, H00_RUST_ANALYZER_LANGUAGE, H00_RUST_ANALYZER_PROVIDER_ID,
+    H00_RUST_ANALYZER_IMPLEMENTATION_V6, H00_RUST_ANALYZER_LANGUAGE, H00_RUST_ANALYZER_PROVIDER_ID,
     ProviderFrameLimits, ProviderIdentity, ProviderSemanticInputs, RESOLVED_CARGO_SHA256_ENV,
     RESOLVED_RUSTC_SHA256_ENV, RUST_SEMANTIC_PROFILE_ENV, RustSemanticProfile,
     rust_analyzer_source_components, sha256_hex, validate_provider_identity,
@@ -351,7 +351,7 @@ impl RustSemanticProviderConfig {
             .map_err(|error| SemanticProviderConfigError::Identity(error.to_string()))?;
         if expected_identity.provider_id != H00_RUST_ANALYZER_PROVIDER_ID
             || expected_identity.language != H00_RUST_ANALYZER_LANGUAGE
-            || expected_identity.implementation_version != H00_RUST_ANALYZER_IMPLEMENTATION_V5
+            || expected_identity.implementation_version != H00_RUST_ANALYZER_IMPLEMENTATION_V6
             || expected_identity.source_components != rust_analyzer_source_components()
         {
             return Err(SemanticProviderConfigError::Identity(

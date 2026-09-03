@@ -29,6 +29,10 @@ impl LanguageExtractor for GoExtractor {
         "go"
     }
 
+    fn source_file_is_test(&self, file_path: &str) -> bool {
+        file_path.ends_with("_test.go")
+    }
+
     fn ts_language_for_path(&self, _file_path: &str) -> tree_sitter::Language {
         // THE single sanctioned `tree_sitter_go` binding site (mirrors
         // `RustExtractor::ts_language`). `LANGUAGE: LanguageFn` -> `Language` via
@@ -38,6 +42,10 @@ impl LanguageExtractor for GoExtractor {
 
     fn named_callable_declaration_kinds(&self) -> &'static [&'static str] {
         &["function_declaration", "method_declaration", "method_elem"]
+    }
+
+    fn anonymous_callable_declaration_kinds(&self) -> &'static [&'static str] {
+        &["func_literal"]
     }
 
     fn named_call_syntax<'tree>(&self, call: Node<'tree>) -> Option<NamedCallSyntax<'tree>> {

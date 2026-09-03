@@ -370,8 +370,8 @@ func (engine *h00TypeScriptEngine) typeScriptExternalSymbol(
 func h00TypeScriptNamedContainers(declaration *ast.Node) []*scip.Descriptor {
 	var reversed []*scip.Descriptor
 	for parent := declaration.Parent; parent != nil && !ast.IsSourceFile(parent); parent = parent.Parent {
-		name := ast.GetNameOfDeclaration(parent)
-		if name == nil || name.Text() == "" {
+		name := ast.GetDeclarationName(parent)
+		if name == "" {
 			continue
 		}
 		suffix := scip.Descriptor_Term
@@ -380,7 +380,7 @@ func h00TypeScriptNamedContainers(declaration *ast.Node) []*scip.Descriptor {
 		} else if ast.IsModuleDeclaration(parent) {
 			suffix = scip.Descriptor_Namespace
 		}
-		reversed = append(reversed, &scip.Descriptor{Name: name.Text(), Suffix: suffix})
+		reversed = append(reversed, &scip.Descriptor{Name: name, Suffix: suffix})
 	}
 	containers := make([]*scip.Descriptor, 0, len(reversed))
 	for index := len(reversed) - 1; index >= 0; index-- {

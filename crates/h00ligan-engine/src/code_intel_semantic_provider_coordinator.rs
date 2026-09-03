@@ -21,8 +21,8 @@ use h00ligan_provider_protocol::{
     ProviderHealthEvidence, ProviderIdentity, ProviderOperation, ProviderRequestBody,
     ProviderResponseBody, ProviderSemanticEnvironmentInput, ProviderSemanticInputCoverage,
     ProviderSemanticInputIssue, ProviderSemanticInputs, ProviderSemanticPathInput,
-    ProviderSemanticPathKind, ProviderSourceChange, ProviderSourceIdentity,
-    RESOLVED_TOOLCHAIN_SHA256_ENV, provider_identity_sha256,
+    ProviderSemanticPathKind, ProviderSemanticPathRoot, ProviderSourceChange,
+    ProviderSourceIdentity, RESOLVED_TOOLCHAIN_SHA256_ENV, provider_identity_sha256,
     provider_semantic_inputs_are_current_in_environment, provider_semantic_inputs_sha256,
     resolved_authority_configuration_sha256, resolved_workspace_configuration_sha256, sha256_hex,
     source_population_sha256,
@@ -30,7 +30,7 @@ use h00ligan_provider_protocol::{
 #[cfg(test)]
 use h00ligan_provider_protocol::{
     H00_GO_IMPLEMENTATION_V4, H00_GO_LANGUAGE, H00_GO_PROVIDER_ID,
-    H00_RUST_ANALYZER_IMPLEMENTATION_V5, H00_RUST_ANALYZER_LANGUAGE, H00_RUST_ANALYZER_PROVIDER_ID,
+    H00_RUST_ANALYZER_IMPLEMENTATION_V6, H00_RUST_ANALYZER_LANGUAGE, H00_RUST_ANALYZER_PROVIDER_ID,
     RESOLVED_CARGO_SHA256_ENV, RESOLVED_RUSTC_SHA256_ENV, RustSemanticProfile,
     SEMANTIC_PROVIDER_CACHE_DIR_ENV, go_provider_source_components,
     rust_analyzer_source_components,
@@ -39,7 +39,7 @@ use thiserror::Error;
 
 use crate::code_intel_cancellation::IndexCancellation;
 use crate::code_intel_domain::{
-    CapabilityStatus, LanguageId, ProjectInventory, ProjectInventoryCoverage,
+    CapabilityStatus, EcosystemId, LanguageId, ProjectInventory, ProjectInventoryCoverage,
 };
 #[cfg(test)]
 use crate::code_intel_go_semantic_provider::{GoSemanticProviderConfig, GoSemanticProviderPolicy};
@@ -49,8 +49,8 @@ use crate::code_intel_inventory::{
 };
 use crate::code_intel_payload::{
     CallsProviderPayload, NormalizedProviderPayload, ProviderCall, ProviderExecutionAuthority,
-    ProviderExecutionRootAuthority, ProviderGenerationReconstruction, ProviderPayload,
-    normalize_provider_payload_typed,
+    ProviderExecutionRootAuthority, ProviderGenerationReconstruction, ProviderLocation,
+    ProviderPayload, ProviderRootInvocation, normalize_provider_payload_typed,
 };
 #[cfg(test)]
 use crate::code_intel_rust_semantic_provider::{
@@ -469,6 +469,158 @@ pub enum SemanticProviderError {
         #[source]
         source: Box<Self>,
     },
+}
+
+/// Bounded failure evidence that may cross the immutable publication boundary.
+///
+/// Process/session errors retain rich internal types, but generation receipts
+/// need one stable machine code plus bounded human detail. Keeping this
+/// projection on the owning error type prevents each index adapter from
+/// collapsing failures differently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticProviderFailureEvidence {
+    pub reason_code: String,
+    pub reason: String,
+}
+
+impl SemanticProviderError {
+    #[must_use]
+    pub(crate) fn immutable_failure_evidence(&self) -> SemanticProviderFailureEvidence {
+        const DETAIL_LIMIT: usize = 1_024;
+
+        let detail = self.to_string();
+        let mut reason = detail.chars().take(DETAIL_LIMIT).collect::<String>();
+        if detail.chars().count() > DETAIL_LIMIT {
+            reason.push('…');
+        }
+        SemanticProviderFailureEvidence {
+            reason_code: self.immutable_failure_reason_code(),
+            reason,
+        }
+    }
+
+    fn immutable_failure_reason_code(&self) -> String {
+        match self {
+            Self::ExecutionRoot { source, .. } | Self::PriorAuthorityPreserved { source } => {
+                source.immutable_failure_reason_code()
+            }
+            Self::Rejected { code, .. } => provider_failure_fragment(code).map_or_else(
+                || "provider_rejected_request".into(),
+                |code| format!("provider_rejected_{code}"),
+            ),
+            Self::IncompleteHealth { health, .. } => health_failure_reason_code(health),
+            Self::NoExecutionRoots => "provider_execution_root_unavailable".into(),
+            Self::InvalidRoot(_)
+            | Self::InvalidSourcePath(_)
+            | Self::SourceOutsideExecutionRoot(_)
+            | Self::EmptyExecutionRoot(_)
+            | Self::Inventory(_) => "provider_inventory_invalid".into(),
+            Self::SourceIdentityMismatch(_) | Self::SourceIdentityCollision(_) => {
+                "provider_source_identity_changed".into()
+            }
+            Self::Filesystem { .. } => "provider_filesystem_failed".into(),
+            Self::Process(error) => process_failure_reason_code(error).into(),
+            Self::Protocol(_) => "provider_protocol_invalid".into(),
+            Self::Bridge(error) => bridge_failure_reason_code(error).into(),
+            Self::InvalidTransition(_) => "provider_transition_invalid".into(),
+            Self::InconsistentProviderIdentity => "provider_identity_inconsistent".into(),
+            Self::Toolchain(error) => toolchain_failure_reason_code(error).into(),
+            Self::ToolchainBindingMismatch => "provider_toolchain_binding_mismatch".into(),
+            Self::ToolchainChanged => "provider_toolchain_changed".into(),
+            Self::IncompleteFullCertification => "provider_certification_incomplete".into(),
+        }
+    }
+}
+
+fn provider_failure_fragment(value: &str) -> Option<&str> {
+    (!value.is_empty()
+        && value.len() <= 96
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        }))
+    .then_some(value)
+}
+
+fn health_failure_reason_code(health: &ProviderHealthEvidence) -> String {
+    let mut degradation_reasons = health
+        .degradation_reasons
+        .iter()
+        .filter_map(|reason| provider_failure_fragment(reason))
+        .collect::<Vec<_>>();
+    degradation_reasons.sort_unstable();
+    degradation_reasons.dedup();
+    if degradation_reasons.len() == 1 {
+        return format!("provider_health_{}", degradation_reasons[0]);
+    }
+
+    let mut unhealthy_components = health
+        .components
+        .iter()
+        .filter(|(_, status)| {
+            !matches!(
+                status,
+                h00ligan_provider_protocol::ProviderComponentHealth::Healthy
+                    | h00ligan_provider_protocol::ProviderComponentHealth::NotApplicable
+            )
+        })
+        .filter_map(|(component, _)| provider_failure_fragment(component))
+        .collect::<Vec<_>>();
+    unhealthy_components.sort_unstable();
+    unhealthy_components.dedup();
+    if unhealthy_components.len() == 1 {
+        format!("provider_health_{}", unhealthy_components[0])
+    } else {
+        "provider_health_incomplete".into()
+    }
+}
+
+const fn process_failure_reason_code(error: &SemanticProviderProcessError) -> &'static str {
+    match error {
+        SemanticProviderProcessError::Timeout => "provider_process_timeout",
+        SemanticProviderProcessError::Cancelled => "provider_process_cancelled",
+        SemanticProviderProcessError::Exited
+        | SemanticProviderProcessError::ProcessFailure { .. } => "provider_process_exited",
+        SemanticProviderProcessError::ExecutableIdentityMismatch
+        | SemanticProviderProcessError::TerminalIdentityMismatch => {
+            "provider_process_identity_mismatch"
+        }
+        SemanticProviderProcessError::ToolchainIdentityMismatch => {
+            "provider_toolchain_identity_mismatch"
+        }
+        SemanticProviderProcessError::Protocol(_) => "provider_protocol_invalid",
+        SemanticProviderProcessError::Spawn(_) => "provider_process_spawn_failed",
+        SemanticProviderProcessError::Filesystem(_) => "provider_filesystem_failed",
+        SemanticProviderProcessError::InvalidConfiguration(_)
+        | SemanticProviderProcessError::RuntimeConfigurationInvalid
+        | SemanticProviderProcessError::LimitsMismatch => "provider_process_configuration_invalid",
+        SemanticProviderProcessError::UnexpectedTerminal
+        | SemanticProviderProcessError::UnexpectedHello => "provider_transition_invalid",
+        SemanticProviderProcessError::Quarantined => "provider_process_quarantined",
+        SemanticProviderProcessError::CloseFailed => "provider_process_close_failed",
+    }
+}
+
+const fn bridge_failure_reason_code(error: &SemanticProviderBridgeError) -> &'static str {
+    match error {
+        SemanticProviderBridgeError::Protocol(_) => "provider_protocol_invalid",
+        SemanticProviderBridgeError::CanonicalDocumentDecode(_)
+        | SemanticProviderBridgeError::CanonicalAnalysis(_)
+        | SemanticProviderBridgeError::CanonicalSnapshot(_)
+        | SemanticProviderBridgeError::EmptyCertificationPopulation
+        | SemanticProviderBridgeError::OverlappingCertificationPopulation
+        | SemanticProviderBridgeError::OverlappingCertificationRoots => "provider_output_invalid",
+        SemanticProviderBridgeError::ParentSnapshotMismatch
+        | SemanticProviderBridgeError::ProviderLineageMismatch => "provider_authority_mismatch",
+    }
+}
+
+const fn toolchain_failure_reason_code(error: &ToolchainResolutionError) -> &'static str {
+    match error {
+        ToolchainResolutionError::Cancelled => "provider_toolchain_resolution_cancelled",
+        ToolchainResolutionError::UnsupportedLanguage(_) => "provider_toolchain_unsupported",
+        ToolchainResolutionError::Invalid(_) => "provider_toolchain_invalid",
+        ToolchainResolutionError::Resolution { .. } => "provider_toolchain_resolution_failed",
+    }
 }
 
 /// One successfully admitted provider refresh lane. Exact reuse is modeled as
@@ -1368,8 +1520,10 @@ impl<P: SemanticProviderPolicy> PersistentSemanticProviderCoordinator<P> {
         // Closed-generation reconstruction is an adapter capability, not a
         // lifecycle language branch. Adapters without an independently proven
         // closed reconstruction contract must open the real provider session.
-        if inventory.coverage != ProjectInventoryCoverage::IndexedSourcePopulationComplete
-            || !inventory.issues.is_empty()
+        if inventory.coverage_for_provider(
+            &LanguageId::new(self.config.policy.language()),
+            &EcosystemId::new(self.config.policy.ecosystem()),
+        ) != ProjectInventoryCoverage::IndexedSourcePopulationComplete
             || persisted_roots.len() != execution_roots.len()
             || !self
                 .config
@@ -2211,7 +2365,12 @@ impl<P: SemanticProviderPolicy> PersistentSemanticProviderCoordinator<P> {
                     current_toolchains.get(root) == Some(&session.toolchain)
                         && session.sources == sources_for_root(current_sources, root)
                         && semantic_input_paths.get(root).is_some_and(|paths| {
-                            *paths == semantic_input_path_population(&session.semantic_inputs)
+                            paths
+                                .iter()
+                                .cloned()
+                                .map(|path| (ProviderSemanticPathRoot::Repository, path))
+                                .collect::<BTreeSet<_>>()
+                                == semantic_input_path_population(&session.semantic_inputs)
                         })
                         && root_topology_sha256.get(root).is_some_and(|topology| {
                             topology != &session.authority.root_topology_sha256
@@ -3901,20 +4060,23 @@ fn source_changed_documents_by_execution_root(
 }
 
 fn semantic_input_path_covers_document(input: &ProviderSemanticPathInput, document: &str) -> bool {
-    input.path == document
-        || matches!(
-            input.kind,
-            ProviderSemanticPathKind::Directory | ProviderSemanticPathKind::DirectoryListing
-        ) && document
-            .strip_prefix(&input.path)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+    input.root == ProviderSemanticPathRoot::Repository
+        && (input.path == document
+            || matches!(
+                input.kind,
+                ProviderSemanticPathKind::Directory | ProviderSemanticPathKind::DirectoryListing
+            ) && document
+                .strip_prefix(&input.path)
+                .is_some_and(|suffix| suffix.starts_with('/')))
 }
 
-fn semantic_input_path_population(inputs: &ProviderSemanticInputs) -> BTreeSet<String> {
+fn semantic_input_path_population(
+    inputs: &ProviderSemanticInputs,
+) -> BTreeSet<(ProviderSemanticPathRoot, String)> {
     inputs
         .paths
         .iter()
-        .map(|input| input.path.clone())
+        .map(|input| (input.root, input.path.clone()))
         .collect()
 }
 
@@ -4174,13 +4336,14 @@ fn common_limits(
 fn combined_semantic_inputs(
     sessions: &BTreeMap<PathBuf, RootSession>,
 ) -> Result<ProviderSemanticInputs, SemanticProviderError> {
-    let mut paths = BTreeMap::<String, ProviderSemanticPathInput>::new();
+    let mut paths =
+        BTreeMap::<(ProviderSemanticPathRoot, String), ProviderSemanticPathInput>::new();
     let mut environment = BTreeMap::<String, ProviderSemanticEnvironmentInput>::new();
     let mut issues = BTreeSet::<ProviderSemanticInputIssue>::new();
     for session in sessions.values() {
         for input in &session.semantic_inputs.paths {
             if paths
-                .insert(input.path.clone(), input.clone())
+                .insert((input.root, input.path.clone()), input.clone())
                 .is_some_and(|previous| previous != *input)
             {
                 return Err(SemanticProviderError::InvalidTransition(
@@ -4389,20 +4552,20 @@ fn unaffected_call_divergences(
     candidate: &CallsProviderPayload,
     affected: &BTreeSet<String>,
 ) -> Vec<SemanticTargetDivergence> {
-    let prior = unaffected_calls(&prior.calls, affected);
-    let candidate = unaffected_calls(&candidate.calls, affected);
+    let prior_calls = unaffected_calls(&prior.calls, affected);
+    let candidate_calls = unaffected_calls(&candidate.calls, affected);
     let mut divergences = BTreeSet::new();
     let mut prior_index = 0;
     let mut candidate_index = 0;
 
-    while prior_index < prior.len() && candidate_index < candidate.len() {
-        match prior[prior_index].cmp(candidate[candidate_index]) {
+    while prior_index < prior_calls.len() && candidate_index < candidate_calls.len() {
+        match prior_calls[prior_index].cmp(candidate_calls[candidate_index]) {
             std::cmp::Ordering::Less => {
-                divergences.insert(call_divergence(prior[prior_index]));
+                divergences.insert(call_divergence(prior_calls[prior_index]));
                 prior_index += 1;
             }
             std::cmp::Ordering::Greater => {
-                divergences.insert(call_divergence(candidate[candidate_index]));
+                divergences.insert(call_divergence(candidate_calls[candidate_index]));
                 candidate_index += 1;
             }
             std::cmp::Ordering::Equal => {
@@ -4411,13 +4574,47 @@ fn unaffected_call_divergences(
             }
         }
     }
-    for call in &prior[prior_index..] {
+    for call in &prior_calls[prior_index..] {
         divergences.insert(call_divergence(call));
     }
-    for call in &candidate[candidate_index..] {
+    for call in &candidate_calls[candidate_index..] {
         divergences.insert(call_divergence(call));
     }
+    divergences.extend(unaffected_root_invocation_divergences(
+        &prior.root_invocations,
+        &candidate.root_invocations,
+        affected,
+    ));
     divergences.into_iter().collect()
+}
+
+fn unaffected_root_invocation_divergences(
+    prior: &[ProviderRootInvocation],
+    candidate: &[ProviderRootInvocation],
+    affected: &BTreeSet<String>,
+) -> BTreeSet<SemanticTargetDivergence> {
+    let prior = prior
+        .iter()
+        .filter(|invocation| !affected.contains(&invocation.call_site.document_path))
+        .collect::<BTreeSet<_>>();
+    let candidate = candidate
+        .iter()
+        .filter(|invocation| !affected.contains(&invocation.call_site.document_path))
+        .collect::<BTreeSet<_>>();
+    prior
+        .symmetric_difference(&candidate)
+        .map(|invocation| location_divergence(&invocation.call_site))
+        .collect()
+}
+
+fn location_divergence(location: &ProviderLocation) -> SemanticTargetDivergence {
+    SemanticTargetDivergence {
+        document_path: location.document_path.clone(),
+        call_site_identity: format!(
+            "{}:{}-{}",
+            location.document_path, location.span.start_byte, location.span.end_byte
+        ),
+    }
 }
 
 fn unaffected_calls<'a>(
@@ -4612,7 +4809,7 @@ mod tests {
         let snapshot = canonical_scip_snapshot_from_provider_document_sets(
             &root,
             ScipProviderSpec::rust_analyzer_sidecar(),
-            H00_RUST_ANALYZER_IMPLEMENTATION_V5,
+            H00_RUST_ANALYZER_IMPLEMENTATION_V6,
             &BTreeMap::from([(root.clone(), "c".repeat(64))]),
             Vec::new(),
             &inventory,
@@ -4622,7 +4819,7 @@ mod tests {
             CallsProviderPayload::new(crate::code_intel_domain::CapabilityReceipt::complete(
                 "calls",
                 H00_RUST_ANALYZER_PROVIDER_ID,
-                H00_RUST_ANALYZER_IMPLEMENTATION_V5,
+                H00_RUST_ANALYZER_IMPLEMENTATION_V6,
                 crate::code_intel_domain::CapabilityScope::Language {
                     language_id: LanguageId::new(H00_RUST_ANALYZER_LANGUAGE),
                     configuration_id: crate::code_intel_domain::ConfigurationId::new(
@@ -4651,7 +4848,7 @@ mod tests {
             protocol: h00ligan_provider_protocol::SEMANTIC_PROVIDER_PROTOCOL.into(),
             provider_id: H00_RUST_ANALYZER_PROVIDER_ID.into(),
             language: H00_RUST_ANALYZER_LANGUAGE.into(),
-            implementation_version: H00_RUST_ANALYZER_IMPLEMENTATION_V5.into(),
+            implementation_version: H00_RUST_ANALYZER_IMPLEMENTATION_V6.into(),
             source_components: rust_analyzer_source_components(),
             patch_sha256: "a".repeat(64),
             executable_sha256: "b".repeat(64),
@@ -4713,6 +4910,24 @@ mod tests {
         ProviderCall {
             caller_symbol_id: "caller".into(),
             callee_symbol_id: callee.into(),
+            call_site: ProviderLocation {
+                document_path: path.into(),
+                span: NormalizedSourceSpan {
+                    start_byte: start,
+                    end_byte: start + 1,
+                    start_line: 0,
+                    start_utf8_byte_column: start as u32,
+                    end_line: 0,
+                    end_utf8_byte_column: start as u32 + 1,
+                },
+            },
+        }
+    }
+
+    fn root_invocation(path: &str, start: u64, callee: &str) -> ProviderRootInvocation {
+        ProviderRootInvocation {
+            callee_symbol_id: callee.into(),
+            context: crate::code_intel_domain::ExecutionRootContext::ModuleInitialization,
             call_site: ProviderLocation {
                 document_path: path.into(),
                 span: NormalizedSourceSpan {
@@ -4815,12 +5030,47 @@ mod tests {
     }
 
     #[test]
+    fn unaffected_root_target_or_ownership_change_forces_a_full_candidate() {
+        let affected = BTreeSet::from(["src/changed.ts".into()]);
+        let receipt = crate::code_intel_domain::CapabilityReceipt::complete(
+            "calls",
+            "provider",
+            "version",
+            crate::code_intel_domain::CapabilityScope::Language {
+                language_id: LanguageId::new("typescript"),
+                configuration_id: crate::code_intel_domain::ConfigurationId::new("config"),
+            },
+            "fingerprint",
+        );
+        let mut prior = CallsProviderPayload::new(receipt.clone());
+        prior.root_invocations = vec![root_invocation("src/unchanged.ts", 4, "target-a")];
+        let mut changed_target = CallsProviderPayload::new(receipt.clone());
+        changed_target.root_invocations = vec![root_invocation("src/unchanged.ts", 4, "target-b")];
+        let expected = vec![SemanticTargetDivergence {
+            document_path: "src/unchanged.ts".into(),
+            call_site_identity: "src/unchanged.ts:4-5".into(),
+        }];
+        assert_eq!(
+            unaffected_call_divergences(&prior, &changed_target, &affected),
+            expected
+        );
+
+        let mut changed_owner = CallsProviderPayload::new(receipt);
+        changed_owner.calls = vec![call("src/unchanged.ts", 4, "target-a")];
+        assert_eq!(
+            unaffected_call_divergences(&prior, &changed_owner, &affected),
+            expected,
+            "changing a source occurrence between execution-root and callable ownership must invalidate incremental reuse"
+        );
+    }
+
+    #[test]
     fn provider_config_requires_the_exact_rust_provider_identity() {
         let exact = ProviderIdentity {
             protocol: h00ligan_provider_protocol::SEMANTIC_PROVIDER_PROTOCOL.into(),
             provider_id: H00_RUST_ANALYZER_PROVIDER_ID.into(),
             language: H00_RUST_ANALYZER_LANGUAGE.into(),
-            implementation_version: H00_RUST_ANALYZER_IMPLEMENTATION_V5.into(),
+            implementation_version: H00_RUST_ANALYZER_IMPLEMENTATION_V6.into(),
             source_components: rust_analyzer_source_components(),
             patch_sha256: "a".repeat(64),
             executable_sha256: "b".repeat(64),
@@ -4875,7 +5125,7 @@ mod tests {
         let typescript_identity = identity(
             h00ligan_provider_protocol::H00_TYPESCRIPT_PROVIDER_ID,
             h00ligan_provider_protocol::H00_TYPESCRIPT_LANGUAGE,
-            h00ligan_provider_protocol::H00_TYPESCRIPT_IMPLEMENTATION_V1,
+            h00ligan_provider_protocol::H00_TYPESCRIPT_IMPLEMENTATION_V2,
             h00ligan_provider_protocol::typescript_source_components(),
         );
         let resolver = Arc::new(TestToolchainResolver::default());
@@ -4941,7 +5191,7 @@ mod tests {
             protocol: h00ligan_provider_protocol::SEMANTIC_PROVIDER_PROTOCOL.into(),
             provider_id: H00_RUST_ANALYZER_PROVIDER_ID.into(),
             language: H00_RUST_ANALYZER_LANGUAGE.into(),
-            implementation_version: H00_RUST_ANALYZER_IMPLEMENTATION_V5.into(),
+            implementation_version: H00_RUST_ANALYZER_IMPLEMENTATION_V6.into(),
             source_components: rust_analyzer_source_components(),
             patch_sha256: "a".repeat(64),
             executable_sha256: "b".repeat(64),
@@ -5019,7 +5269,7 @@ mod tests {
             protocol: h00ligan_provider_protocol::SEMANTIC_PROVIDER_PROTOCOL.into(),
             provider_id: H00_RUST_ANALYZER_PROVIDER_ID.into(),
             language: H00_RUST_ANALYZER_LANGUAGE.into(),
-            implementation_version: H00_RUST_ANALYZER_IMPLEMENTATION_V5.into(),
+            implementation_version: H00_RUST_ANALYZER_IMPLEMENTATION_V6.into(),
             source_components: rust_analyzer_source_components(),
             patch_sha256: "a".repeat(64),
             executable_sha256: "b".repeat(64),
@@ -6176,6 +6426,7 @@ mod tests {
             .semantic_inputs
             .paths
             .push(ProviderSemanticPathInput {
+                root: ProviderSemanticPathRoot::Repository,
                 path: "alpha/src/lib.rs".into(),
                 kind: ProviderSemanticPathKind::File,
                 identity_sha256: "f".repeat(64),
@@ -6418,7 +6669,7 @@ mod tests {
         let snapshot = canonical_scip_snapshot_from_provider_document_sets(
             &repository_root,
             ScipProviderSpec::rust_analyzer_sidecar(),
-            H00_RUST_ANALYZER_IMPLEMENTATION_V5,
+            H00_RUST_ANALYZER_IMPLEMENTATION_V6,
             &provider_configurations,
             Vec::new(),
             &inventory,
@@ -6440,7 +6691,7 @@ mod tests {
             CallsProviderPayload::new(crate::code_intel_domain::CapabilityReceipt::complete(
                 "calls",
                 H00_RUST_ANALYZER_PROVIDER_ID,
-                H00_RUST_ANALYZER_IMPLEMENTATION_V5,
+                H00_RUST_ANALYZER_IMPLEMENTATION_V6,
                 crate::code_intel_domain::CapabilityScope::ProjectUnits {
                     language_id: LanguageId::new(H00_RUST_ANALYZER_LANGUAGE),
                     project_unit_ids,
@@ -6554,7 +6805,7 @@ mod tests {
             protocol: field("protocol"),
             provider_id: field("provider_id"),
             language: field("language"),
-            implementation_version: H00_RUST_ANALYZER_IMPLEMENTATION_V5.into(),
+            implementation_version: H00_RUST_ANALYZER_IMPLEMENTATION_V6.into(),
             source_components: rust_analyzer_source_components(),
             patch_sha256: field("patch_sha256"),
             executable_sha256: sha256_hex(&fs::read(binary).expect("provider binary")),
@@ -6969,7 +7220,7 @@ mod tests {
             CallsProviderPayload::new(crate::code_intel_domain::CapabilityReceipt::complete(
                 "calls",
                 H00_RUST_ANALYZER_PROVIDER_ID,
-                H00_RUST_ANALYZER_IMPLEMENTATION_V5,
+                H00_RUST_ANALYZER_IMPLEMENTATION_V6,
                 crate::code_intel_domain::CapabilityScope::ProjectUnits {
                     language_id: LanguageId::new(H00_RUST_ANALYZER_LANGUAGE),
                     project_unit_ids: project_unit_ids.clone(),
@@ -6998,7 +7249,7 @@ mod tests {
         let persisted_snapshot = canonical_scip_snapshot_from_provider_document_sets(
             &root,
             ScipProviderSpec::rust_analyzer_sidecar(),
-            H00_RUST_ANALYZER_IMPLEMENTATION_V5,
+            H00_RUST_ANALYZER_IMPLEMENTATION_V6,
             &BTreeMap::from([(
                 root.clone(),
                 configurations
@@ -7020,7 +7271,7 @@ mod tests {
                 crate::code_intel_domain::CapabilityReceipt::complete(
                     "callable_liveness",
                     H00_RUST_ANALYZER_PROVIDER_ID,
-                    H00_RUST_ANALYZER_IMPLEMENTATION_V5,
+                    H00_RUST_ANALYZER_IMPLEMENTATION_V6,
                     crate::code_intel_domain::CapabilityScope::ProjectUnits {
                         language_id: LanguageId::new(H00_RUST_ANALYZER_LANGUAGE),
                         project_unit_ids,
@@ -7662,7 +7913,7 @@ mod tests {
             CallsProviderPayload::new(crate::code_intel_domain::CapabilityReceipt::complete(
                 "calls",
                 H00_RUST_ANALYZER_PROVIDER_ID,
-                H00_RUST_ANALYZER_IMPLEMENTATION_V5,
+                H00_RUST_ANALYZER_IMPLEMENTATION_V6,
                 crate::code_intel_domain::CapabilityScope::ProjectUnits {
                     language_id: LanguageId::new(H00_RUST_ANALYZER_LANGUAGE),
                     project_unit_ids,
@@ -7691,7 +7942,7 @@ mod tests {
         let snapshot = canonical_scip_snapshot_from_provider_document_sets(
             &root,
             ScipProviderSpec::rust_analyzer_sidecar(),
-            H00_RUST_ANALYZER_IMPLEMENTATION_V5,
+            H00_RUST_ANALYZER_IMPLEMENTATION_V6,
             &BTreeMap::from([(root.clone(), resolved_configuration)]),
             Vec::new(),
             &inventory,

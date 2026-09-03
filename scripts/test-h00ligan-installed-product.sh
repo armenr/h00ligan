@@ -13,23 +13,12 @@ if [[ -z "${DEVBOX_PACKAGES_DIR:-}" ]]; then
     exec devbox run -- "$0" "$@"
 fi
 
-mkdir -p "$repo_root/target"
-[[ -d "$repo_root/target" && ! -L "$repo_root/target" ]] || {
-    echo "installed h00ligan test target root must be a real directory" >&2
-    exit 1
-}
 test_tmp_parent="$repo_root/target/h00ligan-test-tmp"
-mkdir -p "$test_tmp_parent"
-[[ -d "$test_tmp_parent" && ! -L "$test_tmp_parent" ]] || {
-    echo "installed h00ligan test temporary parent must be a real directory" >&2
-    exit 1
-}
-owned_tmp_root="$(mktemp -d "$test_tmp_parent/installed-product.XXXXXX")"
-export TMPDIR="$owned_tmp_root"
-scratch_root="$owned_tmp_root/acceptance"
-mkdir "$scratch_root"
+owned_tmp_root=""
+scratch_root=""
 process_baseline=""
 process_reconciled=0
+python_interrupted_cache_controls=()
 cleanup() {
     local status=$?
     if [[ "$process_reconciled" == 0 && -n "$process_baseline" && -f "$process_baseline" && -n "${binary:-}" ]]; then
@@ -39,6 +28,10 @@ cleanup() {
             status=1
         fi
     fi
+    local interrupted
+    for interrupted in "${python_interrupted_cache_controls[@]}"; do
+        [[ ! -e "$interrupted" && ! -L "$interrupted" ]] || rm -rf -- "$interrupted"
+    done
     [[ -n "${owned_tmp_root:-}" && -d "$owned_tmp_root" ]] && rm -rf -- "$owned_tmp_root"
     rmdir -- "$test_tmp_parent" 2>/dev/null || true
     trap - EXIT HUP INT TERM
@@ -48,6 +41,21 @@ trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+mkdir -p "$repo_root/target"
+[[ -d "$repo_root/target" && ! -L "$repo_root/target" ]] || {
+    echo "installed h00ligan test target root must be a real directory" >&2
+    exit 1
+}
+mkdir -p "$test_tmp_parent"
+[[ -d "$test_tmp_parent" && ! -L "$test_tmp_parent" ]] || {
+    echo "installed h00ligan test temporary parent must be a real directory" >&2
+    exit 1
+}
+owned_tmp_root="$(mktemp -d "$test_tmp_parent/installed-product.XXXXXX")"
+export TMPDIR="$owned_tmp_root"
+scratch_root="$owned_tmp_root/acceptance"
+mkdir "$scratch_root"
 
 binary="${H00_TEST_H00LIGAN_BINARY:-}"
 receipt="${H00_TEST_H00LIGAN_RECEIPT:-}"
@@ -243,6 +251,47 @@ python_compilation_before="$(directory_logical_bytes "$python_compilation_cache"
     echo "Pyrefly provider retained compiler cache residue before replay: $python_compilation_before bytes" >&2
     exit 1
 }
+python_forged_lock_log="$scratch_root/pyrefly-forged-lock.log"
+if H00LIGAN_CACHE_LOCK_FD=999999 \
+    "$repo_root/scripts/build-h00-pyrefly-semantic-provider.sh" \
+    --target "$target" --prepare-only >"$python_forged_lock_log" 2>&1; then
+    echo "Pyrefly provider accepted a forged inherited compiler lock" >&2
+    exit 1
+fi
+grep -Fq "cache lock descriptor is not open" "$python_forged_lock_log" || {
+    echo "Pyrefly forged-lock refusal did not fire for the intended reason" >&2
+    exit 1
+}
+python_source_root="$(printf '%s\n' "$provider_details" | sed -n 's/^H00_PYREFLY_SOURCE_ROOT=//p')"
+[[ -d "$python_source_root" && ! -L "$python_source_root" ]] || {
+    echo "installed h00ligan gate lacks the exact Pyrefly source root" >&2
+    exit 1
+}
+python_cache_root="$repo_root/target/portable-cache/python-provider"
+for template in \
+    "$python_cache_root/invocations/invocation.interrupted-control.XXXXXX" \
+    "$python_cache_root/candidates/source.interrupted-control.XXXXXX" \
+    "$python_cache_root/candidates/adapter.interrupted-control.XXXXXX" \
+    "$python_compilation_cache/build.interrupted-control.XXXXXX" \
+    "$python_cache_root/artifacts/$target/artifact.interrupted-control.XXXXXX"; do
+    interrupted="$(mktemp -d "$template")"
+    printf 'interrupted-provider-output\n' > "$interrupted/payload"
+    python_interrupted_cache_controls+=("$interrupted")
+done
+python_interrupted_archive="$(mktemp "$python_cache_root/archives/pyrefly-1.2.0.tar.gz.download.interrupted-control.XXXXXX")"
+printf 'interrupted-download\n' > "$python_interrupted_archive"
+python_interrupted_cache_controls+=("$python_interrupted_archive")
+for interrupted in "${python_interrupted_cache_controls[@]}"; do
+    [[ -e "$interrupted" || -L "$interrupted" ]] || {
+        echo "Pyrefly interrupted-cache residue positive control did not fire: $interrupted" >&2
+        exit 1
+    }
+done
+python_stale_compilation_bytes="$(directory_logical_bytes "$python_compilation_cache")"
+((python_stale_compilation_bytes > 0)) || {
+    echo "Pyrefly interrupted compiler-root positive control did not fire" >&2
+    exit 1
+}
 python_repeat_details="$(
     "$repo_root/scripts/build-h00-pyrefly-semantic-provider.sh" \
         --target "$target" --machine
@@ -252,6 +301,13 @@ python_compilation_after="$(directory_logical_bytes "$python_compilation_cache")
     echo "Pyrefly provider retained compiler cache residue after replay: $python_compilation_after bytes" >&2
     exit 1
 }
+for interrupted in "${python_interrupted_cache_controls[@]}"; do
+    [[ ! -e "$interrupted" && ! -L "$interrupted" ]] || {
+        echo "Pyrefly provider retained interrupted cache residue after replay: $interrupted" >&2
+        exit 1
+    }
+done
+python_interrupted_cache_controls=()
 python_expected_sha256="$(printf '%s\n' "$provider_details" | sed -n 's/^H00_PYREFLY_PROVIDER_BINARY_SHA256=//p')"
 python_repeated_sha256="$(printf '%s\n' "$python_repeat_details" | sed -n 's/^H00_PYREFLY_PROVIDER_BINARY_SHA256=//p')"
 [[ "$python_expected_sha256" =~ ^[0-9a-f]{64}$ \
@@ -317,6 +373,16 @@ cargo test --locked --offline -p h00ligan \
 
 cargo test --locked --offline -p h00ligan \
     --test installed_one_file_mcp \
+    installed_rust_linked_worktree_git_inputs_remain_complete -- \
+    --exact --ignored --nocapture --test-threads=1
+
+cargo test --locked --offline -p h00ligan \
+    --test installed_one_file_mcp \
+    installed_rust_linked_worktree_refuses_nonreciprocal_git_authority -- \
+    --exact --ignored --nocapture --test-threads=1
+
+cargo test --locked --offline -p h00ligan \
+    --test installed_one_file_mcp \
     installed_typescript_cli_and_mcp_need_no_ambient_toolchain -- \
     --exact --ignored --nocapture --test-threads=1
 
@@ -335,32 +401,36 @@ cargo test --locked --offline -p h00ligan \
     installed_multiroot_go_index_overlaps_independent_provider_processes -- \
     --exact --ignored --nocapture --test-threads=1
 
-watch_tests=(
-    installed_typescript_watch_source_and_configuration_lifecycle_matches_full_baselines
-    installed_python_watch_source_and_configuration_lifecycle_matches_full_baselines
-    installed_mixed_watch_does_not_rerun_go_for_a_rust_only_edit
-    installed_go_watch_body_edit_reuses_one_session_with_full_baseline_parity
-    installed_go_watch_import_change_succeeds_in_first_reconciliation
-    installed_go_build_variant_is_explicitly_qualified
-    installed_go_workspace_watch_does_not_rerun_an_unchanged_module
-    installed_go_workspace_watch_recovers_exact_basis_after_process_restart
-    installed_independent_go_project_input_change_reuses_only_affected_root
-    installed_nested_go_workspace_inputs_reconfigure_warm
-    installed_one_file_watch_recertifies_hidden_cargo_configuration
-    installed_one_file_watch_reloads_changed_build_script_semantics
-    installed_one_file_watch_reloads_changed_build_input_semantics
-    installed_one_file_watch_reloads_hidden_declared_build_input_semantics
-    installed_one_file_status_detects_persisted_build_input_drift
-    installed_one_file_refuses_weaker_rust_fallback_after_health_failure
-)
-for test_name in "${watch_tests[@]}"; do
+watch_test_source="$repo_root/crates/h00ligan/tests/watch_lifecycle.rs"
+declared_watch_population="$(
+    sed -n 's/^fn \(installed_[[:alnum:]_]*\)() {$/\1/p' "$watch_test_source" |
+        LC_ALL=C sort
+)"
+discovered_watch_population="$(
+    cargo test --locked --offline -p h00ligan \
+        --test watch_lifecycle -- --list --ignored |
+        sed -n 's/^\(installed_[[:alnum:]_]*\): test$/\1/p' |
+        LC_ALL=C sort
+)"
+[[ -n "$declared_watch_population" ]] || {
+    echo "installed WATCH declaration population is empty" >&2
+    exit 1
+}
+[[ "$declared_watch_population" == "$discovered_watch_population" ]] || {
+    printf 'installed WATCH declaration/discovery mismatch\ndeclared=%s\ndiscovered=%s\n' \
+        "$declared_watch_population" "$discovered_watch_population" >&2
+    exit 1
+}
+watch_test_count=0
+while IFS= read -r test_name; do
     cargo test --locked --offline -p h00ligan \
         --test watch_lifecycle "$test_name" -- \
         --exact --ignored --nocapture --test-threads=1
-done
+    watch_test_count=$((watch_test_count + 1))
+done <<< "$discovered_watch_population"
 
 process_after="$scratch_root/product-process-after.json"
 capture_product_processes "$process_after"
 process_population_comparator "$process_baseline" "$process_after"
 process_reconciled=1
-printf 'installed-h00ligan-product: OK (receipted build authority, hidden provider, MCP, provider concurrency, %d WATCH lifecycles; zero new process residue)\n' "${#watch_tests[@]}"
+printf 'installed-h00ligan-product: OK (receipted build authority, hidden provider, MCP, provider concurrency, %d WATCH lifecycles; zero new process residue)\n' "$watch_test_count"

@@ -13,11 +13,11 @@ use crate::code_intel_cursor::{page_window, request_digest};
 use crate::code_intel_domain::{
     AuthorityStatus, CALLS_CONFIGURATION_ID, CallerFilter, CallsPopulation, CallsRequest,
     CapabilityCoverage, CapabilityCoverageStatus, CapabilityEvidenceGap, CapabilityQualification,
-    CapabilityScope, CapabilityStatus, ConfigurationId, DomainError, GenerationId, LanguageId,
-    MAX_CALLS_PAGE_SIZE, Page, ProjectInventory, ProjectInventoryCoverage, ProjectUnitId,
-    ProviderId, RepositoryBinding, ResolvedCapabilityProvider, SourceSpan, SymbolIdentity,
-    UnitGraph, aggregate_capability_coverage_status, assess_calls_receipt_coverage,
-    capability_resolution_domain_error, resolve_capability_provider,
+    CapabilityScope, CapabilityStatus, ConfigurationId, DomainError, ExecutionRootContext,
+    GenerationId, LanguageId, MAX_CALLS_PAGE_SIZE, MAX_GENERATION_ENGINE_RESULT_CHARS, Page,
+    ProjectInventory, ProjectUnitId, ProviderId, RepositoryBinding, ResolvedCapabilityProvider,
+    SourceSpan, SymbolIdentity, UnitGraph, aggregate_capability_coverage_status,
+    assess_calls_receipt_coverage, capability_resolution_domain_error, resolve_capability_provider,
 };
 use crate::code_intel_inventory::project_unit_graph;
 use crate::code_intel_payload::{
@@ -36,7 +36,7 @@ use crate::project_binding::ProjectBinding;
 use crate::reachability::ReachabilityClass;
 use crate::structural_ir::{SymbolRole, symbol_kind_has_role};
 
-const CALLS_SCHEMA_VERSION: &str = "h00/code-intel/calls/v9";
+const CALLS_SCHEMA_VERSION: &str = "h00/code-intel/calls/v11";
 
 #[cfg(test)]
 std::thread_local! {
@@ -207,15 +207,123 @@ pub struct AuthorityCoverageExclusion {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExactCallReference {
-    pub caller: SymbolIdentity,
+    pub origin: CallOrigin,
     pub call_span: SourceSpan,
     pub context: String,
+}
+
+/// Exact source execution context for an invocation that has no published
+/// structural caller. This is source identity, not a fabricated symbol or
+/// graph node.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ExecutionRootIdentity {
+    pub document_path: String,
+    pub language_id: LanguageId,
+    pub project_unit_ids: Vec<ProjectUnitId>,
+    pub configuration_id: ConfigurationId,
+    pub class: ExecutionRootClass,
+    pub context: ExecutionRootContext,
+}
+
+impl ExecutionRootIdentity {
+    pub(crate) fn stable_key(&self) -> String {
+        format!(
+            "root:{}:{}:{}",
+            self.class.as_str(),
+            self.context.as_str(),
+            self.document_path
+        )
+    }
+
+    #[must_use]
+    pub const fn display_name(&self) -> &'static str {
+        match (self.class, self.context) {
+            (ExecutionRootClass::Production, ExecutionRootContext::ModuleInitialization) => {
+                "<module initialization>"
+            }
+            (ExecutionRootClass::Test, ExecutionRootContext::ModuleInitialization) => {
+                "<test module initialization>"
+            }
+            (ExecutionRootClass::Production, ExecutionRootContext::AnonymousCallable) => {
+                "<anonymous callable context>"
+            }
+            (ExecutionRootClass::Test, ExecutionRootContext::AnonymousCallable) => {
+                "<anonymous test callable context>"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionRootClass {
+    Production,
+    Test,
+}
+
+impl ExecutionRootClass {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Production => "production",
+            Self::Test => "test",
+        }
+    }
+}
+
+/// The exact source origin of one provider-resolved invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "identity", rename_all = "snake_case")]
+pub enum CallOrigin {
+    Callable(SymbolIdentity),
+    ExecutionRoot(ExecutionRootIdentity),
+}
+
+impl CallOrigin {
+    #[must_use]
+    pub const fn callable(&self) -> Option<&SymbolIdentity> {
+        match self {
+            Self::Callable(caller) => Some(caller),
+            Self::ExecutionRoot(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn document_path(&self) -> &str {
+        match self {
+            Self::Callable(caller) => &caller.document_path,
+            Self::ExecutionRoot(root) => &root.document_path,
+        }
+    }
+
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        match self {
+            Self::Callable(caller) => &caller.name,
+            Self::ExecutionRoot(root) => root.display_name(),
+        }
+    }
+
+    pub(crate) fn stable_key(&self) -> String {
+        match self {
+            Self::Callable(caller) => format!("callable:{}", caller.symbol_id),
+            Self::ExecutionRoot(root) => root.stable_key(),
+        }
+    }
 }
 
 /// One exact provider-resolved invocation in an execution path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExactCallStep {
     pub caller: SymbolIdentity,
+    pub callee: SymbolIdentity,
+    pub call_span: SourceSpan,
+}
+
+/// One exact provider-resolved invocation from a source execution root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExactRootCallStep {
+    pub root: ExecutionRootIdentity,
     pub callee: SymbolIdentity,
     pub call_span: SourceSpan,
 }
@@ -241,15 +349,35 @@ pub struct CallableValueBindingStep {
 #[serde(tag = "relation", content = "evidence", rename_all = "snake_case")]
 pub enum CallablePathStep {
     ExactInvocation(ExactCallStep),
+    ExecutionRootInvocation(ExactRootCallStep),
     CallableValueBinding(CallableValueBindingStep),
 }
 
 impl CallablePathStep {
     #[must_use]
-    pub const fn source(&self) -> &SymbolIdentity {
+    pub const fn source_symbol(&self) -> Option<&SymbolIdentity> {
         match self {
-            Self::ExactInvocation(step) => &step.caller,
-            Self::CallableValueBinding(step) => &step.binding,
+            Self::ExactInvocation(step) => Some(&step.caller),
+            Self::ExecutionRootInvocation(_) => None,
+            Self::CallableValueBinding(step) => Some(&step.binding),
+        }
+    }
+
+    #[must_use]
+    pub fn source_document(&self) -> &str {
+        match self {
+            Self::ExactInvocation(step) => &step.caller.document_path,
+            Self::ExecutionRootInvocation(step) => &step.root.document_path,
+            Self::CallableValueBinding(step) => &step.binding.document_path,
+        }
+    }
+
+    #[must_use]
+    pub fn source_name(&self) -> &str {
+        match self {
+            Self::ExactInvocation(step) => &step.caller.name,
+            Self::ExecutionRootInvocation(step) => step.root.display_name(),
+            Self::CallableValueBinding(step) => &step.binding.name,
         }
     }
 
@@ -257,13 +385,20 @@ impl CallablePathStep {
     pub const fn target(&self) -> &SymbolIdentity {
         match self {
             Self::ExactInvocation(step) => &step.callee,
+            Self::ExecutionRootInvocation(step) => &step.callee,
             Self::CallableValueBinding(step) => &step.target,
         }
     }
 
     #[must_use]
     pub const fn is_qualified(&self) -> bool {
-        matches!(self, Self::CallableValueBinding(_))
+        match self {
+            Self::CallableValueBinding(_) => true,
+            Self::ExecutionRootInvocation(step) => {
+                matches!(step.root.context, ExecutionRootContext::AnonymousCallable)
+            }
+            Self::ExactInvocation(_) => false,
+        }
     }
 }
 
@@ -305,6 +440,7 @@ pub(crate) struct PublishedCallsGraph {
     nodes: BTreeMap<Uuid, PublishedCallNode>,
     provider_join_failures: BTreeMap<(LanguageId, String, String), BTreeSet<String>>,
     incoming: BTreeMap<Uuid, Vec<PublishedIncomingCall>>,
+    incoming_roots: BTreeMap<Uuid, Vec<PublishedIncomingRootCall>>,
     outgoing: BTreeMap<Uuid, Vec<Uuid>>,
     callable_bindings: BTreeMap<Uuid, Vec<Uuid>>,
     incoming_callable_bindings: BTreeMap<Uuid, Vec<PublishedIncomingCallableBinding>>,
@@ -319,6 +455,12 @@ pub(crate) struct PublishedIncomingCall {
     pub caller_id: Uuid,
     pub caller_reachability: ReachabilityClass,
     pub caller: SymbolIdentity,
+    pub call_span: SourceSpan,
+}
+
+pub(crate) struct PublishedIncomingRootCall {
+    pub root_reachability: ReachabilityClass,
+    pub root: ExecutionRootIdentity,
     pub call_span: SourceSpan,
 }
 
@@ -340,7 +482,14 @@ pub(crate) struct PublishedCallPath {
 
 pub(crate) struct PublishedReverseCallTraversal {
     pub paths: Vec<PublishedCallPath>,
+    pub root_paths: Vec<PublishedRootCallPath>,
     pub depth_cutoff_nodes: usize,
+}
+
+pub(crate) struct PublishedRootCallPath {
+    pub root: ExecutionRootIdentity,
+    pub depth: usize,
+    pub chain: Vec<CallablePathStep>,
 }
 
 impl PublishedCallsGraph {
@@ -434,6 +583,21 @@ impl PublishedCallsGraph {
                 "selected Calls provider payloads disagree on their authorized population".into(),
             ));
         }
+        let mut selected_document_content = BTreeMap::<&str, &str>::new();
+        for payload in &payloads {
+            for document in &payload.documents {
+                if let Some(existing) = selected_document_content.insert(
+                    document.document_path.as_str(),
+                    document.content_sha256.as_str(),
+                ) && existing != document.content_sha256.as_str()
+                {
+                    return Err(invalid_generation(format!(
+                        "selected Calls provider payloads disagree on document content for {}",
+                        document.document_path
+                    )));
+                }
+            }
+        }
         let required_documents = required_scope_documents(
             &generation.project_inventory,
             target_language,
@@ -523,7 +687,11 @@ impl PublishedCallsGraph {
         let mut nodes = BTreeMap::<Uuid, PublishedCallNode>::new();
         let mut provider_join_failures =
             BTreeMap::<(LanguageId, String, String), BTreeSet<String>>::new();
+        let mut invocation_occurrences =
+            BTreeMap::<InvocationOccurrenceKey, CanonicalInvocationOccurrence>::new();
         let mut incoming = BTreeMap::<Uuid, BTreeMap<ReferenceKey, PublishedIncomingCall>>::new();
+        let mut incoming_roots =
+            BTreeMap::<Uuid, BTreeMap<RootReferenceKey, PublishedIncomingRootCall>>::new();
         let mut callable_bindings = BTreeMap::<Uuid, BTreeSet<Uuid>>::new();
         let mut incoming_callable_bindings =
             BTreeMap::<Uuid, BTreeMap<ReferenceKey, PublishedIncomingCallableBinding>>::new();
@@ -694,6 +862,13 @@ impl PublishedCallsGraph {
                     caller: caller.identity.clone(),
                     call_span: source_span(&call.call_site.span)?,
                 };
+                register_callable_invocation_occurrence(
+                    &mut invocation_occurrences,
+                    item.caller_id,
+                    callee_id,
+                    &item.caller.document_path,
+                    &item.call_span,
+                )?;
                 let key = ReferenceKey::from_parts(&item.caller, &item.call_span);
                 match incoming.entry(callee_id).or_default().entry(key) {
                     std::collections::btree_map::Entry::Vacant(entry) => {
@@ -705,6 +880,90 @@ impl PublishedCallsGraph {
                     std::collections::btree_map::Entry::Occupied(_) => {
                         return Err(invalid_generation(
                             "conflicting provider records occupy one exact call occurrence".into(),
+                        ));
+                    }
+                }
+            }
+            for invocation in &payload.root_invocations {
+                let callee_symbol = provider_symbols
+                    .get(invocation.callee_symbol_id.as_str())
+                    .ok_or_else(|| {
+                        invalid_generation(format!(
+                            "provider root invocation references missing callee {}",
+                            invocation.callee_symbol_id
+                        ))
+                    })?;
+                if callee_symbol.language_id != *target_language {
+                    continue;
+                }
+                let source_selected =
+                    required_documents.contains(&invocation.call_site.document_path);
+                let callee_selected = callee_symbol.definition.as_ref().is_some_and(|definition| {
+                    required_documents.contains(&definition.document_path)
+                });
+                if !source_selected {
+                    if callee_selected {
+                        return Err(invalid_generation(format!(
+                            "provider root invocation from {} into {} contradicts the persisted possible-caller dependency population",
+                            invocation.call_site.document_path,
+                            callee_symbol
+                                .definition
+                                .as_ref()
+                                .map_or("<external>", |definition| definition
+                                    .document_path
+                                    .as_str())
+                        )));
+                    }
+                    continue;
+                }
+                if !callee_selected {
+                    continue;
+                }
+                let callee_id = payload_nodes
+                    .get(invocation.callee_symbol_id.as_str())
+                    .copied()
+                    .ok_or_else(|| {
+                        let detail = mapping_failures
+                            .get(invocation.callee_symbol_id.as_str())
+                            .map_or(String::new(), |reason| format!(": {reason}"));
+                        invalid_generation(format!(
+                            "provider root invocation target {} cannot join its co-published structural definition{detail}",
+                            invocation.callee_symbol_id
+                        ))
+                    })?;
+                let root = execution_root_identity(
+                    &generation.project_inventory,
+                    &invocation.call_site.document_path,
+                    target_language,
+                    invocation.context,
+                )?;
+                let call_span = source_span(&invocation.call_site.span)?;
+                let item = PublishedIncomingRootCall {
+                    root_reachability: match root.class {
+                        ExecutionRootClass::Production => ReachabilityClass::Wired,
+                        ExecutionRootClass::Test => ReachabilityClass::TestOnly,
+                    },
+                    root,
+                    call_span,
+                };
+                register_root_invocation_occurrence(
+                    &mut invocation_occurrences,
+                    callee_id,
+                    &item.root,
+                    &item.call_span,
+                )?;
+                let key = RootReferenceKey::from_parts(&item.root, &item.call_span);
+                match incoming_roots.entry(callee_id).or_default().entry(key) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(item);
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if entry.get().root == item.root
+                            && entry.get().call_span == item.call_span => {}
+                    std::collections::btree_map::Entry::Occupied(_) => {
+                        return Err(invalid_generation(
+                            "conflicting provider records occupy one exact root invocation occurrence"
+                                .into(),
                         ));
                     }
                 }
@@ -845,6 +1104,10 @@ impl PublishedCallsGraph {
             .into_iter()
             .map(|(callee, calls)| (callee, calls.into_values().collect()))
             .collect::<BTreeMap<_, Vec<_>>>();
+        let incoming_roots = incoming_roots
+            .into_iter()
+            .map(|(callee, calls)| (callee, calls.into_values().collect()))
+            .collect::<BTreeMap<_, Vec<_>>>();
         let mut outgoing = BTreeMap::<Uuid, BTreeSet<Uuid>>::new();
         for (callee_id, calls) in &incoming {
             for call in calls {
@@ -878,6 +1141,7 @@ impl PublishedCallsGraph {
             nodes,
             provider_join_failures,
             incoming,
+            incoming_roots,
             outgoing,
             callable_bindings,
             incoming_callable_bindings,
@@ -926,6 +1190,84 @@ impl PublishedCallsGraph {
         self.incoming.get(&callee_id).map_or(&[], Vec::as_slice)
     }
 
+    pub(crate) fn incoming_roots(&self, callee_id: Uuid) -> &[PublishedIncomingRootCall] {
+        self.incoming_roots
+            .get(&callee_id)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    pub(crate) fn filtered_exact_references(
+        &self,
+        callee_id: Uuid,
+        filter: CallerFilter,
+    ) -> (Vec<ExactCallReference>, usize) {
+        let mut references = Vec::new();
+        let mut filtered_origins = BTreeSet::new();
+        for incoming in self.incoming(callee_id) {
+            let origin = CallOrigin::Callable(incoming.caller.clone());
+            if !filter_admits(filter, incoming.caller_reachability) {
+                filtered_origins.insert(origin.stable_key());
+                continue;
+            }
+            references.push(ExactCallReference {
+                origin,
+                call_span: incoming.call_span.clone(),
+                context: "exact provider-resolved call occurrence".into(),
+            });
+        }
+        for incoming in self.incoming_roots(callee_id) {
+            let origin = CallOrigin::ExecutionRoot(incoming.root.clone());
+            if !filter_admits(filter, incoming.root_reachability) {
+                filtered_origins.insert(origin.stable_key());
+                continue;
+            }
+            references.push(ExactCallReference {
+                origin,
+                call_span: incoming.call_span.clone(),
+                context: match incoming.root.context {
+                    ExecutionRootContext::ModuleInitialization => {
+                        "exact provider-resolved invocation from module initialization"
+                    }
+                    ExecutionRootContext::AnonymousCallable => {
+                        "exact provider-resolved invocation inside an anonymous callable; the target remains conservatively live, but execution depends on that callable running"
+                    }
+                }
+                .into(),
+            });
+        }
+        references.sort_by(|left, right| {
+            (
+                left.origin.document_path(),
+                left.call_span.start_byte,
+                left.call_span.end_byte,
+                left.origin.stable_key(),
+            )
+                .cmp(&(
+                    right.origin.document_path(),
+                    right.call_span.start_byte,
+                    right.call_span.end_byte,
+                    right.origin.stable_key(),
+                ))
+        });
+        (references, filtered_origins.len())
+    }
+
+    pub(crate) fn root_invocation_target_ids(
+        &self,
+        class: ExecutionRootClass,
+        context: ExecutionRootContext,
+    ) -> BTreeSet<Uuid> {
+        self.incoming_roots
+            .iter()
+            .filter(|(_, incoming)| {
+                incoming
+                    .iter()
+                    .any(|call| call.root.class == class && call.root.context == context)
+            })
+            .map(|(callee_id, _)| *callee_id)
+            .collect()
+    }
+
     pub(crate) fn incoming_callable_bindings(
         &self,
         target_id: Uuid,
@@ -954,7 +1296,7 @@ impl PublishedCallsGraph {
             .all_nodes()
             .into_iter()
             .filter(|node| {
-                structural_node_is_callable_kind(&node.kind)
+                symbol_kind_has_role(&node.kind, SymbolRole::Callable)
                     && language_id_for_path(&node.file_path) == *language_id
                     && required_documents.contains(&node.file_path)
             })
@@ -996,6 +1338,25 @@ impl PublishedCallsGraph {
                 return Err(invalid_generation(format!(
                     "provider call from {} into {} contradicts the persisted possible-caller dependency population",
                     call.caller.document_path, callee.structural.file_path
+                )));
+            }
+        }
+        for (callee_id, incoming) in &self.incoming_roots {
+            let Some(callee) = self.nodes.get(callee_id) else {
+                return Err(invalid_generation(format!(
+                    "provider root invocation target {callee_id} disappeared from the canonical call index"
+                )));
+            };
+            if !required_documents.contains(&callee.structural.file_path) {
+                continue;
+            }
+            if let Some(call) = incoming
+                .iter()
+                .find(|call| !required_documents.contains(&call.root.document_path))
+            {
+                return Err(invalid_generation(format!(
+                    "provider root invocation from {} into {} contradicts the persisted possible-caller dependency population",
+                    call.root.document_path, callee.structural.file_path
                 )));
             }
         }
@@ -1067,6 +1428,7 @@ impl PublishedCallsGraph {
         let mut queue = VecDeque::from([(target_node.memory_id, 0usize, Vec::new())]);
         let mut visited = BTreeSet::from([target_node.memory_id]);
         let mut paths = Vec::new();
+        let mut root_paths = Vec::new();
         let mut depth_cutoffs = BTreeSet::new();
 
         while let Some((callee_id, depth, reverse_chain)) = queue.pop_front() {
@@ -1080,6 +1442,27 @@ impl PublishedCallsGraph {
                 })?;
                 self.node(graph, callee_node)?.identity.clone()
             };
+            for incoming in self.incoming_roots(callee_id) {
+                let next_depth = depth + 1;
+                if next_depth > max_depth {
+                    depth_cutoffs.insert(incoming.root.stable_key());
+                    continue;
+                }
+                let mut chain = reverse_chain.clone();
+                chain.push(CallablePathStep::ExecutionRootInvocation(
+                    ExactRootCallStep {
+                        root: incoming.root.clone(),
+                        callee: callee.clone(),
+                        call_span: incoming.call_span.clone(),
+                    },
+                ));
+                chain.reverse();
+                root_paths.push(PublishedRootCallPath {
+                    root: incoming.root.clone(),
+                    depth: next_depth,
+                    chain,
+                });
+            }
             for incoming in self.incoming(callee_id) {
                 let next_depth = depth + 1;
                 if next_depth > max_depth {
@@ -1163,8 +1546,33 @@ impl PublishedCallsGraph {
                     right.caller.symbol_id.as_str(),
                 ))
         });
+        root_paths.sort_by(|left, right| {
+            (
+                left.depth,
+                left.root.document_path.as_str(),
+                left.chain.first().map_or(0, |step| match step {
+                    CallablePathStep::ExecutionRootInvocation(step) => step.call_span.start_byte,
+                    CallablePathStep::ExactInvocation(step) => step.call_span.start_byte,
+                    CallablePathStep::CallableValueBinding(step) => step.binding_span.start_byte,
+                }),
+            )
+                .cmp(&(
+                    right.depth,
+                    right.root.document_path.as_str(),
+                    right.chain.first().map_or(0, |step| match step {
+                        CallablePathStep::ExecutionRootInvocation(step) => {
+                            step.call_span.start_byte
+                        }
+                        CallablePathStep::ExactInvocation(step) => step.call_span.start_byte,
+                        CallablePathStep::CallableValueBinding(step) => {
+                            step.binding_span.start_byte
+                        }
+                    }),
+                ))
+        });
         Ok(PublishedReverseCallTraversal {
             paths,
+            root_paths,
             depth_cutoff_nodes: depth_cutoffs.len(),
         })
     }
@@ -1288,19 +1696,8 @@ fn query_published_calls_with_index(
         }
         Err(error) => return Err(error),
     };
-    let mut references = Vec::new();
-    let mut filtered_callers = BTreeSet::new();
-    for incoming in calls.incoming(target_node.memory_id) {
-        if !filter_admits(request.filter, incoming.caller_reachability) {
-            filtered_callers.insert(incoming.caller.symbol_id.clone());
-            continue;
-        }
-        references.push(ExactCallReference {
-            caller: incoming.caller.clone(),
-            call_span: incoming.call_span.clone(),
-            context: "exact provider-resolved call occurrence".into(),
-        });
-    }
+    let (references, filtered_callers) =
+        calls.filtered_exact_references(target_node.memory_id, request.filter);
     let mut callable_value_bindings = 0usize;
     let mut filtered_callable_value_bindings = 0usize;
     for binding in calls.incoming_callable_bindings(target_node.memory_id) {
@@ -1315,60 +1712,93 @@ fn query_published_calls_with_index(
     let total_items = all_items.len();
     let generation_id = generation.manifest.generation_id.clone();
     let request_digest = calls_request_digest(request);
-    let window = page_window(
-        "calls",
-        &generation_id,
-        &request_digest,
-        request.cursor.as_deref(),
-        request.limit,
-        total_items,
-    )?;
-    let items = all_items[window.range.clone()].to_vec();
     let total_callers = all_items
         .iter()
-        .map(|reference| reference.caller.symbol_id.as_str())
+        .map(|reference| reference.origin.stable_key())
         .collect::<BTreeSet<_>>()
         .len();
-    let mut projected_documents = items
-        .iter()
-        .map(|item| item.caller.document_path.as_str())
-        .collect::<Vec<_>>();
-    projected_documents.push(&resolved_symbol.document_path);
-    let unit_graph = project_unit_graph(&generation.project_inventory, projected_documents);
-    let mut warnings = Vec::new();
-    if generation.project_inventory.coverage
-        == ProjectInventoryCoverage::IndexedSourcePopulationPartial
-    {
-        warnings.push(format!(
+    let mut base_warnings = Vec::new();
+    let inventory_issues = generation
+        .project_inventory
+        .issues_for_language(&target_language);
+    if !inventory_issues.is_empty() {
+        base_warnings.push(format!(
             "Project inventory is partial and reports {} issue(s).",
-            generation.project_inventory.issues.len()
+            inventory_issues.len()
         ));
     }
     if let Some(warning) = calls.coverage_warning() {
-        warnings.push(warning);
+        base_warnings.push(warning);
     }
     if callable_value_bindings > 0 {
-        warnings.push(format!(
+        base_warnings.push(format!(
             "{callable_value_bindings} exact callable-value assignment(s) target this symbol; they are qualified possible-dispatch evidence, not direct invocation records; Assess follows them without relabelling them as calls"
         ));
     }
-
-    Ok(ExactCallsResult {
-        schema_version: CALLS_SCHEMA_VERSION.into(),
-        capability: "calls".into(),
-        generation_id,
-        repository: repository_binding(binding, generation),
-        unit_graph,
-        resolved_symbol,
-        authority: calls.authority(),
-        items,
-        total_callers,
-        filtered_callers: filtered_callers.len(),
-        callable_value_bindings,
-        filtered_callable_value_bindings,
-        page: window.page,
-        warnings,
-    })
+    let authority = calls.authority();
+    let mut smallest_result_chars = 0;
+    for effective_limit in (1..=request.limit).rev() {
+        let window = page_window(
+            "calls",
+            &generation_id,
+            &request_digest,
+            request.cursor.as_deref(),
+            effective_limit,
+            total_items,
+        )?;
+        let items = all_items[window.range.clone()].to_vec();
+        let mut projected_documents = items
+            .iter()
+            .map(|item| item.origin.document_path())
+            .collect::<Vec<_>>();
+        projected_documents.push(&resolved_symbol.document_path);
+        let unit_graph = project_unit_graph(&generation.project_inventory, projected_documents);
+        let mut warnings = base_warnings.clone();
+        if effective_limit < request.limit && window.page.returned == effective_limit {
+            warnings.push(format!(
+                "serialized-result bounds reduced this page from the requested ceiling of {} to {} call sites",
+                request.limit, effective_limit
+            ));
+        }
+        if window.page.has_more {
+            warnings.push(format!(
+                "showing {} of {} call sites in this page; continue with next_cursor",
+                window.page.returned, window.page.total_items
+            ));
+        }
+        let result = ExactCallsResult {
+            schema_version: CALLS_SCHEMA_VERSION.into(),
+            capability: "calls".into(),
+            generation_id: generation_id.clone(),
+            repository: repository_binding(binding, generation),
+            unit_graph,
+            resolved_symbol: resolved_symbol.clone(),
+            authority: authority.clone(),
+            items,
+            total_callers,
+            filtered_callers,
+            callable_value_bindings,
+            filtered_callable_value_bindings,
+            page: window.page,
+            warnings,
+        };
+        let result_chars = serde_json::to_string(&result)
+            .map_err(|error| DomainError::PublishedGenerationInvalid {
+                reason: format!("serialize Calls result for size validation: {error}"),
+            })?
+            .chars()
+            .count();
+        smallest_result_chars = result_chars;
+        if result_chars <= MAX_GENERATION_ENGINE_RESULT_CHARS {
+            return Ok(result);
+        }
+    }
+    Err(DomainError::result_too_large(
+        "calls",
+        smallest_result_chars,
+        MAX_GENERATION_ENGINE_RESULT_CHARS,
+        "Narrow the symbol/file scope; required Calls identity, authority, and unit metadata do not fit even when the page limit is one",
+    ))
 }
 
 pub(crate) fn resolve_invocation_target<'a>(
@@ -1521,7 +1951,7 @@ pub(crate) fn structural_node_is_invocation_target(node: &GraphNode) -> bool {
 }
 
 fn structural_kind_is_invocation_target(language_id: &str, kind: &str) -> bool {
-    structural_node_is_callable_kind(kind) || (language_id == "python" && kind == "class")
+    symbol_kind_has_role(kind, SymbolRole::Callable) || (language_id == "python" && kind == "class")
 }
 
 fn potential_calls_target(node: &GraphNode) -> bool {
@@ -1567,13 +1997,10 @@ fn resolve_calls_target_candidate<'a>(
     }
 }
 
-fn structural_node_is_callable_kind(kind: &str) -> bool {
-    symbol_kind_has_role(kind, SymbolRole::Callable)
-}
-
 #[cfg(test)]
 mod polyglot_symbol_role_tests {
-    use super::{structural_kind_is_invocation_target, structural_node_is_callable_kind};
+    use super::structural_kind_is_invocation_target;
+    use crate::structural_ir::{SymbolRole, symbol_kind_has_role};
 
     /// FALSIFIER for provider/structural joins: language adapters may preserve
     /// the source-level distinction between a function, method, and
@@ -1581,13 +2008,13 @@ mod polyglot_symbol_role_tests {
     #[test]
     fn callable_role_is_not_a_rust_go_function_spelling_check() {
         assert!(
-            structural_node_is_callable_kind("function"),
+            symbol_kind_has_role("function", SymbolRole::Callable),
             "known-positive control"
         );
-        assert!(structural_node_is_callable_kind("method"));
-        assert!(structural_node_is_callable_kind("constructor"));
+        assert!(symbol_kind_has_role("method", SymbolRole::Callable));
+        assert!(symbol_kind_has_role("constructor", SymbolRole::Callable));
         assert!(
-            !structural_node_is_callable_kind("class"),
+            !symbol_kind_has_role("class", SymbolRole::Callable),
             "a class does not own a language-neutral callable body"
         );
         assert!(
@@ -1651,6 +2078,9 @@ fn calls_payload_structural_join(
         {
             required_local_symbols.insert(call.callee_symbol_id.as_str());
         }
+    }
+    for invocation in &payload.root_invocations {
+        required_local_symbols.insert(invocation.callee_symbol_id.as_str());
     }
     for binding in &payload.callable_bindings {
         required_local_symbols.insert(binding.binding_symbol_id.as_str());
@@ -1817,7 +2247,7 @@ pub(crate) fn project_calls_payload_structural_join(
                 call.callee_symbol_id
             ))
         })?;
-        let scope = if crate::extractor::file_is_test(&call.call_site.document_path) {
+        let scope = if crate::language::source_path_is_test(&call.call_site.document_path) {
             EdgeScope::Test
         } else {
             EdgeScope::Production
@@ -2022,6 +2452,26 @@ fn symbol_identity(
         project_unit_ids,
         configuration_id: ConfigurationId::new(CALLS_CONFIGURATION_ID),
         definition_span: Some(source_span(&definition.span)?),
+    })
+}
+
+fn execution_root_identity(
+    inventory: &ProjectInventory,
+    document_path: &str,
+    language_id: &LanguageId,
+    context: ExecutionRootContext,
+) -> Result<ExecutionRootIdentity, DomainError> {
+    Ok(ExecutionRootIdentity {
+        document_path: document_path.to_owned(),
+        language_id: language_id.clone(),
+        project_unit_ids: source_owner_ids(inventory, document_path, language_id)?,
+        configuration_id: ConfigurationId::new(CALLS_CONFIGURATION_ID),
+        class: if crate::language::source_path_is_test(document_path) {
+            ExecutionRootClass::Test
+        } else {
+            ExecutionRootClass::Production
+        },
+        context,
     })
 }
 
@@ -2449,6 +2899,142 @@ struct ReferenceKey {
     caller_symbol_id: String,
 }
 
+/// One exact source occurrence after provider-local identities have joined the
+/// immutable structural generation. Selected payload scopes may overlap, so
+/// provider-local validation cannot own this invariant by itself.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct InvocationOccurrenceKey {
+    document_path: String,
+    start_byte: usize,
+    end_byte: usize,
+}
+
+impl InvocationOccurrenceKey {
+    fn from_parts(document_path: &str, call_span: &SourceSpan) -> Self {
+        Self {
+            document_path: document_path.to_owned(),
+            start_byte: call_span.start_byte,
+            end_byte: call_span.end_byte,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CanonicalInvocationOccurrence {
+    /// One callable expression may resolve to multiple possible callees. Its
+    /// enclosing structural caller and exact source metadata must nevertheless
+    /// agree across every selected complete payload.
+    Callable {
+        caller_id: Uuid,
+        callee_ids: BTreeSet<Uuid>,
+        call_span: SourceSpan,
+    },
+    /// Execution roots carry no structural caller, so one exact occurrence has
+    /// exactly one callee and execution context.
+    ExecutionRoot {
+        callee_id: Uuid,
+        root: ExecutionRootIdentity,
+        call_span: SourceSpan,
+    },
+}
+
+fn register_callable_invocation_occurrence(
+    occurrences: &mut BTreeMap<InvocationOccurrenceKey, CanonicalInvocationOccurrence>,
+    caller_id: Uuid,
+    callee_id: Uuid,
+    document_path: &str,
+    call_span: &SourceSpan,
+) -> Result<(), DomainError> {
+    let key = InvocationOccurrenceKey::from_parts(document_path, call_span);
+    match occurrences.entry(key) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(CanonicalInvocationOccurrence::Callable {
+                caller_id,
+                callee_ids: BTreeSet::from([callee_id]),
+                call_span: call_span.clone(),
+            });
+            Ok(())
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) => match entry.get_mut() {
+            CanonicalInvocationOccurrence::Callable {
+                caller_id: existing_caller,
+                callee_ids,
+                call_span: existing_span,
+            } if *existing_caller == caller_id && *existing_span == *call_span => {
+                callee_ids.insert(callee_id);
+                Ok(())
+            }
+            CanonicalInvocationOccurrence::Callable { .. } => Err(invalid_generation(
+                "conflicting callable records occupy one exact invocation occurrence".into(),
+            )),
+            CanonicalInvocationOccurrence::ExecutionRoot { .. } => Err(invalid_generation(
+                "one exact invocation occurrence is classified as both a callable edge and an execution root"
+                    .into(),
+            )),
+        },
+    }
+}
+
+fn register_root_invocation_occurrence(
+    occurrences: &mut BTreeMap<InvocationOccurrenceKey, CanonicalInvocationOccurrence>,
+    callee_id: Uuid,
+    root: &ExecutionRootIdentity,
+    call_span: &SourceSpan,
+) -> Result<(), DomainError> {
+    let key = InvocationOccurrenceKey::from_parts(&root.document_path, call_span);
+    match occurrences.entry(key) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(CanonicalInvocationOccurrence::ExecutionRoot {
+                callee_id,
+                root: root.clone(),
+                call_span: call_span.clone(),
+            });
+            Ok(())
+        }
+        std::collections::btree_map::Entry::Occupied(entry) => match entry.get() {
+            CanonicalInvocationOccurrence::ExecutionRoot {
+                callee_id: existing_callee,
+                root: existing_root,
+                call_span: existing_span,
+            } if *existing_callee == callee_id
+                && *existing_root == *root
+                && *existing_span == *call_span =>
+            {
+                Ok(())
+            }
+            CanonicalInvocationOccurrence::ExecutionRoot { .. } => Err(invalid_generation(
+                "conflicting execution-root records occupy one exact invocation occurrence"
+                    .into(),
+            )),
+            CanonicalInvocationOccurrence::Callable { .. } => Err(invalid_generation(
+                "one exact invocation occurrence is classified as both a callable edge and an execution root"
+                    .into(),
+            )),
+        },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RootReferenceKey {
+    document_path: String,
+    start_byte: usize,
+    end_byte: usize,
+    class: ExecutionRootClass,
+    context: ExecutionRootContext,
+}
+
+impl RootReferenceKey {
+    fn from_parts(root: &ExecutionRootIdentity, call_span: &SourceSpan) -> Self {
+        Self {
+            document_path: root.document_path.clone(),
+            start_byte: call_span.start_byte,
+            end_byte: call_span.end_byte,
+            class: root.class,
+            context: root.context,
+        }
+    }
+}
+
 impl ReferenceKey {
     fn from_parts(caller: &SymbolIdentity, call_span: &SourceSpan) -> Self {
         Self {
@@ -2461,13 +3047,12 @@ impl ReferenceKey {
 }
 
 pub(crate) fn calls_request_digest(request: &CallsRequest) -> String {
-    let filter = format!("{:?}", request.filter);
     request_digest(
         "calls",
         &[
             request.symbol.as_str(),
             request.file.as_deref().unwrap_or_default(),
-            filter.as_str(),
+            request.filter.as_str(),
         ],
     )
 }
@@ -2480,6 +3065,7 @@ pub(crate) mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::code_intel_domain::ProjectInventoryCoverage;
 
     #[test]
     fn path_language_identity_is_derived_from_the_registered_language_boundary() {
@@ -2506,12 +3092,13 @@ pub(crate) mod tests {
     }
     use crate::code_intel_domain::{
         CapabilityReceipt, ConfigurationId, DocumentMembership, DocumentMembershipKind,
-        EcosystemId, ProjectUnit, ProjectUnitKind, RepositoryId,
+        EcosystemId, ProjectUnit, ProjectUnitKind, ProjectUnitRelationship,
+        ProjectUnitRelationshipKind, RepositoryId,
     };
     use crate::code_intel_payload::{
         CALLS_PROVIDER_PAYLOAD_SCHEMA, ProviderCall, ProviderCallableBinding,
-        ProviderCoverageExclusion, ProviderDocument, ProviderLocation, ProviderSymbolRole,
-        normalize_provider_payload_typed, provider_payload_descriptor,
+        ProviderCoverageExclusion, ProviderDocument, ProviderLocation, ProviderRootInvocation,
+        ProviderSymbolRole, normalize_provider_payload_typed, provider_payload_descriptor,
     };
     use crate::code_intel_publication::{GenerationManifest, PublicationHead, PublicationHeadBody};
     use crate::project_binding::ProjectBindingOptions;
@@ -2660,6 +3247,7 @@ pub(crate) mod tests {
             }],
             symbols,
             calls,
+            root_invocations: Vec::new(),
             callable_bindings: Vec::new(),
             coverage_exclusions: Vec::new(),
         })
@@ -2772,7 +3360,7 @@ pub(crate) mod tests {
         let repository_id = RepositoryId::new("repository-fixture");
         let generation_id = GenerationId::new("generation-a");
         let manifest = GenerationManifest {
-            schema_version: "h00/code-intel/generation/v6".into(),
+            schema_version: crate::code_intel_publication::GENERATION_SCHEMA_VERSION.into(),
             generation_id: generation_id.clone(),
             repository_id: repository_id.clone(),
             parent_generation_id: None,
@@ -2818,6 +3406,98 @@ pub(crate) mod tests {
             graph,
             generation,
         }
+    }
+
+    pub fn fixture_with_production_root_invocation() -> Fixture {
+        fixture_with_root_invocation(ExecutionRootContext::ModuleInitialization)
+    }
+
+    pub fn fixture_with_root_invocation(context: ExecutionRootContext) -> Fixture {
+        let mut fixture = fixture(&[]);
+        let receipt = fixture.generation.manifest.receipts[0].clone();
+        let mut payload = calls_payload(receipt.clone(), &[], TARGET_LINE);
+        let ProviderPayload::Calls(calls) = &mut payload else {
+            unreachable!("Calls fixture")
+        };
+        calls.root_invocations.push(ProviderRootInvocation {
+            callee_symbol_id: "provider-target".into(),
+            call_site: location(1, 40, 46),
+            context,
+        });
+        set_evidence(&mut fixture.generation, vec![receipt], vec![payload]);
+        fixture
+    }
+
+    /// FALSIFIER for CLI/MCP parity: reducing a Calls page to one item cannot
+    /// shrink ancestry metadata that is required independently of the item
+    /// count. The shared engine boundary must therefore return one typed
+    /// refusal instead of allowing CLI JSON to succeed and leaving MCP to
+    /// replace the DTO with a transport-only cap error.
+    #[test]
+    fn fixed_calls_metadata_over_product_bound_is_a_domain_refusal() {
+        let control = fixture(&["caller"]);
+        let control_result = query_published_calls(
+            &control.graph,
+            &control.generation,
+            &control.binding,
+            &CallsRequest {
+                limit: 1,
+                ..CallsRequest::new("target")
+            },
+        )
+        .expect("known-positive one-item Calls control");
+        assert_eq!(control_result.items.len(), 1);
+
+        let mut oversized = fixture(&["caller"]);
+        let inventory = std::sync::Arc::make_mut(&mut oversized.generation.project_inventory);
+        let mut child = ProjectUnitId::new("rust:nested");
+        for index in 0..200 {
+            let parent = ProjectUnitId::new(format!("rust:ancestor-{index:03}"));
+            inventory.project_topology.units.push(ProjectUnit {
+                project_unit_id: parent.clone(),
+                language_id: LanguageId::new("rust"),
+                ecosystem_id: EcosystemId::new("cargo"),
+                kind: ProjectUnitKind::Workspace,
+                root_path: format!("{}/{index:03}", "nested".repeat(40)),
+                manifest_path: None,
+                compilation_root_paths: Vec::new(),
+            });
+            inventory
+                .project_topology
+                .relationships
+                .push(ProjectUnitRelationship {
+                    parent_project_unit_id: parent.clone(),
+                    child_project_unit_id: child,
+                    kind: ProjectUnitRelationshipKind::PathNestedWithin,
+                });
+            child = parent;
+        }
+
+        let error = query_published_calls(
+            &oversized.graph,
+            &oversized.generation,
+            &oversized.binding,
+            &CallsRequest {
+                limit: 1,
+                ..CallsRequest::new("target")
+            },
+        )
+        .expect_err("fixed metadata cannot be repaired by a lower page limit");
+        let DomainError::ResultTooLarge {
+            operation,
+            actual_chars,
+            max_chars,
+            remedy,
+        } = error
+        else {
+            panic!("expected typed result bound, got {error}");
+        };
+        assert_eq!(operation, "calls");
+        assert!(actual_chars > max_chars, "positive oversize control");
+        assert!(
+            remedy.contains("page limit is one"),
+            "the remedy must not tell the user to lower an irreducible limit"
+        );
     }
 
     fn configure_partial_owner_population(fixture: &mut Fixture) -> (ProjectUnitId, ProjectUnitId) {
@@ -3116,7 +3796,14 @@ pub(crate) mod tests {
         );
         assert_eq!(result.resolved_symbol.project_unit_ids, owners);
         assert_eq!(result.items.len(), 1);
-        assert_eq!(result.items[0].caller.project_unit_ids, owners);
+        assert_eq!(
+            result.items[0]
+                .origin
+                .callable()
+                .expect("structural caller")
+                .project_unit_ids,
+            owners
+        );
         assert_eq!(result.items[0].call_span.start_byte, 40);
     }
 
@@ -3546,7 +4233,14 @@ pub(crate) mod tests {
 
         assert_eq!(result.resolved_symbol.kind, "static");
         assert_eq!(result.items.len(), 1);
-        assert_eq!(result.items[0].caller.name, "caller");
+        assert_eq!(
+            result.items[0]
+                .origin
+                .callable()
+                .expect("structural caller")
+                .name,
+            "caller"
+        );
     }
 
     #[test]
@@ -3749,6 +4443,439 @@ pub(crate) mod tests {
         );
     }
 
+    /// FALSIFIER: overlapping scopes may repeat one exact occurrence, but the
+    /// source path and byte span are meaningful only relative to one exact
+    /// document. Two selected payloads must not silently merge occurrences
+    /// from different source contents merely because their coordinates match.
+    #[test]
+    fn overlapping_scoped_payloads_reject_shared_document_digest_drift() {
+        let fixture = fixture(&["caller"]);
+        let receipt_a = complete_receipt("provider-a", owner_scope("rust:workspace"), 'a');
+        let receipt_b = complete_receipt("provider-a", owner_scope("rust:nested"), 'b');
+        let first = calls_payload(receipt_a.clone(), &["caller"], TARGET_LINE);
+        let mut drifted = calls_payload(receipt_b.clone(), &["caller"], TARGET_LINE);
+        let ProviderPayload::Calls(drifted_calls) = &mut drifted else {
+            unreachable!("Calls fixture")
+        };
+        drifted_calls.documents[0].content_sha256 = "a".repeat(64);
+        let mut generation = fixture.generation.clone();
+        set_evidence(
+            &mut generation,
+            vec![receipt_a, receipt_b],
+            vec![first, drifted],
+        );
+
+        let error = query_published_calls(
+            &fixture.graph,
+            &generation,
+            &fixture.binding,
+            &CallsRequest::new("target"),
+        )
+        .expect_err("one document path cannot carry two content identities");
+        assert!(
+            error
+                .to_string()
+                .contains("selected Calls provider payloads disagree on document content"),
+            "digest disagreement failed for the wrong reason: {error}"
+        );
+    }
+
+    /// FALSIFIER: receipt selection may retain overlapping complete payloads
+    /// from one provider (for example, one workspace scope and one nested
+    /// package scope). Provider-local validation cannot make one exact source
+    /// occurrence globally unambiguous: the canonical structural join must
+    /// reject two different execution-root classifications for the same UTF-8
+    /// byte span before either classification becomes query-visible.
+    #[test]
+    fn overlapping_scoped_payloads_reject_conflicting_root_contexts() {
+        let fixture = fixture(&[]);
+        let receipt_a = complete_receipt("provider-a", owner_scope("rust:workspace"), 'a');
+        let receipt_b = complete_receipt("provider-a", owner_scope("rust:nested"), 'b');
+        let root_payload = |receipt, context| {
+            let mut payload = calls_payload(receipt, &[], TARGET_LINE);
+            let ProviderPayload::Calls(calls) = &mut payload else {
+                unreachable!("Calls fixture")
+            };
+            calls.root_invocations.push(ProviderRootInvocation {
+                callee_symbol_id: "provider-target".into(),
+                call_site: location(1, 40, 46),
+                context,
+            });
+            payload
+        };
+        let mut generation = fixture.generation.clone();
+        set_evidence(
+            &mut generation,
+            vec![receipt_a.clone(), receipt_b.clone()],
+            vec![
+                root_payload(
+                    receipt_a,
+                    crate::code_intel_domain::ExecutionRootContext::ModuleInitialization,
+                ),
+                root_payload(
+                    receipt_b,
+                    crate::code_intel_domain::ExecutionRootContext::AnonymousCallable,
+                ),
+            ],
+        );
+
+        let error = query_published_calls(
+            &fixture.graph,
+            &generation,
+            &fixture.binding,
+            &CallsRequest::new("target"),
+        )
+        .expect_err("one exact source occurrence cannot have two execution-root contexts");
+        assert!(
+            matches!(error, DomainError::PublishedGenerationInvalid { .. }),
+            "conflicting overlapping evidence must invalidate the generation: {error}"
+        );
+        assert!(
+            error.to_string().contains("exact invocation occurrence"),
+            "the rejection must come from the canonical occurrence owner: {error}"
+        );
+    }
+
+    #[test]
+    fn overlapping_scoped_payloads_reject_conflicting_root_callees() {
+        let mut fixture = fixture(&[]);
+        let other = graph_node("other_target", 8);
+        let other_id = other.memory_id;
+        fixture.graph.add_node(other).expect("second target node");
+        fixture
+            .graph
+            .set_source_span(
+                other_id,
+                crate::graph::SourceSpan {
+                    start_byte: 800,
+                    end_byte: 880,
+                },
+            )
+            .expect("second target source span");
+
+        let receipt_a = complete_receipt("provider-a", owner_scope("rust:workspace"), 'a');
+        let receipt_b = complete_receipt("provider-a", owner_scope("rust:nested"), 'b');
+        let mut first = calls_payload(receipt_a.clone(), &[], TARGET_LINE);
+        let ProviderPayload::Calls(first_calls) = &mut first else {
+            unreachable!("Calls fixture")
+        };
+        first_calls.root_invocations.push(ProviderRootInvocation {
+            callee_symbol_id: "provider-target".into(),
+            call_site: location(1, 40, 46),
+            context: crate::code_intel_domain::ExecutionRootContext::ModuleInitialization,
+        });
+
+        let mut second = calls_payload(receipt_b.clone(), &[], TARGET_LINE);
+        let ProviderPayload::Calls(second_calls) = &mut second else {
+            unreachable!("Calls fixture")
+        };
+        let other_extent = location(8, 800, 880);
+        second_calls.symbols.push(ProviderSymbol {
+            provider_symbol_id: "provider-other-target".into(),
+            name: "other_target".into(),
+            provider_kind: "function".into(),
+            language_id: LanguageId::new("rust"),
+            role: ProviderSymbolRole::SourceInvocationTarget,
+            definition: Some(location(8, 804, 816)),
+            structural_extent: Some(other_extent.clone()),
+            call_owner_extent: Some(other_extent),
+        });
+        second_calls.root_invocations.push(ProviderRootInvocation {
+            callee_symbol_id: "provider-other-target".into(),
+            call_site: location(1, 40, 46),
+            context: crate::code_intel_domain::ExecutionRootContext::ModuleInitialization,
+        });
+        set_evidence(
+            &mut fixture.generation,
+            vec![receipt_a, receipt_b],
+            vec![first, second],
+        );
+
+        let error = query_published_calls(
+            &fixture.graph,
+            &fixture.generation,
+            &fixture.binding,
+            &CallsRequest::new("target"),
+        )
+        .expect_err("one exact execution-root occurrence cannot invoke two callees");
+        assert!(error.to_string().contains("exact invocation occurrence"));
+    }
+
+    #[test]
+    fn overlapping_scoped_payloads_deduplicate_one_exact_root_occurrence() {
+        let fixture = fixture(&[]);
+        let receipt_a = complete_receipt("provider-a", owner_scope("rust:workspace"), 'a');
+        let receipt_b = complete_receipt("provider-a", owner_scope("rust:nested"), 'b');
+        let root_payload = |receipt| {
+            let mut payload = calls_payload(receipt, &[], TARGET_LINE);
+            let ProviderPayload::Calls(calls) = &mut payload else {
+                unreachable!("Calls fixture")
+            };
+            calls.root_invocations.push(ProviderRootInvocation {
+                callee_symbol_id: "provider-target".into(),
+                call_site: location(1, 40, 46),
+                context: crate::code_intel_domain::ExecutionRootContext::ModuleInitialization,
+            });
+            payload
+        };
+        let mut generation = fixture.generation.clone();
+        set_evidence(
+            &mut generation,
+            vec![receipt_a.clone(), receipt_b.clone()],
+            vec![root_payload(receipt_a), root_payload(receipt_b)],
+        );
+
+        let result = query_published_calls(
+            &fixture.graph,
+            &generation,
+            &fixture.binding,
+            &CallsRequest::new("target"),
+        )
+        .expect("identical overlapping evidence must remain usable");
+        assert_eq!(result.items.len(), 1, "one occurrence must appear once");
+        assert_eq!(
+            result.authority.input_fingerprints,
+            vec!["a".repeat(64), "b".repeat(64)]
+        );
+    }
+
+    #[test]
+    fn overlapping_scoped_payloads_reject_redundant_root_line_drift() {
+        let fixture = fixture(&[]);
+        let receipt_a = complete_receipt("provider-a", owner_scope("rust:workspace"), 'a');
+        let receipt_b = complete_receipt("provider-a", owner_scope("rust:nested"), 'b');
+        let mut first = calls_payload(receipt_a.clone(), &[], TARGET_LINE);
+        let ProviderPayload::Calls(first_calls) = &mut first else {
+            unreachable!("Calls fixture")
+        };
+        first_calls.root_invocations.push(ProviderRootInvocation {
+            callee_symbol_id: "provider-target".into(),
+            call_site: location(1, 40, 46),
+            context: crate::code_intel_domain::ExecutionRootContext::ModuleInitialization,
+        });
+        let mut drifted = calls_payload(receipt_b.clone(), &[], TARGET_LINE);
+        let ProviderPayload::Calls(drifted_calls) = &mut drifted else {
+            unreachable!("Calls fixture")
+        };
+        drifted_calls.root_invocations.push(ProviderRootInvocation {
+            callee_symbol_id: "provider-target".into(),
+            call_site: location(2, 40, 46),
+            context: crate::code_intel_domain::ExecutionRootContext::ModuleInitialization,
+        });
+        let mut generation = fixture.generation.clone();
+        set_evidence(
+            &mut generation,
+            vec![receipt_a, receipt_b],
+            vec![first, drifted],
+        );
+
+        let error = query_published_calls(
+            &fixture.graph,
+            &generation,
+            &fixture.binding,
+            &CallsRequest::new("target"),
+        )
+        .expect_err("redundant line metadata cannot split one byte occurrence");
+        assert!(error.to_string().contains("exact invocation occurrence"));
+    }
+
+    #[test]
+    fn overlapping_scoped_payloads_reject_root_and_callable_for_one_occurrence() {
+        let fixture = fixture(&["caller"]);
+        let receipt_a = complete_receipt("provider-a", owner_scope("rust:workspace"), 'a');
+        let receipt_b = complete_receipt("provider-a", owner_scope("rust:nested"), 'b');
+        let callable = calls_payload(receipt_a.clone(), &["caller"], TARGET_LINE);
+        let mut root = calls_payload(receipt_b.clone(), &[], TARGET_LINE);
+        let ProviderPayload::Calls(root_calls) = &mut root else {
+            unreachable!("Calls fixture")
+        };
+        root_calls.root_invocations.push(ProviderRootInvocation {
+            callee_symbol_id: "provider-target".into(),
+            call_site: location(0, 40, 46),
+            context: crate::code_intel_domain::ExecutionRootContext::ModuleInitialization,
+        });
+        let mut generation = fixture.generation.clone();
+        set_evidence(
+            &mut generation,
+            vec![receipt_a, receipt_b],
+            vec![callable, root],
+        );
+
+        let error = query_published_calls(
+            &fixture.graph,
+            &generation,
+            &fixture.binding,
+            &CallsRequest::new("target"),
+        )
+        .expect_err("one occurrence cannot be both callable-owned and an execution root");
+        assert!(
+            error
+                .to_string()
+                .contains("both a callable edge and an execution root")
+        );
+    }
+
+    #[test]
+    fn one_callable_occurrence_may_retain_multiple_resolved_callees() {
+        let mut fixture = fixture(&["caller"]);
+        let other = graph_node("other_target", 8);
+        let other_id = other.memory_id;
+        fixture.graph.add_node(other).expect("second target node");
+        fixture
+            .graph
+            .set_source_span(
+                other_id,
+                crate::graph::SourceSpan {
+                    start_byte: 800,
+                    end_byte: 880,
+                },
+            )
+            .expect("second target span");
+
+        let receipt = fixture.generation.manifest.receipts[0].clone();
+        let mut payload = calls_payload(receipt.clone(), &["caller"], TARGET_LINE);
+        let ProviderPayload::Calls(calls) = &mut payload else {
+            unreachable!("Calls fixture")
+        };
+        let other_extent = location(8, 800, 880);
+        calls.symbols.push(ProviderSymbol {
+            provider_symbol_id: "provider-other-target".into(),
+            name: "other_target".into(),
+            provider_kind: "function".into(),
+            language_id: LanguageId::new("rust"),
+            role: ProviderSymbolRole::SourceInvocationTarget,
+            definition: Some(location(8, 804, 816)),
+            structural_extent: Some(other_extent.clone()),
+            call_owner_extent: Some(other_extent),
+        });
+        calls.calls.push(ProviderCall {
+            caller_symbol_id: "provider-caller-caller".into(),
+            callee_symbol_id: "provider-other-target".into(),
+            call_site: location(0, 40, 46),
+        });
+        set_evidence(&mut fixture.generation, vec![receipt], vec![payload]);
+
+        for target in ["target", "other_target"] {
+            let result = query_published_calls(
+                &fixture.graph,
+                &fixture.generation,
+                &fixture.binding,
+                &CallsRequest::new(target),
+            )
+            .unwrap_or_else(|error| panic!("multi-target call to {target} was rejected: {error}"));
+            assert_eq!(result.items.len(), 1, "{target} must retain the call site");
+        }
+    }
+
+    #[test]
+    fn root_invocation_is_returned_and_traversed_without_a_fabricated_graph_edge() {
+        let fixture = fixture(&[]);
+        let receipt = fixture.generation.manifest.receipts[0].clone();
+        let mut payload = calls_payload(receipt.clone(), &[], TARGET_LINE);
+        let ProviderPayload::Calls(calls) = &mut payload else {
+            unreachable!("Calls fixture")
+        };
+        calls.root_invocations.push(ProviderRootInvocation {
+            callee_symbol_id: "provider-target".into(),
+            call_site: location(1, 40, 46),
+            context: crate::code_intel_domain::ExecutionRootContext::ModuleInitialization,
+        });
+        let mut generation = fixture.generation.clone();
+        set_evidence(&mut generation, vec![receipt], vec![payload.clone()]);
+
+        let result = query_published_calls(
+            &fixture.graph,
+            &generation,
+            &fixture.binding,
+            &CallsRequest::new("target"),
+        )
+        .expect("root invocation query");
+        assert_eq!(result.authority.status, AuthorityStatus::Complete);
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.total_callers, 1);
+        assert_eq!(
+            result.items[0].origin.display_name(),
+            "<module initialization>"
+        );
+        assert!(result.items[0].context.contains("module initialization"));
+        assert!(matches!(
+            &result.items[0].origin,
+            CallOrigin::ExecutionRoot(ExecutionRootIdentity {
+                class: ExecutionRootClass::Production,
+                document_path,
+                ..
+            }) if document_path == DOCUMENT
+        ));
+
+        let target = fixture.graph.node_by_name("target").expect("target node");
+        let published =
+            PublishedCallsGraph::build(&fixture.graph, &generation, &LanguageId::new("rust"))
+                .expect("published Calls graph");
+        let traversal = published
+            .reverse_reachable(&fixture.graph, target, 1)
+            .expect("root traversal");
+        assert!(traversal.paths.is_empty());
+        assert_eq!(traversal.root_paths.len(), 1);
+        assert!(matches!(
+            traversal.root_paths[0].chain.as_slice(),
+            [CallablePathStep::ExecutionRootInvocation(_)]
+        ));
+        assert!(!traversal.root_paths[0].chain[0].is_qualified());
+
+        let ProviderPayload::Calls(payload) = payload else {
+            unreachable!("Calls fixture")
+        };
+        let mut projected = fixture.graph.clone();
+        let stats = project_calls_payload_structural_join(&mut projected, &payload)
+            .expect("root invocation structural join");
+        assert_eq!(stats.novel_edges, 0);
+        assert!(
+            projected
+                .all_edges()
+                .iter()
+                .all(|(_, _, edge)| edge.kind != EdgeKind::Calls),
+            "an execution root must not be represented as a fabricated symbol edge"
+        );
+    }
+
+    #[test]
+    fn anonymous_callable_root_is_distinguishable_and_qualified_in_product_calls() {
+        let fixture = fixture_with_root_invocation(ExecutionRootContext::AnonymousCallable);
+        let result = query_published_calls(
+            &fixture.graph,
+            &fixture.generation,
+            &fixture.binding,
+            &CallsRequest::new("target"),
+        )
+        .expect("anonymous-root Calls query");
+        assert_eq!(result.items.len(), 1);
+        let CallOrigin::ExecutionRoot(root) = &result.items[0].origin else {
+            panic!("anonymous source context must remain a typed execution root")
+        };
+        assert_eq!(root.context, ExecutionRootContext::AnonymousCallable);
+        assert_eq!(root.display_name(), "<anonymous callable context>");
+        assert!(
+            result.items[0].context.contains("depends on that callable"),
+            "the positive call must not imply unconditional execution"
+        );
+
+        let target = fixture.graph.node_by_name("target").expect("target node");
+        let published = PublishedCallsGraph::build(
+            &fixture.graph,
+            &fixture.generation,
+            &LanguageId::new("rust"),
+        )
+        .expect("published Calls graph");
+        let traversal = published
+            .reverse_reachable(&fixture.graph, target, 1)
+            .expect("anonymous-root traversal");
+        assert_eq!(traversal.root_paths.len(), 1);
+        assert!(
+            traversal.root_paths[0].chain[0].is_qualified(),
+            "Assess/Tests must preserve conditional anonymous-root execution"
+        );
+    }
+
     #[test]
     fn overlapping_scoped_payloads_deduplicate_exact_coverage_exclusions() {
         let fixture = fixture(&["caller"]);
@@ -3801,6 +4928,14 @@ pub(crate) mod tests {
             &first_request,
         )
         .expect("first page");
+        assert!(
+            first
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("showing 1 of 2 call sites in this page")),
+            "the page total counts exact call occurrences, not unique callers: {:?}",
+            first.warnings
+        );
         let cursor = first.page.next_cursor.expect("continuation cursor");
 
         let mut changed = fixture.generation.clone();

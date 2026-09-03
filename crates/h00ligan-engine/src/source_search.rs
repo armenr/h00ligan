@@ -394,6 +394,62 @@ mod tests {
     }
 
     #[test]
+    fn returns_requested_context_lines() {
+        let root = tempfile::tempdir().expect("temp root");
+        std::fs::write(
+            root.path().join("multi.rs"),
+            "line_one_before\nTARGET_MATCH_HERE\nline_three_after\n",
+        )
+        .unwrap();
+
+        let report = search_registered_source(
+            &binding(root.path()),
+            root.path(),
+            SourcePattern::Regex("TARGET_MATCH_HERE"),
+            SourceSearchOptions {
+                max_matches: 50,
+                max_matches_per_file: 50,
+                context_lines: 1,
+            },
+        )
+        .unwrap();
+
+        let joined = report
+            .records
+            .iter()
+            .map(|record| record.line_text.as_str())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(joined.contains("line_one_before"));
+        assert!(joined.contains("TARGET_MATCH_HERE"));
+        assert!(joined.contains("line_three_after"));
+    }
+
+    #[test]
+    fn supports_multiline_patterns() {
+        let root = tempfile::tempdir().expect("temp root");
+        std::fs::write(
+            root.path().join("span.rs"),
+            "fn start_marker() {\n    end_marker();\n}\n",
+        )
+        .unwrap();
+
+        let report = search_registered_source(
+            &binding(root.path()),
+            root.path(),
+            SourcePattern::Regex("(?s)start_marker.*end_marker"),
+            SourceSearchOptions {
+                max_matches: 50,
+                max_matches_per_file: 50,
+                context_lines: 0,
+            },
+        )
+        .unwrap();
+
+        assert!(report.matches_returned > 0);
+    }
+
+    #[test]
     fn exact_match_limit_is_not_reported_as_truncated() {
         let root = tempfile::tempdir().expect("temp root");
         std::fs::write(root.path().join("lib.rs"), "marker\nmarker\n").unwrap();

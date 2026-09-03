@@ -5,6 +5,8 @@
 //! adding a language adapter must extend a provider collection rather than add
 //! another Rust/Go-shaped constructor argument or runtime field.
 
+use std::collections::BTreeSet;
+
 const REGISTRY: &str =
     include_str!("../../h00ligan-engine/src/code_intel_semantic_provider_registry.rs");
 const COORDINATOR: &str =
@@ -449,6 +451,64 @@ fn portable_builder_binds_the_embedded_python_provider_end_to_end() {
             "the one-file product does not wire its Python capability: {capability}"
         );
     }
+}
+
+fn printed_machine_output_keys(section: &str, prefix: &str) -> BTreeSet<String> {
+    section
+        .lines()
+        .filter_map(|line| {
+            let key = line
+                .trim()
+                .strip_prefix("printf '")?
+                .split_once("=%s\\n'")?
+                .0;
+            key.starts_with(prefix).then(|| key.to_owned())
+        })
+        .collect()
+}
+
+/// SOURCE CONTRACT: prepare-only output and final artifact output are both
+/// consumed as machine authority. Losing a Pyrefly identity field from either
+/// branch must fail even when the other branch still contains that spelling.
+#[test]
+fn portable_builder_machine_outputs_bind_identical_pyrefly_authority() {
+    let prepare = PORTABLE_BUILDER
+        .split_once("if ((prepare_only)); then")
+        .expect("positive control: prepare-only branch")
+        .1
+        .split_once("    exit 0\nfi")
+        .expect("bounded prepare-only branch")
+        .0;
+    let final_output = PORTABLE_BUILDER
+        .rsplit_once("if ((machine_output)); then")
+        .expect("positive control: terminal machine-output branch")
+        .1;
+    let expected = [
+        "H00_PYREFLY_ARCHIVE_SHA256",
+        "H00_PYREFLY_BUILDER_SHA256",
+        "H00_PYREFLY_CACHE_PUBLISHER_SHA256",
+        "H00_PYREFLY_PATCH_SHA256",
+        "H00_PYREFLY_PROVIDER_BINARY",
+        "H00_PYREFLY_PROVIDER_BINARY_SHA256",
+        "H00_PYREFLY_PROVIDER_RECEIPT",
+        "H00_PYREFLY_SOURCE_KEY",
+        "H00_PYREFLY_SOURCE_ROOT",
+        "H00_PYREFLY_SOURCE_TREE_SHA256",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        printed_machine_output_keys(prepare, "H00_PYREFLY_"),
+        expected,
+        "prepare-only machine output must expose the complete Pyrefly authority set"
+    );
+    assert_eq!(
+        printed_machine_output_keys(final_output, "H00_PYREFLY_"),
+        expected,
+        "final machine output must expose the same complete Pyrefly authority set"
+    );
 }
 
 /// RIGHT-REASON REGRESSION: distribution-patched Go SDKs may embed host-store

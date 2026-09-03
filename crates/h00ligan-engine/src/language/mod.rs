@@ -11,6 +11,7 @@
 //! [`LanguageExtractor::ts_language_for_path`].
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use crate::structural_ir::{ExtractorError, ExtractorOutput, StructuralDocumentTarget};
 
@@ -30,6 +31,10 @@ pub struct NamedCallableSyntax {
     pub extent: (usize, usize),
     pub has_body: bool,
     pub is_package_function: bool,
+    /// Whether structural extraction publishes this exact callable as a graph
+    /// node. Local callable values may own call sites without becoming stable
+    /// source-level deletion/query targets.
+    pub structural_target: bool,
 }
 
 /// Exact source-syntax target for one explicit invocation.
@@ -62,6 +67,13 @@ pub trait LanguageExtractor: Send + Sync {
     /// (e.g. `"rust"`). Must match the `IndexConfig.languages` vocabulary.
     fn language(&self) -> &'static str;
 
+    /// Whether the source document belongs to this language's test-only file
+    /// population. Structural extraction, execution-root Calls evidence, and
+    /// dead-code liveness must share this exact path policy.
+    fn source_file_is_test(&self, _file_path: &str) -> bool {
+        false
+    }
+
     /// The tree-sitter grammar used for this source path. Returned by value (a
     /// cheap `LanguageFn`-backed handle). The path is load-bearing for language
     /// families with multiple syntaxes, such as TypeScript/JavaScript
@@ -85,6 +97,12 @@ pub trait LanguageExtractor: Send + Sync {
     /// Tree-sitter declaration kinds whose `name` field owns a callable body
     /// or callable signature in this language.
     fn named_callable_declaration_kinds(&self) -> &'static [&'static str];
+
+    /// Tree-sitter node kinds whose body is a callable execution context but
+    /// has no independently published structural caller identity. Calls in
+    /// these ranges remain positive evidence, while product surfaces qualify
+    /// their execution as conditional on the anonymous callable running.
+    fn anonymous_callable_declaration_kinds(&self) -> &'static [&'static str];
 
     /// Resolve a grammar-owned call expression to its exact named callee.
     /// Dynamic/computed call targets return `None`; semantic normalization may
@@ -142,33 +160,41 @@ pub trait LanguageExtractor: Send + Sync {
     /// it owns. The grammar adapter owns the declaration-kind vocabulary;
     /// callers own only the generic exact-name-field invariant.
     fn named_callable_syntax(&self, name: tree_sitter::Node<'_>) -> Option<NamedCallableSyntax> {
-        let mut ancestor = name.parent();
-        while let Some(candidate) = ancestor {
-            if self
-                .named_callable_declaration_kinds()
-                .contains(&candidate.kind())
-                && candidate
-                    .child_by_field_name("name")
-                    .is_some_and(|candidate_name| {
-                        candidate_name.start_byte() == name.start_byte()
-                            && candidate_name.end_byte() == name.end_byte()
-                    })
-            {
-                return Some(NamedCallableSyntax {
-                    extent: self.structural_callable_extent(candidate),
-                    has_body: candidate.child_by_field_name("body").is_some(),
-                    is_package_function: self.is_package_function_declaration(candidate.kind()),
-                });
-            }
-            ancestor = candidate.parent();
-        }
-        None
+        named_declaration_callable_syntax(self, name)
     }
 
     /// Extract symbols from already-read source text. `source` + `file_path` are
     /// exactly the `extract_rust_symbols` inputs; `file_path` is
     /// workspace-relative (the caller computed it).
     fn extract(&self, source: &str, file_path: &str) -> Result<ExtractorOutput, ExtractorError>;
+}
+
+pub(super) fn named_declaration_callable_syntax<E: LanguageExtractor + ?Sized>(
+    extractor: &E,
+    name: tree_sitter::Node<'_>,
+) -> Option<NamedCallableSyntax> {
+    let mut ancestor = name.parent();
+    while let Some(candidate) = ancestor {
+        if extractor
+            .named_callable_declaration_kinds()
+            .contains(&candidate.kind())
+            && candidate
+                .child_by_field_name("name")
+                .is_some_and(|candidate_name| {
+                    candidate_name.start_byte() == name.start_byte()
+                        && candidate_name.end_byte() == name.end_byte()
+                })
+        {
+            return Some(NamedCallableSyntax {
+                extent: extractor.structural_callable_extent(candidate),
+                has_body: candidate.child_by_field_name("body").is_some(),
+                is_package_function: extractor.is_package_function_declaration(candidate.kind()),
+                structural_target: true,
+            });
+        }
+        ancestor = candidate.parent();
+    }
+    None
 }
 
 /// One registered language: the extensions it claims plus its extractor.
@@ -215,6 +241,17 @@ pub fn extractor_for_extension(ext: &str) -> Option<&'static dyn LanguageExtract
         .map(|e| e.extractor)
 }
 
+/// Route source-file test ownership through the same language adapter that
+/// owns parsing and structural facts. Unknown extensions are conservatively
+/// not classified as test source.
+pub fn source_path_is_test(file_path: &str) -> bool {
+    Path::new(file_path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(extractor_for_extension)
+        .is_some_and(|extractor| extractor.source_file_is_test(file_path))
+}
+
 /// The canonical language name for an extension (the single-source replacement
 /// for the inline `rs → rust` maps).
 pub fn language_for_extension(ext: &str) -> Option<&'static str> {
@@ -245,4 +282,35 @@ pub fn registered_languages() -> Vec<&'static str> {
         .iter()
         .map(|entry| entry.extractor.language())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_path_is_test;
+
+    #[test]
+    fn test_source_path_policy_is_language_owned_and_non_vacuous() {
+        for path in [
+            "tests/integration.rs",
+            "pkg/service_test.go",
+            "tests/test_service.py",
+            "apps/web/service.spec.ts",
+            "apps/web/service.e2e.ts",
+            "apps/web/widget.stories.tsx",
+        ] {
+            assert!(source_path_is_test(path), "expected test source: {path}");
+        }
+        for path in [
+            "src/contest.rs",
+            "pkg/service.go",
+            "src/service.py",
+            "apps/web/service.ts",
+            "apps/web/storybook.ts",
+        ] {
+            assert!(
+                !source_path_is_test(path),
+                "production decoy was classified as test source: {path}"
+            );
+        }
+    }
 }

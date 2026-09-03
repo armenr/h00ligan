@@ -19,7 +19,7 @@ from h00_semantic_provider_test_harness import (
 )
 
 
-PROTOCOL = "h00/semantic-provider/v13"
+PROTOCOL = "h00/semantic-provider/v15"
 PROVIDER_ID = "h00-pyrefly-scip"
 LANGUAGE = "python"
 UPSTREAM_VERSION = "1.2.0"

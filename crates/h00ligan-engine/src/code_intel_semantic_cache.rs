@@ -432,6 +432,7 @@ mod tests {
             documents: Vec::new(),
             symbols: Vec::new(),
             calls: Vec::new(),
+            root_invocations: Vec::new(),
             callable_bindings: Vec::new(),
             coverage_exclusions: Vec::new(),
         });
@@ -541,6 +542,7 @@ mod tests {
             documents: Vec::new(),
             symbols: Vec::new(),
             calls: Vec::new(),
+            root_invocations: Vec::new(),
             callable_bindings: Vec::new(),
             coverage_exclusions: Vec::new(),
         });

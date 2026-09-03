@@ -12,11 +12,11 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context as _, bail};
 use h00ligan_provider_protocol::{
     H00_PYREFLY_IMPLEMENTATION_V1, H00_PYREFLY_LANGUAGE, H00_PYREFLY_PROVIDER_ID,
-    H00_PYREFLY_UPSTREAM_COMMIT, H00_PYREFLY_UPSTREAM_VERSION, ProviderAuthority,
-    ProviderComponentHealth, ProviderDocumentOutcome, ProviderFrame, ProviderFrameLimits,
-    ProviderHealthEvidence, ProviderIdentity, ProviderRequest, ProviderRequestBody,
-    ProviderResponse, ProviderResponseBody, ProviderRuntimeConfiguration, ProviderSemanticInputs,
-    ProviderSourceChange, ProviderSourceIdentity, PROVIDER_PARENT_PID_ENV,
+    H00_PYREFLY_UPSTREAM_COMMIT, H00_PYREFLY_UPSTREAM_VERSION, PROVIDER_PARENT_PID_ENV,
+    ProviderAuthority, ProviderComponentHealth, ProviderDocumentOutcome, ProviderFrame,
+    ProviderFrameLimits, ProviderHealthEvidence, ProviderIdentity, ProviderRequest,
+    ProviderRequestBody, ProviderResponse, ProviderResponseBody, ProviderRuntimeConfiguration,
+    ProviderSemanticInputs, ProviderSourceChange, ProviderSourceIdentity,
     RESOLVED_TOOLCHAIN_SHA256_ENV, SEMANTIC_PROVIDER_PROTOCOL, capture_provider_semantic_inputs,
     provider_runtime_configuration, provider_semantic_inputs_sha256,
     provider_semantic_paths_are_current, pyrefly_source_components, read_provider_frame,
@@ -75,6 +75,7 @@ struct RootSession {
     sources: BTreeMap<String, ProviderSourceIdentity>,
     source_bytes: BTreeMap<String, String>,
     absolute_paths: BTreeMap<String, PathBuf>,
+    document_bound_modules_by_document: BTreeMap<String, String>,
     facts_by_document: BTreeMap<String, H00SemanticFacts>,
     symbols: BTreeMap<(PathBuf, String), PythonSymbol>,
     package_name: String,
@@ -365,7 +366,6 @@ impl RootSession {
         if sources.is_empty() {
             bail!("Pyrefly source population is empty");
         }
-
         let candidate_paths = configuration_candidate_paths(
             &repository_root,
             absolute_paths.values().map(PathBuf::as_path),
@@ -377,7 +377,7 @@ impl RootSession {
             &BTreeSet::new(),
             limits,
         )?;
-        let semantic = H00SemanticSession::open(&repository_root, admitted)
+        let semantic = H00SemanticSession::open(&execution_root, admitted)
             .context("open exact-byte Pyrefly solved state")?;
         let initial_authority = semantic.authority_facts()?;
         let semantic_paths = semantic_input_paths(
@@ -418,7 +418,13 @@ impl RootSession {
             bail!("Python workspace authority changed during session admission");
         }
 
-        let facts_by_document = collect_facts(&semantic, &absolute_paths)?;
+        let document_bound_modules_by_document =
+            index_document_bound_modules(&absolute_paths, &final_authority)?;
+        let facts_by_document = collect_facts(
+            &semantic,
+            &absolute_paths,
+            &document_bound_modules_by_document,
+        )?;
         let package_name = package_name(&execution_prefix);
         let symbols = build_symbol_catalog(&facts_by_document, &package_name)?;
         let workspace_resolution_sha256 =
@@ -437,6 +443,7 @@ impl RootSession {
             sources,
             source_bytes,
             absolute_paths,
+            document_bound_modules_by_document,
             facts_by_document,
             symbols,
             package_name,
@@ -556,14 +563,11 @@ impl RootSession {
         self.semantic.apply(replacements)?;
         self.sources = next_sources;
         self.source_bytes = next_bytes;
-        for document_path in changed_documents {
-            let absolute = self
-                .absolute_paths
-                .get(&document_path)
-                .context("changed Pyrefly path disappeared")?;
-            self.facts_by_document
-                .insert(document_path, self.semantic.facts(absolute)?);
-        }
+        self.facts_by_document = collect_facts(
+            &self.semantic,
+            &self.absolute_paths,
+            &self.document_bound_modules_by_document,
+        )?;
         self.symbols = build_symbol_catalog(&self.facts_by_document, &self.package_name)?;
         self.authority = next_authority;
         self.verify_authority_inputs(limits)
@@ -584,11 +588,10 @@ impl RootSession {
             let source = self.sources.get(&document_path).with_context(|| {
                 format!("export path is outside Pyrefly session: {document_path}")
             })?;
-            let absolute = self
-                .absolute_paths
+            let facts = self
+                .facts_by_document
                 .get(&document_path)
-                .context("export source path disappeared")?;
-            let facts = self.semantic.facts(absolute)?;
+                .context("export fact snapshot disappeared")?;
             let document = build_document(
                 &document_path,
                 self.source_bytes
@@ -622,66 +625,284 @@ impl RootSession {
 fn collect_facts(
     semantic: &H00SemanticSession,
     paths: &BTreeMap<String, PathBuf>,
+    document_bound_modules_by_document: &BTreeMap<String, String>,
 ) -> anyhow::Result<BTreeMap<String, H00SemanticFacts>> {
-    paths
+    let raw = paths
         .iter()
         .map(|(document_path, absolute)| Ok((document_path.clone(), semantic.facts(absolute)?)))
-        .collect()
+        .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+    project_fact_snapshot(raw, document_bound_modules_by_document)
+}
+
+fn project_fact_snapshot(
+    mut facts_by_document: BTreeMap<String, H00SemanticFacts>,
+    document_bound_modules_by_document: &BTreeMap<String, String>,
+) -> anyhow::Result<BTreeMap<String, H00SemanticFacts>> {
+    let document_by_compiler_file = index_documents_by_compiler_file(&facts_by_document)?;
+    let declaration_aliases_by_compiler_file = index_document_bound_declaration_aliases(
+        &facts_by_document,
+        document_bound_modules_by_document,
+    );
+    for (document_path, facts) in &mut facts_by_document {
+        normalize_document_bound_module_names(
+            facts,
+            document_path,
+            &document_by_compiler_file,
+            document_bound_modules_by_document,
+            &declaration_aliases_by_compiler_file,
+        );
+    }
+    Ok(facts_by_document)
+}
+
+fn index_document_bound_modules(
+    paths: &BTreeMap<String, PathBuf>,
+    authority: &H00AuthorityFacts,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut modules_by_path = BTreeMap::new();
+    for module in &authority.modules {
+        if modules_by_path
+            .insert(module.path.clone(), module)
+            .is_some()
+        {
+            bail!("Pyrefly authority contains duplicate source module bindings");
+        }
+    }
+    if modules_by_path.len() != paths.len() {
+        bail!("Pyrefly authority module population differs from admitted sources");
+    }
+    let mut source_stems_by_module = BTreeMap::<String, BTreeSet<PathBuf>>::new();
+    for (document_path, absolute) in paths {
+        let module = modules_by_path
+            .get(absolute)
+            .context("Pyrefly authority omitted an admitted source module")?;
+        source_stems_by_module
+            .entry(module.module_name.clone())
+            .or_default()
+            .insert(Path::new(document_path).with_extension(""));
+    }
+    let colliding_modules = source_stems_by_module
+        .into_iter()
+        .filter_map(|(module, stems)| (stems.len() > 1).then_some(module))
+        .collect::<BTreeSet<_>>();
+
+    let mut document_bound = BTreeMap::new();
+    for (document_path, absolute) in paths {
+        let module = modules_by_path
+            .get(absolute)
+            .context("Pyrefly authority omitted an admitted source module")?;
+        if module.fallback_name || colliding_modules.contains(&module.module_name) {
+            document_bound.insert(document_path.clone(), module.module_name.clone());
+        }
+    }
+    Ok(document_bound)
+}
+
+fn index_documents_by_compiler_file(
+    facts_by_document: &BTreeMap<String, H00SemanticFacts>,
+) -> anyhow::Result<BTreeMap<PathBuf, String>> {
+    let mut documents = BTreeMap::new();
+    for (document_path, facts) in facts_by_document {
+        if documents
+            .insert(PathBuf::from(&facts.file), document_path.clone())
+            .is_some()
+        {
+            bail!("multiple Pyrefly documents expose one compiler file identity");
+        }
+    }
+    Ok(documents)
+}
+
+fn index_document_bound_declaration_aliases(
+    facts_by_document: &BTreeMap<String, H00SemanticFacts>,
+    document_bound_modules_by_document: &BTreeMap<String, String>,
+) -> BTreeMap<PathBuf, Vec<(String, String)>> {
+    let mut aliases = BTreeMap::<PathBuf, Vec<(String, String)>>::new();
+    for (document_path, facts) in facts_by_document {
+        let Some(compiler_module) = document_bound_modules_by_document.get(document_path) else {
+            continue;
+        };
+        let entries = aliases.entry(PathBuf::from(&facts.file)).or_default();
+        for declaration in &facts.declarations {
+            if let Some(canonical) =
+                normalized_document_bound_name(&declaration.name, compiler_module, document_path)
+            {
+                entries.push((declaration.name.clone(), canonical));
+            }
+        }
+        entries.sort();
+        entries.dedup();
+    }
+    aliases
+}
+
+/// A Pyrefly fallback module is not repository identity, nor is any module name
+/// the compiler assigns to multiple distinct source stems. Cloud API proves the
+/// second case: dozens of Alembic files are all called `__unknown__` while
+/// Pyrefly reports `fallback_name=false`. Bind those ambiguous prefixes to the
+/// exact admitted document (with `.py` and `.pyi` sharing one module identity),
+/// and rewrite references only when the compiler supplies an exact target file.
+fn normalize_document_bound_module_names(
+    facts: &mut H00SemanticFacts,
+    document_path: &str,
+    document_by_compiler_file: &BTreeMap<PathBuf, String>,
+    document_bound_modules_by_document: &BTreeMap<String, String>,
+    declaration_aliases_by_compiler_file: &BTreeMap<PathBuf, Vec<(String, String)>>,
+) {
+    if let Some(compiler_module) = document_bound_modules_by_document.get(document_path) {
+        for declaration in &mut facts.declarations {
+            if let Some(name) =
+                normalized_document_bound_name(&declaration.name, compiler_module, document_path)
+            {
+                declaration.name = name;
+            }
+        }
+    }
+    for reference in &mut facts.references {
+        let Some(target_file) = reference.target_file.as_ref() else {
+            continue;
+        };
+        let Some(target_document) = document_by_compiler_file.get(Path::new(target_file)) else {
+            continue;
+        };
+        let Some(compiler_module) = document_bound_modules_by_document.get(target_document) else {
+            continue;
+        };
+        if let Some(name) = resolve_document_bound_declaration_alias(
+            declaration_aliases_by_compiler_file,
+            Path::new(target_file),
+            &reference.target_name,
+        ) {
+            reference.target_name = name;
+            continue;
+        }
+        if let Some(name) =
+            normalized_document_bound_name(&reference.target_name, compiler_module, target_document)
+        {
+            reference.target_name = name;
+        }
+    }
+}
+
+fn resolve_document_bound_declaration_alias(
+    aliases_by_compiler_file: &BTreeMap<PathBuf, Vec<(String, String)>>,
+    target_file: &Path,
+    target_name: &str,
+) -> Option<String> {
+    let mut paths = vec![target_file.to_path_buf()];
+    if let Some(extension) = target_file.extension().and_then(|value| value.to_str()) {
+        let sibling_extension = match extension {
+            "py" => Some("pyi"),
+            "pyi" => Some("py"),
+            _ => None,
+        };
+        if let Some(sibling_extension) = sibling_extension {
+            let mut sibling = target_file.to_path_buf();
+            sibling.set_extension(sibling_extension);
+            paths.push(sibling);
+        }
+    }
+
+    let mut candidates = BTreeMap::<usize, BTreeSet<String>>::new();
+    for path in paths {
+        for (raw, canonical) in aliases_by_compiler_file.get(&path).into_iter().flatten() {
+            if target_name == raw
+                || target_name
+                    .strip_suffix(raw)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+            {
+                candidates
+                    .entry(raw.len())
+                    .or_default()
+                    .insert(canonical.clone());
+            }
+        }
+    }
+    let (_, most_specific) = candidates.last_key_value()?;
+    (most_specific.len() == 1).then(|| most_specific.first().expect("one alias candidate").clone())
+}
+
+fn normalized_document_bound_name(
+    name: &str,
+    compiler_module: &str,
+    document_path: &str,
+) -> Option<String> {
+    let suffix = name.strip_prefix(compiler_module)?.strip_prefix('.')?;
+    if suffix.is_empty() {
+        return None;
+    }
+    let module_path = Path::new(document_path).with_extension("");
+    Some(format!(
+        "__h00_module_{}.{}",
+        sha256_hex(module_path.to_string_lossy().as_bytes()),
+        suffix
+    ))
 }
 
 fn build_symbol_catalog(
     facts_by_document: &BTreeMap<String, H00SemanticFacts>,
     package_name: &str,
 ) -> anyhow::Result<BTreeMap<(PathBuf, String), PythonSymbol>> {
-    let mut declaration_kinds = BTreeMap::<String, H00DeclarationKind>::new();
-    for facts in facts_by_document.values() {
-        for declaration in &facts.declarations {
-            if !supported_declaration(&declaration.kind) {
-                continue;
-            }
-            if declaration_kinds
-                .insert(declaration.name.clone(), declaration.kind.clone())
-                .is_some()
-            {
-                bail!("Pyrefly emitted a duplicate qualified declaration name");
-            }
-        }
-    }
-
-    let mut catalog = BTreeMap::new();
-    let mut declarations = BTreeMap::<String, H00DeclarationFact>::new();
+    let mut canonical_declarations = BTreeMap::<String, (PathBuf, H00DeclarationFact)>::new();
     for facts in facts_by_document.values() {
         let file = PathBuf::from(&facts.file);
         for declaration in &facts.declarations {
             if !supported_declaration(&declaration.kind) {
                 continue;
             }
-            let symbol = python_symbol(package_name, declaration, &declaration_kinds)?;
-            let display_name = declaration
-                .name
-                .rsplit('.')
-                .next()
-                .context("empty Pyrefly declaration name")?
-                .to_owned();
-            let kind = scip_kind(&declaration.kind);
-            let key = (file.clone(), declaration.name.clone());
-            if catalog
-                .insert(
-                    key,
-                    PythonSymbol {
-                        symbol,
-                        display_name,
-                        kind,
-                        relationships: Vec::new(),
-                    },
-                )
-                .is_some()
-                || declarations
-                    .insert(declaration.name.clone(), declaration.clone())
-                    .is_some()
-            {
-                bail!("Pyrefly emitted a duplicate repository declaration");
+            match canonical_declarations.entry(declaration.name.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((file.clone(), declaration.clone()));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let (previous_file, previous) = entry.get();
+                    if previous.kind != declaration.kind
+                        || !python_runtime_stub_pair(previous_file, &file)
+                    {
+                        bail!(
+                            "Pyrefly emitted duplicate qualified declaration {} outside one exact runtime/stub pair",
+                            declaration.name
+                        );
+                    }
+                    if is_python_stub(&file) {
+                        entry.insert((file.clone(), declaration.clone()));
+                    }
+                }
             }
+        }
+    }
+
+    let declaration_kinds = canonical_declarations
+        .iter()
+        .map(|(name, (_, declaration))| (name.clone(), declaration.kind.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut catalog = BTreeMap::new();
+    let declarations = canonical_declarations
+        .iter()
+        .map(|(name, (_, declaration))| (name.clone(), declaration.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for (name, (file, declaration)) in &canonical_declarations {
+        let symbol = python_symbol(package_name, declaration, &declaration_kinds)?;
+        let display_name = name
+            .rsplit('.')
+            .next()
+            .context("empty Pyrefly declaration name")?
+            .to_owned();
+        let kind = scip_kind(&declaration.kind);
+        if catalog
+            .insert(
+                (file.clone(), name.clone()),
+                PythonSymbol {
+                    symbol,
+                    display_name,
+                    kind,
+                    relationships: Vec::new(),
+                },
+            )
+            .is_some()
+        {
+            bail!("Pyrefly canonical declaration catalog collided");
         }
     }
 
@@ -773,8 +994,7 @@ fn build_document(
         let Some(target_file) = reference.target_file.as_ref() else {
             continue;
         };
-        let Some(target) =
-            symbols.get(&(PathBuf::from(target_file), reference.target_name.clone()))
+        let Some(target) = resolve_reference_symbol(symbols, target_file, &reference.target_name)
         else {
             continue;
         };
@@ -805,6 +1025,47 @@ fn build_document(
     document.occurrences = occurrences;
     document.symbols = information;
     Ok(document)
+}
+
+/// Resolve one Pyrefly reference to the exact repository declaration exported
+/// into this provider session.
+///
+/// Pyrefly may retain the runtime `.py` target path for an import whose class
+/// declaration is supplied by the adjacent `.pyi` stub (and vice versa). That
+/// pair is one Python module, so the sibling declaration is authoritative. No
+/// broader terminal- or qualified-name fallback is allowed: an unrelated file
+/// with the same symbol spelling remains outside the reference target.
+fn resolve_reference_symbol<'a>(
+    symbols: &'a BTreeMap<(PathBuf, String), PythonSymbol>,
+    target_file: &str,
+    target_name: &str,
+) -> Option<&'a PythonSymbol> {
+    let target_path = PathBuf::from(target_file);
+    if let Some(symbol) = symbols.get(&(target_path.clone(), target_name.to_owned())) {
+        return Some(symbol);
+    }
+    let sibling_extension = match target_path.extension().and_then(|value| value.to_str()) {
+        Some("py") => "pyi",
+        Some("pyi") => "py",
+        _ => return None,
+    };
+    let mut sibling = target_path;
+    sibling.set_extension(sibling_extension);
+    symbols.get(&(sibling, target_name.to_owned()))
+}
+
+fn python_runtime_stub_pair(left: &Path, right: &Path) -> bool {
+    matches!(
+        (
+            left.extension().and_then(|value| value.to_str()),
+            right.extension().and_then(|value| value.to_str())
+        ),
+        (Some("py"), Some("pyi")) | (Some("pyi"), Some("py"))
+    ) && left.with_extension("") == right.with_extension("")
+}
+
+fn is_python_stub(path: &Path) -> bool {
+    path.extension().and_then(|value| value.to_str()) == Some("pyi")
 }
 
 fn supported_declaration(kind: &H00DeclarationKind) -> bool {
@@ -925,7 +1186,7 @@ fn semantic_input_paths(
     for config in &authority.configurations {
         add_configuration_paths(repository_root, config, &mut paths)?;
     }
-    if paths.len() > limits.max_document_paths {
+    if paths.len() > limits.max_semantic_input_paths {
         bail!("Python semantic-input population exceeds negotiated path bounds");
     }
     Ok(paths)
@@ -1004,7 +1265,7 @@ fn configuration_candidate_paths<'a>(
             }
         }
     }
-    if paths.is_empty() || paths.len() > limits.max_document_paths {
+    if paths.is_empty() || paths.len() > limits.max_semantic_input_paths {
         bail!("Python configuration-candidate population is empty or oversized");
     }
     Ok(paths)
@@ -1263,6 +1524,624 @@ fn arm_parent_liveness_guard() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RIGHT-REASON REGRESSION from AEGIS dogfood: Pyrefly can resolve a
+    /// runtime-module import to a declaration supplied by that module's
+    /// adjacent `.pyi` stub. The reference target retains the `.py` path while
+    /// the repository definition belongs to the `.pyi`; exact sibling pairing
+    /// must preserve the call occurrence without admitting an unrelated stub.
+    #[test]
+    fn runtime_module_reference_resolves_adjacent_stub_declaration() {
+        let runtime = PathBuf::from("/repo/src/fixture/dynamic_pb2.py");
+        let stub = PathBuf::from("/repo/src/fixture/dynamic_pb2.pyi");
+        let caller = PathBuf::from("/repo/src/fixture/caller.py");
+        let qualified = "fixture.dynamic_pb2.AuditRecord";
+        let stub_source = "class AuditRecord:\n    ...\n";
+        let caller_source = "def caller():\n    return AuditRecord()\n";
+        let call_start = caller_source.find("AuditRecord").expect("call token") as u64;
+        let declaration_start = stub_source.find("AuditRecord").expect("class token") as u64;
+        let declaration = H00DeclarationFact {
+            name: qualified.into(),
+            kind: H00DeclarationKind::Class,
+            name_span: H00ByteSpan {
+                start: declaration_start,
+                length: "AuditRecord".len() as u64,
+            },
+            extent_span: H00ByteSpan {
+                start: 0,
+                length: stub_source.len() as u64,
+            },
+            bases: Vec::new(),
+        };
+        let runtime_facts = H00SemanticFacts {
+            file: runtime.to_string_lossy().into_owned(),
+            declarations: vec![declaration.clone()],
+            references: Vec::new(),
+        };
+        let stub_facts = H00SemanticFacts {
+            file: stub.to_string_lossy().into_owned(),
+            declarations: vec![declaration],
+            references: Vec::new(),
+        };
+        let caller_facts = |target_file: &Path| H00SemanticFacts {
+            file: caller.to_string_lossy().into_owned(),
+            declarations: Vec::new(),
+            references: vec![pyrefly::h00_semantic::H00ReferenceFact {
+                target_name: qualified.into(),
+                target_file: Some(target_file.to_string_lossy().into_owned()),
+                source_span: H00ByteSpan {
+                    start: call_start,
+                    length: "AuditRecord".len() as u64,
+                },
+            }],
+        };
+        let facts = BTreeMap::from([
+            ("src/fixture/dynamic_pb2.py".into(), runtime_facts),
+            ("src/fixture/dynamic_pb2.pyi".into(), stub_facts),
+            ("src/fixture/caller.py".into(), caller_facts(&runtime)),
+        ]);
+        let symbols = build_symbol_catalog(&facts, "stub-fixture").expect("symbol catalog");
+        assert!(
+            !symbols.contains_key(&(runtime.clone(), qualified.into())),
+            "the runtime declaration must not compete with its authoritative stub"
+        );
+        assert!(
+            symbols.contains_key(&(stub.clone(), qualified.into())),
+            "the exact adjacent stub must own the canonical definition"
+        );
+        let document = build_document(
+            "src/fixture/caller.py",
+            caller_source,
+            facts.get("src/fixture/caller.py").expect("caller facts"),
+            &symbols,
+        )
+        .expect("canonical caller document");
+        assert_eq!(
+            document.occurrences.len(),
+            1,
+            "a runtime target path must resolve its exact adjacent stub declaration"
+        );
+
+        let unrelated = caller_facts(Path::new("/repo/src/fixture/unrelated.py"));
+        let unrelated_document =
+            build_document("src/fixture/caller.py", caller_source, &unrelated, &symbols)
+                .expect("unrelated canonical document");
+        assert!(
+            unrelated_document.occurrences.is_empty(),
+            "terminal-name equality must not alias an unrelated module to the stub"
+        );
+
+        let canonical = facts
+            .get("src/fixture/dynamic_pb2.pyi")
+            .expect("stub facts")
+            .declarations[0]
+            .clone();
+        let unrelated_stub = PathBuf::from("/repo/src/other/dynamic_pb2.pyi");
+        let conflicting = BTreeMap::from([
+            (
+                "src/fixture/dynamic_pb2.pyi".into(),
+                H00SemanticFacts {
+                    file: stub.to_string_lossy().into_owned(),
+                    declarations: vec![canonical.clone()],
+                    references: Vec::new(),
+                },
+            ),
+            (
+                "src/other/dynamic_pb2.pyi".into(),
+                H00SemanticFacts {
+                    file: unrelated_stub.to_string_lossy().into_owned(),
+                    declarations: vec![canonical],
+                    references: Vec::new(),
+                },
+            ),
+        ]);
+        let error = match build_symbol_catalog(&conflicting, "stub-fixture") {
+            Ok(_) => panic!("unrelated duplicate qualified declarations must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("outside one exact runtime/stub pair"),
+            "unexpected duplicate-declaration error: {error:#}"
+        );
+    }
+
+    /// RIGHT-REASON REGRESSION from the AEGIS uv workspace: Pyrefly assigned
+    /// `__unknown__.run_real_migrations` to functions in two different files.
+    /// The placeholder cannot be repository identity, while a reference with
+    /// an exact target file can be bound without any name-only guessing.
+    #[test]
+    fn unknown_module_names_are_bound_to_exact_document_identity() {
+        let first_file = PathBuf::from("/repo/apps/agents/tests/first.py");
+        let second_file = PathBuf::from("/repo/apps/agents/tests/second.py");
+        let caller_file = PathBuf::from("/repo/apps/agents/src/caller.py");
+        let document_bound_modules = BTreeMap::from([
+            ("tests/first.py".into(), "__unknown__".into()),
+            ("tests/second.py".into(), "__unknown__".into()),
+            ("src/caller.py".into(), "__unknown__".into()),
+        ]);
+        let declaration = || H00DeclarationFact {
+            name: "__unknown__.run_real_migrations".into(),
+            kind: H00DeclarationKind::Function,
+            name_span: H00ByteSpan {
+                start: 4,
+                length: "run_real_migrations".len() as u64,
+            },
+            extent_span: H00ByteSpan {
+                start: 0,
+                length: 32,
+            },
+            bases: Vec::new(),
+        };
+        let first = H00SemanticFacts {
+            file: first_file.to_string_lossy().into_owned(),
+            declarations: vec![declaration()],
+            references: Vec::new(),
+        };
+        let second = H00SemanticFacts {
+            file: second_file.to_string_lossy().into_owned(),
+            declarations: vec![declaration()],
+            references: Vec::new(),
+        };
+        let caller = H00SemanticFacts {
+            file: caller_file.to_string_lossy().into_owned(),
+            declarations: Vec::new(),
+            references: vec![pyrefly::h00_semantic::H00ReferenceFact {
+                target_name: "__unknown__.run_real_migrations".into(),
+                target_file: Some(first_file.to_string_lossy().into_owned()),
+                source_span: H00ByteSpan {
+                    start: 0,
+                    length: "run_real_migrations".len() as u64,
+                },
+            }],
+        };
+
+        let facts = project_fact_snapshot(
+            BTreeMap::from([
+                ("tests/first.py".into(), first),
+                ("tests/second.py".into(), second),
+                ("src/caller.py".into(), caller),
+            ]),
+            &document_bound_modules,
+        )
+        .expect("document-bound fact projection");
+        let first = &facts["tests/first.py"];
+        let second = &facts["tests/second.py"];
+        let caller = &facts["src/caller.py"];
+        assert_ne!(first.declarations[0].name, second.declarations[0].name);
+        assert_eq!(
+            caller.references[0].target_name, first.declarations[0].name,
+            "exact target-file evidence must select the same synthetic module identity"
+        );
+        assert_eq!(
+            normalized_document_bound_name(
+                "__unknown__.AuditRecord",
+                "__unknown__",
+                "src/dynamic_pb2.py"
+            ),
+            normalized_document_bound_name(
+                "__unknown__.AuditRecord",
+                "__unknown__",
+                "src/dynamic_pb2.pyi"
+            ),
+            "one runtime/stub module pair must retain one identity"
+        );
+
+        let symbols = build_symbol_catalog(&facts, "unknown-module-fixture")
+            .expect("file-bound unknown modules must not collide");
+        assert_eq!(symbols.len(), 2, "positive two-declaration control");
+    }
+
+    /// RIGHT-REASON REGRESSION from Cloud API dogfood: Pyrefly assigns every
+    /// Alembic migration the colliding module name `__unknown__` while marking
+    /// `fallback_name=false`. Explicit fallback state is therefore insufficient;
+    /// repository identity must also reject one module name mapped to distinct
+    /// source stems, without misclassifying one `.py` / `.pyi` pair.
+    #[test]
+    fn colliding_nonfallback_modules_are_document_bound_but_stub_pairs_are_not() {
+        let module =
+            |path: &str, name: &str, fallback_name: bool| pyrefly::h00_semantic::H00ModuleBinding {
+                path: PathBuf::from(path),
+                module_name: name.into(),
+                fallback_name,
+                python_version: "3.13".into(),
+                python_platform: "linux".into(),
+                type_checking: false,
+            };
+        let paths = BTreeMap::from([
+            (
+                "alembic/versions/0001.py".into(),
+                PathBuf::from("/repo/alembic/versions/0001.py"),
+            ),
+            (
+                "alembic/versions/0002.py".into(),
+                PathBuf::from("/repo/alembic/versions/0002.py"),
+            ),
+            ("app/model.py".into(), PathBuf::from("/repo/app/model.py")),
+            ("app/model.pyi".into(), PathBuf::from("/repo/app/model.pyi")),
+            ("app/main.py".into(), PathBuf::from("/repo/app/main.py")),
+            (
+                "components/client.py".into(),
+                PathBuf::from("/repo/components/client.py"),
+            ),
+        ]);
+        let authority = H00AuthorityFacts {
+            modules: vec![
+                module("/repo/alembic/versions/0001.py", "__unknown__", false),
+                module("/repo/alembic/versions/0002.py", "__unknown__", false),
+                module("/repo/app/model.py", "app.model", false),
+                module("/repo/app/model.pyi", "app.model", false),
+                module("/repo/app/main.py", "app.main", false),
+                module("/repo/components/client.py", "client", true),
+            ],
+            configurations: Vec::new(),
+        };
+        let document_bound =
+            index_document_bound_modules(&paths, &authority).expect("module identity index");
+        assert_eq!(document_bound.len(), 3, "positive bound-module population");
+        assert_eq!(
+            document_bound
+                .get("alembic/versions/0001.py")
+                .map(String::as_str),
+            Some("__unknown__")
+        );
+        assert_eq!(
+            document_bound
+                .get("alembic/versions/0002.py")
+                .map(String::as_str),
+            Some("__unknown__")
+        );
+        assert_eq!(
+            document_bound
+                .get("components/client.py")
+                .map(String::as_str),
+            Some("client")
+        );
+        assert!(!document_bound.contains_key("app/model.py"));
+        assert!(!document_bound.contains_key("app/model.pyi"));
+        assert!(!document_bound.contains_key("app/main.py"));
+    }
+
+    /// RIGHT-REASON REGRESSION from Cloud API dogfood: without project module
+    /// configuration, Pyrefly marks unrelated `ses/client.py` and
+    /// `zammad/client.py` handles as fallback module `client`. The fallback
+    /// spelling cannot be repository identity, while an exact compiler target
+    /// file remains sufficient to bind a same-document call.
+    #[test]
+    fn non_unknown_fallback_modules_are_bound_to_exact_documents() {
+        let ses_path = "app/components/ses/client.py";
+        let zammad_path = "app/components/zammad/client.py";
+        let caller_path = "app/components/billing/invoice.py";
+        let ses_source = "def _configured() -> bool:\n    return True\n";
+        let zammad_source = "def _configured() -> bool:\n    return False\n";
+        let caller_source = "_configured()\n";
+        let declaration = |source: &str| H00DeclarationFact {
+            name: "client._configured".into(),
+            kind: H00DeclarationKind::Function,
+            name_span: H00ByteSpan {
+                start: source.find("_configured").expect("definition token") as u64,
+                length: "_configured".len() as u64,
+            },
+            extent_span: H00ByteSpan {
+                start: 0,
+                length: source.find("\n\n").unwrap_or(source.len()) as u64,
+            },
+            bases: Vec::new(),
+        };
+        let call_start = caller_source.find("_configured").expect("call token") as u64;
+        let raw = BTreeMap::from([
+            (
+                caller_path.into(),
+                H00SemanticFacts {
+                    file: caller_path.into(),
+                    declarations: Vec::new(),
+                    references: vec![
+                        pyrefly::h00_semantic::H00ReferenceFact {
+                            target_name: "app.components.ses.client._configured".into(),
+                            target_file: Some(ses_path.into()),
+                            source_span: H00ByteSpan {
+                                start: call_start,
+                                length: "_configured".len() as u64,
+                            },
+                        },
+                        pyrefly::h00_semantic::H00ReferenceFact {
+                            target_name: "invoice._configured".into(),
+                            target_file: Some(caller_path.into()),
+                            source_span: H00ByteSpan {
+                                start: call_start,
+                                length: "_configured".len() as u64,
+                            },
+                        },
+                    ],
+                },
+            ),
+            (
+                ses_path.into(),
+                H00SemanticFacts {
+                    file: ses_path.into(),
+                    declarations: vec![declaration(ses_source)],
+                    references: Vec::new(),
+                },
+            ),
+            (
+                zammad_path.into(),
+                H00SemanticFacts {
+                    file: zammad_path.into(),
+                    declarations: vec![declaration(zammad_source)],
+                    references: Vec::new(),
+                },
+            ),
+        ]);
+        let document_bound_modules = BTreeMap::from([
+            (caller_path.into(), "invoice".into()),
+            (ses_path.into(), "client".into()),
+            (zammad_path.into(), "client".into()),
+        ]);
+        let projected = project_fact_snapshot(raw.clone(), &document_bound_modules)
+            .expect("fallback fact projection");
+        assert_ne!(
+            projected[ses_path].declarations[0].name, projected[zammad_path].declarations[0].name,
+            "unrelated fallback modules must receive distinct identities"
+        );
+        assert_eq!(
+            projected[caller_path].references[0].target_name,
+            projected[ses_path].declarations[0].name,
+            "an import-qualified compiler target must select the exact fallback declaration"
+        );
+        let symbols =
+            build_symbol_catalog(&projected, "fallback-fixture").expect("fallback catalog");
+        assert_eq!(symbols.len(), 2, "positive two-document control");
+        let document = build_document(
+            caller_path,
+            caller_source,
+            &projected[caller_path],
+            &symbols,
+        )
+        .expect("fallback caller document");
+        assert_eq!(
+            document
+                .occurrences
+                .iter()
+                .filter(|occurrence| occurrence.symbol_roles == SymbolRole::ReadAccess.value())
+                .count(),
+            1,
+            "the exact imported target must survive while the bogus self target is discarded"
+        );
+
+        let mut unresolved_raw = raw;
+        unresolved_raw
+            .get_mut(caller_path)
+            .expect("caller raw facts")
+            .references[0]
+            .target_file = None;
+        let unresolved = project_fact_snapshot(unresolved_raw, &document_bound_modules)
+            .expect("unresolved fallback projection");
+        assert_eq!(
+            unresolved[caller_path].references[0].target_name,
+            "app.components.ses.client._configured",
+            "projection must not rewrite a fallback reference without exact target-file evidence"
+        );
+        let unresolved_document = build_document(
+            caller_path,
+            caller_source,
+            &unresolved[caller_path],
+            &symbols,
+        )
+        .expect("unresolved fallback caller document");
+        assert_eq!(
+            unresolved_document
+                .occurrences
+                .iter()
+                .filter(|occurrence| occurrence.symbol_roles == SymbolRole::ReadAccess.value())
+                .count(),
+            0,
+            "name-only fallback references must not borrow repository authority"
+        );
+    }
+
+    /// RIGHT-REASON REGRESSION from AEGIS dogfood: a Hatch `src/` project can
+    /// place test modules in Pyrefly's `__unknown__` namespace while Glean spells
+    /// its file keys relative to the provider process CWD. Declarations were
+    /// normalized by repository document path, but references were joined only
+    /// through an absolute source map, silently discarding every local call.
+    #[test]
+    fn local_unknown_helper_calls_bind_only_to_exact_same_document_declarations() {
+        let root = std::env::temp_dir().join(format!(
+            "h00-pyrefly-local-helper-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).expect("temporary repository");
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        std::fs::create_dir_all(root.join("src/local_helper_proof"))
+            .expect("source package directory");
+        std::fs::create_dir(root.join("tests")).expect("test source directory");
+        std::fs::write(
+            root.join("pyproject.toml"),
+            "[project]\nname = \"local-helper-proof\"\nversion = \"0.0.0\"\n\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[tool.hatch.build.targets.wheel]\npackages = [\"src/local_helper_proof\"]\n",
+        )
+        .expect("project configuration");
+        let package_path = root.join("src/local_helper_proof/__init__.py");
+        std::fs::write(&package_path, "VALUE = 1\n").expect("package source");
+        let source_path = root.join("tests/arango_harness.py");
+        let source = "from typing import Any\n\ndef _thread_doc(value: int) -> int:\n    return value\n\ndef _edge_doc(value: int) -> int:\n    return value\n\ndef seed(db: Any) -> None:\n    db.collection(\"fixture\").insert_many(\n        [\n            _thread_doc(1),\n            _edge_doc(2),\n        ]\n    )\n";
+        std::fs::write(&source_path, source).expect("source fixture");
+        let semantic = H00SemanticSession::open(
+            &root,
+            [
+                (package_path, "VALUE = 1\n".to_owned()),
+                (source_path.clone(), source.to_owned()),
+            ],
+        )
+        .expect("open solved Pyrefly session");
+        semantic.refresh();
+        let facts = semantic.facts(&source_path).expect("raw semantic facts");
+
+        for helper in ["_thread_doc", "_edge_doc"] {
+            let call_start = source
+                .find(&format!("{helper}(1)"))
+                .or_else(|| source.find(&format!("{helper}(2)")))
+                .expect("helper call") as u64;
+            let reference = facts
+                .references
+                .iter()
+                .find(|reference| {
+                    reference.source_span.start == call_start
+                        && reference.source_span.length == helper.len() as u64
+                })
+                .expect("Pyrefly must export the exact local-helper call target");
+            assert!(
+                reference.target_name == format!("__unknown__.{helper}"),
+                "unexpected compiler target: {}",
+                reference.target_name
+            );
+            assert!(
+                reference
+                    .target_file
+                    .as_deref()
+                    .is_some_and(|target| Path::new(target) == source_path),
+                "positive control: Pyrefly supplied exact same-document target evidence"
+            );
+        }
+
+        // Pyrefly's Glean layer spells file identities relative to process CWD
+        // when the source is below it. Model the installed provider topology:
+        // the declaration file and exact reference target remain internally
+        // consistent, but neither matches the filesystem-absolute source map.
+        let mut compiler_relative = facts;
+        compiler_relative.file = "tests/arango_harness.py".into();
+        for reference in &mut compiler_relative.references {
+            if reference
+                .target_file
+                .as_deref()
+                .is_some_and(|target| Path::new(target) == source_path)
+            {
+                reference.target_file = Some("tests/arango_harness.py".into());
+            }
+        }
+        let document_bound_modules =
+            BTreeMap::from([("tests/arango_harness.py".into(), "__unknown__".into())]);
+        let mut projected = project_fact_snapshot(
+            BTreeMap::from([("tests/arango_harness.py".into(), compiler_relative)]),
+            &document_bound_modules,
+        )
+        .expect("compiler-file fact projection");
+        let facts = projected
+            .remove("tests/arango_harness.py")
+            .expect("projected owner facts");
+        let export_facts = facts.clone();
+        let fact_path = PathBuf::from(&facts.file);
+        let symbols = build_symbol_catalog(
+            &BTreeMap::from([("tests/arango_harness.py".into(), facts.clone())]),
+            "local-helper-proof",
+        )
+        .expect("local helper catalog");
+        let document = build_document("tests/arango_harness.py", source, &export_facts, &symbols)
+            .expect("canonical local-helper document");
+        for helper in ["_thread_doc", "_edge_doc"] {
+            let call_start = source
+                .find(&format!("{helper}(1)"))
+                .or_else(|| source.find(&format!("{helper}(2)")))
+                .expect("helper call");
+            let expected_range = scip_range(
+                source,
+                &H00ByteSpan {
+                    start: call_start as u64,
+                    length: helper.len() as u64,
+                },
+            )
+            .expect("call range");
+            assert!(
+                document.occurrences.iter().any(|occurrence| {
+                    occurrence.range == expected_range
+                        && occurrence.symbol_roles == SymbolRole::ReadAccess.value()
+                        && !occurrence.symbol.is_empty()
+                }),
+                "same-document compiler target for {helper} was discarded"
+            );
+            assert!(
+                symbols.keys().any(|(path, name)| {
+                    path == &fact_path && name.ends_with(&format!(".{helper}"))
+                }),
+                "positive declaration control for {helper}"
+            );
+        }
+
+        let unrelated_path = root.join("unrelated.py");
+        let unrelated_source = "def _thread_doc(value: int) -> int:\n    return value\n";
+        std::fs::write(&unrelated_path, unrelated_source).expect("unrelated source");
+        let unrelated_absolute =
+            std::fs::canonicalize(&unrelated_path).expect("canonical unrelated source");
+        let unrelated = H00SemanticFacts {
+            file: unrelated_absolute.to_string_lossy().into_owned(),
+            declarations: vec![H00DeclarationFact {
+                name: "__unknown__._thread_doc".into(),
+                kind: H00DeclarationKind::Function,
+                name_span: H00ByteSpan {
+                    start: 4,
+                    length: "_thread_doc".len() as u64,
+                },
+                extent_span: H00ByteSpan {
+                    start: 0,
+                    length: unrelated_source.len() as u64,
+                },
+                bases: Vec::new(),
+            }],
+            references: Vec::new(),
+        };
+        let caller_path = root.join("caller.py");
+        let caller_source = "_thread_doc(1)\n";
+        std::fs::write(&caller_path, caller_source).expect("caller source");
+        let caller_absolute = std::fs::canonicalize(&caller_path).expect("canonical caller source");
+        let caller = H00SemanticFacts {
+            file: caller_absolute.to_string_lossy().into_owned(),
+            declarations: Vec::new(),
+            references: vec![pyrefly::h00_semantic::H00ReferenceFact {
+                target_name: "__unknown__._thread_doc".into(),
+                target_file: None,
+                source_span: H00ByteSpan {
+                    start: 0,
+                    length: "_thread_doc".len() as u64,
+                },
+            }],
+        };
+        let sabotage_document_bound_modules = BTreeMap::from([
+            ("unrelated.py".into(), "__unknown__".into()),
+            ("caller.py".into(), "__unknown__".into()),
+        ]);
+        let sabotage_facts = project_fact_snapshot(
+            BTreeMap::from([
+                ("unrelated.py".into(), unrelated),
+                ("caller.py".into(), caller),
+            ]),
+            &sabotage_document_bound_modules,
+        )
+        .expect("sabotage fact projection");
+        let caller = &sabotage_facts["caller.py"];
+        assert_eq!(
+            caller.references[0].target_file, None,
+            "a no-file target must not borrow an unrelated declaration"
+        );
+        let sabotage_symbols = build_symbol_catalog(&sabotage_facts, "sabotage")
+            .expect("unrelated declaration catalog");
+        let sabotage_document =
+            build_document("caller.py", caller_source, caller, &sabotage_symbols)
+                .expect("sabotage caller document");
+        assert!(
+            sabotage_document.occurrences.is_empty(),
+            "same spelling in another document must not gain authority"
+        );
+    }
 
     #[test]
     fn python_symbols_preserve_module_class_and_callable_ownership() {

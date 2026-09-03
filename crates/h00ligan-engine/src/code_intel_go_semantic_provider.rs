@@ -15,7 +15,7 @@ use h00ligan_provider_protocol::{
     GO_CALLABLE_LIVENESS_CONFIGURATION_V1, GO_PROVIDER_SEMANTIC_ENVIRONMENT,
     H00_GO_IMPLEMENTATION_V4, H00_GO_LANGUAGE, H00_GO_PROVIDER_ID, ProviderAnalysisRequest,
     ProviderFrameLimits, ProviderIdentity, ProviderSemanticInputCoverage, ProviderSemanticInputs,
-    ProviderSemanticPathKind, RESOLVED_GO_SHA256_ENV,
+    ProviderSemanticPathKind, ProviderSemanticPathRoot, RESOLVED_GO_SHA256_ENV,
     capture_provider_semantic_inputs_in_environment, go_provider_source_components,
     provider_semantic_file_identity_sha256, sha256_hex, validate_provider_identity,
 };
@@ -58,6 +58,12 @@ fn validate_go_semantic_inputs_against_inventory(
         .map(|input| (input.path.as_str(), input))
         .collect::<BTreeMap<_, _>>();
     for semantic_input in &semantic_inputs.paths {
+        if semantic_input.root != ProviderSemanticPathRoot::Repository {
+            return Err(SemanticProviderError::Inventory(format!(
+                "Go semantic input {:?}:{} is not repository-owned",
+                semantic_input.root, semantic_input.path
+            )));
+        }
         match inventory_inputs.get(semantic_input.path.as_str()) {
             Some(inventory_input) => {
                 let expected_identity =

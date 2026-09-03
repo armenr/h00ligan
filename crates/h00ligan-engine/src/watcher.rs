@@ -20,7 +20,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use h00ligan_provider_protocol::{
     ProviderFrameLimits, ProviderSemanticInputCoverage, ProviderSemanticPathKind,
-    provider_semantic_paths_are_current,
+    ProviderSemanticPathRoot, provider_semantic_paths_are_current,
+    resolve_provider_semantic_path_location,
 };
 
 use crate::code_intel_payload::NormalizedProviderPayload;
@@ -129,6 +130,8 @@ pub enum WatcherError {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct DeclaredWatchInput {
+    root: ProviderSemanticPathRoot,
+    authority_root: PathBuf,
     path: PathBuf,
     kind: ProviderSemanticPathKind,
 }
@@ -277,13 +280,19 @@ fn add_declared_input_directories(
     desired: &mut BTreeSet<PathBuf>,
 ) -> Result<(), WatcherError> {
     for input in declared_inputs {
-        if !input.path.is_absolute() || !input.path.starts_with(&config.root) {
+        if !input.path.is_absolute()
+            || !input.path.starts_with(&input.authority_root)
+            || (input.root == ProviderSemanticPathRoot::Repository
+                && input.authority_root != config.root)
+        {
             return Err(WatcherError::InvalidSemanticInput(format!(
-                "path escapes repository root: {}",
+                "path escapes its declared authority root: {}",
                 input.path.display()
             )));
         }
-        if is_generated_or_excluded(config, &input.path) {
+        if input.root == ProviderSemanticPathRoot::Repository
+            && is_generated_or_excluded(config, &input.path)
+        {
             return Err(WatcherError::InvalidSemanticInput(format!(
                 "path overlaps a generated or excluded root: {}",
                 input.path.display()
@@ -303,7 +312,7 @@ fn add_declared_input_directories(
 
         let mut candidate = input.path.parent();
         while let Some(directory) = candidate {
-            if !directory.starts_with(&config.root) {
+            if !directory.starts_with(&input.authority_root) {
                 break;
             }
             if is_plain_directory(directory) {
@@ -642,7 +651,7 @@ fn classify_path_with_declared_inputs(
     if crate::code_intel_project_inputs::is_project_control_path(path) {
         return Some(WatchHintReason::Filesystem);
     }
-    if declared_inputs.iter().any(|input| {
+    if let Some(input) = declared_inputs.iter().find(|input| {
         input.path == path
             || (input.kind == ProviderSemanticPathKind::Directory && path.starts_with(&input.path))
             || (input.kind == ProviderSemanticPathKind::DirectoryListing
@@ -656,7 +665,11 @@ fn classify_path_with_declared_inputs(
                         | EventKind::Any
                 ))
     }) {
-        return Some(WatchHintReason::Filesystem);
+        return Some(if input.root == ProviderSemanticPathRoot::Repository {
+            WatchHintReason::Filesystem
+        } else {
+            WatchHintReason::GitState
+        });
     }
     if path
         .strip_prefix(&config.root)
@@ -687,27 +700,13 @@ fn declared_watch_inputs(
     let mut inputs = BTreeSet::new();
     for payload in payloads {
         for input in &payload.payload().semantic_inputs().paths {
-            let relative = Path::new(&input.path);
-            let is_root_listing =
-                input.path == "." && input.kind == ProviderSemanticPathKind::DirectoryListing;
-            if (!is_root_listing && relative.is_absolute())
-                || relative.components().any(|component| {
-                    !matches!(component, std::path::Component::Normal(_))
-                        && !(is_root_listing && matches!(component, std::path::Component::CurDir))
-                })
-            {
-                return Err(WatcherError::InvalidSemanticInput(input.path.clone()));
-            }
-            let path = if is_root_listing {
-                repository_root.to_path_buf()
-            } else {
-                repository_root.join(relative)
-            };
-            if !path.starts_with(repository_root) {
-                return Err(WatcherError::InvalidSemanticInput(input.path.clone()));
-            }
+            let location =
+                resolve_provider_semantic_path_location(repository_root, input.root, &input.path)
+                    .map_err(|_| WatcherError::InvalidSemanticInput(input.path.clone()))?;
             inputs.insert(DeclaredWatchInput {
-                path,
+                root: input.root,
+                authority_root: location.authority_root,
+                path: location.absolute_path,
                 kind: input.kind,
             });
         }
@@ -860,12 +859,37 @@ impl IndexWatchService {
                         };
                         let inputs = match declared_watch_inputs(
                             &repository_root,
-                            &published.publication.provider_payloads,
+                            &published.provider_payloads,
                         ) {
                             Ok(inputs) => inputs,
                             Err(error) => {
-                                task_status.lock().last_error = Some(error.to_string());
-                                break;
+                                let semantic_error = error.to_string();
+                                if let Err(population_error) =
+                                    population.replace(BTreeSet::new()).await
+                                {
+                                    task_status.lock().last_error = Some(format!(
+                                        "{semantic_error}; repository-root fallback failed: {population_error}"
+                                    ));
+                                    break;
+                                }
+                                match task_supervisor.request_periodic_reconciliation() {
+                                    Ok(observation) => {
+                                        let schedule = task_supervisor.schedule_snapshot();
+                                        let mut current = task_status.lock();
+                                        current.integrity_reconciliations += 1;
+                                        current.desired_epoch = observation.desired_epoch;
+                                        current.published_epoch = schedule.published_epoch;
+                                        current.active_trigger = schedule.active_trigger;
+                                        current.last_error = Some(semantic_error);
+                                    }
+                                    Err(supervisor_error) => {
+                                        task_status.lock().last_error = Some(format!(
+                                            "{semantic_error}; reconciliation failed: {supervisor_error}"
+                                        ));
+                                        break;
+                                    }
+                                }
+                                continue;
                             }
                         };
                         if let Err(error) = population.replace(inputs.clone()).await {
@@ -880,7 +904,7 @@ impl IndexWatchService {
                         // could have been received yet.
                         if !complete_semantic_paths_are_current(
                             &repository_root,
-                            &published.publication.provider_payloads,
+                            &published.provider_payloads,
                         )
                         .unwrap_or(false)
                         {
@@ -900,6 +924,13 @@ impl IndexWatchService {
                                 }
                             }
                         }
+
+                        // Successfully resolving, registering, and
+                        // re-observing the published semantic population is
+                        // the recovery witness for an earlier transient root
+                        // error. Keep status about the current service state,
+                        // not a topology condition that no longer exists.
+                        task_status.lock().last_error = None;
                     }
                     batch = batches.recv() => {
                         let Some(batch) = batch else {
@@ -925,11 +956,17 @@ impl IndexWatchService {
                         }
                     }
                     _ = publication_probe.tick() => {
-                        let schedule = task_supervisor.schedule_snapshot();
+                        let probe_snapshot = task_supervisor.publication_probe_snapshot();
+                        let schedule = &probe_snapshot.schedule;
                         let witness = task_supervisor.publication_control_witness();
-                        let probe = publication_tracker.observe(&schedule, witness, || {
-                            PublicationProbeState::capture(&task_supervisor)
-                        });
+                        let probe = publication_tracker.observe(
+                            schedule,
+                            probe_snapshot.owned_publication_revision,
+                            probe_snapshot.owned_publication_control_token.as_ref(),
+                            witness,
+                            || PublicationProbeState::capture(&task_supervisor),
+                            || task_supervisor.publication_probe_snapshot() == probe_snapshot,
+                        );
                         let probe_failed = probe.control_unavailable
                             && schedule.published_epoch > 0
                             && schedule.active_operation.is_none()
@@ -1031,7 +1068,7 @@ impl PublicationProbeState {
 
 #[derive(Default)]
 struct PublicationProbeTracker {
-    observed_published_epoch: u64,
+    observed_owned_publication_revision: u64,
     last_witness: Option<PublicationControlWitness>,
     last_state: Option<PublicationProbeState>,
 }
@@ -1049,10 +1086,14 @@ impl PublicationProbeTracker {
     fn observe(
         &mut self,
         schedule: &IndexScheduleSnapshot,
+        owned_publication_revision: u64,
+        owned_publication_control_token: Option<&PublicationControlToken>,
         witness: PublicationControlWitness,
         capture_control: impl FnOnce() -> PublicationProbeState,
+        local_snapshot_stable: impl FnOnce() -> bool,
     ) -> PublicationProbeObservation {
-        let own_publication_advanced = schedule.published_epoch != self.observed_published_epoch;
+        let own_publication_advanced =
+            owned_publication_revision != self.observed_owned_publication_revision;
         let baseline_missing = self.last_witness.is_none() || self.last_state.is_none();
         if !own_publication_advanced
             && !baseline_missing
@@ -1062,15 +1103,31 @@ impl PublicationProbeTracker {
         }
         let idle = schedule.active_operation.is_none()
             && schedule.desired_epoch == schedule.published_epoch;
-        if !own_publication_advanced && !baseline_missing && !idle {
+        if !baseline_missing && !idle {
             return PublicationProbeObservation::default();
         }
 
         let state = capture_control();
-        let drifted = !own_publication_advanced
-            && !baseline_missing
-            && self.last_state.as_ref() != Some(&state);
-        self.observed_published_epoch = schedule.published_epoch;
+        if !local_snapshot_stable() {
+            // A local operation started, published, or settled while control
+            // bytes were being read. Do not classify that mixed observation;
+            // retain the prior baseline and retry after a stable idle tick.
+            return PublicationProbeObservation {
+                control_read: true,
+                ..PublicationProbeObservation::default()
+            };
+        }
+        let observed_owned_publication = own_publication_advanced
+            && matches!(
+                (&state, owned_publication_control_token),
+                (PublicationProbeState::Current(observed), Some(expected)) if observed == expected
+            );
+        let drifted = if own_publication_advanced {
+            !observed_owned_publication
+        } else {
+            !baseline_missing && self.last_state.as_ref() != Some(&state)
+        };
+        self.observed_owned_publication_revision = owned_publication_revision;
         self.last_witness = Some(witness);
         self.last_state = Some(state);
         PublicationProbeObservation {
@@ -1104,10 +1161,12 @@ mod tests {
     use tokio::time::timeout;
 
     fn probe_token(value: &str) -> PublicationProbeState {
-        PublicationProbeState::Current(
-            serde_json::from_value(serde_json::Value::String(value.into()))
-                .expect("opaque publication token"),
-        )
+        PublicationProbeState::Current(probe_control_token(value))
+    }
+
+    fn probe_control_token(value: &str) -> PublicationControlToken {
+        serde_json::from_value(serde_json::Value::String(value.into()))
+            .expect("opaque publication token")
     }
 
     fn probe_witness(temporary: &TempDir, label: &str) -> PublicationControlWitness {
@@ -1179,24 +1238,28 @@ mod tests {
         let later_self_witness = probe_witness(&temporary, "later-self");
         let mut tracker = PublicationProbeTracker::default();
 
-        let initial_build = IndexScheduleSnapshot {
-            desired_epoch: 1,
-            published_epoch: 0,
-            active_operation: None,
-            active_trigger: Some(IndexOperationTrigger::Watch),
-            manual_queued: false,
-            watch_enabled: true,
-        };
-        let initial = tracker.observe(&initial_build, initial_witness, || {
-            PublicationProbeState::Unavailable
-        });
+        let initial_unpublished = idle_schedule(0);
+        let initial = tracker.observe(
+            &initial_unpublished,
+            0,
+            None,
+            initial_witness,
+            || PublicationProbeState::Unavailable,
+            || true,
+        );
         assert!(initial.control_read);
         assert!(initial.control_unavailable);
         assert!(!initial.drifted);
 
-        let own_publication = tracker.observe(&idle_schedule(1), self_witness.clone(), || {
-            probe_token("self-a")
-        });
+        let self_token = probe_control_token("self-a");
+        let own_publication = tracker.observe(
+            &idle_schedule(1),
+            1,
+            Some(&self_token),
+            self_witness.clone(),
+            || probe_token("self-a"),
+            || true,
+        );
         assert!(own_publication.control_read);
         assert!(
             !own_publication.drifted,
@@ -1204,50 +1267,288 @@ mod tests {
         );
 
         for _ in 0..100 {
-            let unchanged = tracker.observe(&idle_schedule(1), self_witness.clone(), || {
-                panic!("unchanged metadata must not read validated control bytes")
-            });
+            let unchanged = tracker.observe(
+                &idle_schedule(1),
+                1,
+                Some(&self_token),
+                self_witness.clone(),
+                || panic!("unchanged metadata must not read validated control bytes"),
+                || panic!("unchanged metadata must not recheck local state"),
+            );
             assert_eq!(unchanged, PublicationProbeObservation::default());
         }
 
-        let metadata_only =
-            tracker.observe(&idle_schedule(1), touched_witness, || probe_token("self-a"));
+        let metadata_only = tracker.observe(
+            &idle_schedule(1),
+            1,
+            Some(&self_token),
+            touched_witness,
+            || probe_token("self-a"),
+            || true,
+        );
         assert!(metadata_only.control_read);
         assert!(
             !metadata_only.drifted,
             "metadata-only churn with identical validated controls is not publication drift"
         );
 
-        let foreign = tracker.observe(&idle_schedule(1), foreign_witness.clone(), || {
-            probe_token("foreign-b")
-        });
+        let foreign = tracker.observe(
+            &idle_schedule(1),
+            1,
+            Some(&self_token),
+            foreign_witness.clone(),
+            || probe_token("foreign-b"),
+            || true,
+        );
         assert!(foreign.control_read);
         assert!(
             foreign.drifted,
             "positive control: foreign idle control drift must schedule authority"
         );
-        let replay = tracker.observe(&idle_schedule(1), foreign_witness, || {
-            panic!("an unchanged foreign witness must not reread control bytes")
-        });
+        let replay = tracker.observe(
+            &idle_schedule(1),
+            1,
+            Some(&self_token),
+            foreign_witness,
+            || panic!("an unchanged foreign witness must not reread control bytes"),
+            || panic!("an unchanged foreign witness must not recheck local state"),
+        );
         assert!(
             !replay.drifted && !replay.control_read,
             "an unchanged drift token must not replay reconciliation"
         );
 
-        let unavailable = tracker.observe(&idle_schedule(1), unavailable_witness, || {
-            PublicationProbeState::Unavailable
-        });
+        let unavailable = tracker.observe(
+            &idle_schedule(1),
+            1,
+            Some(&self_token),
+            unavailable_witness,
+            || PublicationProbeState::Unavailable,
+            || true,
+        );
         assert!(
             unavailable.drifted && unavailable.control_read && unavailable.control_unavailable,
             "loss of readable control authority must also schedule one fail-closed reconciliation"
         );
 
-        let later_self = tracker.observe(&idle_schedule(2), later_self_witness, || {
-            probe_token("self-c")
-        });
+        let later_self_token = probe_control_token("self-c");
+        let later_self = tracker.observe(
+            &idle_schedule(2),
+            2,
+            Some(&later_self_token),
+            later_self_witness,
+            || probe_token("self-c"),
+            || true,
+        );
         assert!(
             later_self.control_read && !later_self.drifted,
             "a later self-publication advances the owned epoch and must not look foreign"
+        );
+
+        let uncertain_witness = probe_witness(&temporary, "uncertain-self");
+        let uncertain_self = tracker.observe(
+            &idle_schedule(3),
+            3,
+            None,
+            uncertain_witness,
+            || PublicationProbeState::Unavailable,
+            || true,
+        );
+        assert!(
+            uncertain_self.control_read
+                && uncertain_self.drifted
+                && uncertain_self.control_unavailable,
+            "a durable write without an exact locked control token must fail closed"
+        );
+    }
+
+    /// RIGHT-REASON REGRESSION: one semantic WATCH reconciliation may publish
+    /// fresh structural truth and then replace it with final semantic truth.
+    /// Both writes belong to the same source epoch. Source-epoch equality
+    /// therefore cannot be used as publication ownership identity.
+    #[test]
+    fn publication_probe_does_not_misclassify_two_owned_writes_in_one_source_epoch() {
+        let temporary = TempDir::new().expect("owned publication scratch");
+        let structural_witness = probe_witness(&temporary, "owned-structural");
+        let semantic_witness = probe_witness(&temporary, "owned-semantic");
+        let mut tracker = PublicationProbeTracker::default();
+
+        let structural_token = probe_control_token("owned-structural");
+        let structural = tracker.observe(
+            &idle_schedule(1),
+            1,
+            Some(&structural_token),
+            structural_witness,
+            || probe_token("owned-structural"),
+            || true,
+        );
+        assert!(structural.control_read && !structural.drifted);
+
+        let semantic_token = probe_control_token("owned-semantic");
+        let semantic = tracker.observe(
+            &idle_schedule(1),
+            2,
+            Some(&semantic_token),
+            semantic_witness,
+            || probe_token("owned-semantic"),
+            || true,
+        );
+        assert!(
+            semantic.control_read && !semantic.drifted,
+            "the final semantic write shares its source epoch with the owned structural stage and must not schedule foreign-drift reconciliation"
+        );
+    }
+
+    /// RIGHT-REASON REGRESSION: the durable semantic head may become visible
+    /// after WATCH snapshots the earlier owned structural identity but before
+    /// the supervisor records the semantic write. While that operation is
+    /// still active, the probe must defer instead of calling the later owned
+    /// token foreign and scheduling a redundant reconciliation.
+    #[test]
+    fn publication_probe_defers_during_an_active_owned_publication_sequence() {
+        let temporary = TempDir::new().expect("active publication scratch");
+        let initial_witness = probe_witness(&temporary, "active-initial");
+        let semantic_witness = probe_witness(&temporary, "active-semantic");
+        let initial_token = probe_control_token("owned-a");
+        let structural_token = probe_control_token("owned-b");
+        let semantic_token = probe_control_token("owned-c");
+        let mut tracker = PublicationProbeTracker::default();
+
+        let initial = tracker.observe(
+            &idle_schedule(1),
+            1,
+            Some(&initial_token),
+            initial_witness,
+            || probe_token("owned-a"),
+            || true,
+        );
+        assert!(initial.control_read && !initial.drifted);
+
+        let mut active = idle_schedule(2);
+        active.published_epoch = 1;
+        active.active_operation = Some(
+            "index-00000000000000000000000000000000-1"
+                .parse()
+                .expect("synthetic active operation ID"),
+        );
+        active.active_trigger = Some(IndexOperationTrigger::Watch);
+        let in_flight = tracker.observe(
+            &active,
+            2,
+            Some(&structural_token),
+            semantic_witness.clone(),
+            || probe_token("owned-c"),
+            || true,
+        );
+        assert_eq!(
+            in_flight,
+            PublicationProbeObservation::default(),
+            "an active owned publication sequence is not a stable foreign-drift boundary"
+        );
+
+        let settled = tracker.observe(
+            &idle_schedule(2),
+            3,
+            Some(&semantic_token),
+            semantic_witness,
+            || probe_token("owned-c"),
+            || true,
+        );
+        assert!(
+            settled.control_read && !settled.drifted,
+            "the settled final semantic token is the supervisor's exact owned head"
+        );
+    }
+
+    /// RIGHT-REASON REGRESSION: an operation may start and publish after the
+    /// probe's local snapshot but before its control read completes. A mixed
+    /// local/filesystem observation has no ownership authority; it must retain
+    /// the prior baseline and be classified only on the next stable tick.
+    #[test]
+    fn publication_probe_defers_when_local_state_changes_during_control_read() {
+        let temporary = TempDir::new().expect("concurrent probe scratch");
+        let initial_witness = probe_witness(&temporary, "concurrent-initial");
+        let changed_witness = probe_witness(&temporary, "concurrent-changed");
+        let initial_token = probe_control_token("owned-a");
+        let changed_token = probe_control_token("owned-b");
+        let mut tracker = PublicationProbeTracker::default();
+
+        let initial = tracker.observe(
+            &idle_schedule(1),
+            1,
+            Some(&initial_token),
+            initial_witness,
+            || probe_token("owned-a"),
+            || true,
+        );
+        assert!(initial.control_read && !initial.drifted);
+
+        let mixed = tracker.observe(
+            &idle_schedule(1),
+            1,
+            Some(&initial_token),
+            changed_witness.clone(),
+            || probe_token("owned-b"),
+            || false,
+        );
+        assert_eq!(
+            mixed,
+            PublicationProbeObservation {
+                control_read: true,
+                ..PublicationProbeObservation::default()
+            },
+            "a control token joined to a changed local snapshot is not classifiable"
+        );
+        assert_eq!(tracker.observed_owned_publication_revision, 1);
+        assert_eq!(tracker.last_state, Some(probe_token("owned-a")));
+
+        let settled = tracker.observe(
+            &idle_schedule(2),
+            2,
+            Some(&changed_token),
+            changed_witness,
+            || probe_token("owned-b"),
+            || true,
+        );
+        assert!(
+            settled.control_read && !settled.drifted,
+            "the next stable observation must recognize the exact owned head"
+        );
+    }
+
+    /// RIGHT-REASON REGRESSION: a foreign writer may advance the durable head
+    /// after our write but before WATCH observes either token. A scalar local
+    /// revision cannot prove that the finally observed token belongs to us.
+    #[test]
+    fn publication_probe_rejects_foreign_token_coalesced_after_owned_write() {
+        let temporary = TempDir::new().expect("coalesced publication scratch");
+        let initial_witness = probe_witness(&temporary, "coalesced-initial");
+        let foreign_witness = probe_witness(&temporary, "coalesced-foreign");
+        let initial_token = probe_control_token("initial-a");
+        let owned_token = probe_control_token("owned-b");
+        let mut tracker = PublicationProbeTracker::default();
+
+        let initial = tracker.observe(
+            &idle_schedule(1),
+            1,
+            Some(&initial_token),
+            initial_witness,
+            || probe_token("initial-a"),
+            || true,
+        );
+        assert!(initial.control_read && !initial.drifted);
+
+        let coalesced = tracker.observe(
+            &idle_schedule(2),
+            2,
+            Some(&owned_token),
+            foreign_witness,
+            || probe_token("foreign-c"),
+            || true,
+        );
+        assert!(
+            coalesced.control_read && coalesced.drifted,
+            "an advanced local revision owns only its exact locked publication token"
         );
     }
 
@@ -1341,7 +1642,11 @@ mod tests {
     #[tokio::test]
     async fn deep_integrity_reconciliation_recovers_a_deliberately_hidden_source_event() {
         let (_temporary, root, source, _binding, supervisor) = watch_fixture();
-        let watcher = WatcherConfig::new(root.clone(), 10).exclude_root(root.join("src"));
+        // Isolate the byte-exact reconciliation lane from platform-specific
+        // native delivery. Darwin can report a coarse parent event even when
+        // the changed descendant directory itself is excluded, so excluding
+        // only `src` does not prove that recovery was reconciliation-driven.
+        let watcher = WatcherConfig::new(root.clone(), 10).exclude_root(root.clone());
         let service = IndexWatchService::start(
             supervisor.clone(),
             watcher,
@@ -1464,6 +1769,145 @@ mod tests {
         service.stop().await.expect("stop WATCH service");
     }
 
+    /// FALSIFIER: a linked worktree can be moved or repaired through a short
+    /// interval where its reciprocal Git addressing files are inconsistent.
+    /// That uncertainty must schedule fail-closed reconciliation without
+    /// terminating the long-lived WATCH service.
+    #[tokio::test]
+    async fn transient_git_semantic_root_failure_reconciles_without_stopping_watch() {
+        let temporary = TempDir::new().expect("linked-worktree WATCH scratch");
+        let root = temporary.path().join("worktree");
+        let data = temporary.path().join("data");
+        let common_git = temporary.path().join("main/.git");
+        let worktree_git = common_git.join("worktrees/fixture");
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        std::fs::create_dir_all(&data).expect("data directory");
+        std::fs::create_dir_all(&worktree_git).expect("worktree gitdir");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"watch-git-root\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        )
+        .expect("manifest fixture");
+        std::fs::write(root.join("src/lib.rs"), "pub fn control() {}\n").expect("source fixture");
+        std::fs::write(
+            root.join(".git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .expect("linked-worktree marker");
+        std::fs::write(worktree_git.join("commondir"), "../..\n").expect("commondir");
+        std::fs::write(worktree_git.join("HEAD"), "ref: refs/heads/fixture\n")
+            .expect("per-worktree HEAD");
+        std::fs::write(
+            worktree_git.join("gitdir"),
+            format!("{}\n", root.join(".git").display()),
+        )
+        .expect("reciprocal worktree pointer");
+
+        let coordinates = BTreeSet::from([
+            h00ligan_provider_protocol::classify_provider_semantic_input_path(
+                &root,
+                &worktree_git.join("HEAD"),
+            )
+            .expect("classify exact per-worktree control"),
+        ]);
+        let semantic_inputs =
+            h00ligan_provider_protocol::capture_provider_semantic_inputs_at_coordinates(
+                &root,
+                &coordinates,
+                &BTreeSet::new(),
+                &ProviderFrameLimits::default(),
+            )
+            .expect("capture exact linked-worktree authority");
+        assert!(
+            semantic_inputs
+                .paths
+                .iter()
+                .any(|input| input.path == "commondir"),
+            "positive addressing-population control"
+        );
+        let receipt = crate::code_intel_domain::CapabilityReceipt::complete(
+            "calls",
+            "watch-git-fixture",
+            "1.0.0",
+            crate::code_intel_domain::CapabilityScope::Language {
+                language_id: crate::code_intel_domain::LanguageId::new("rust"),
+                configuration_id: crate::code_intel_domain::ConfigurationId::new("default"),
+            },
+            "a".repeat(64),
+        );
+        let mut payload = crate::code_intel_payload::CallsProviderPayload::new(receipt);
+        payload.semantic_inputs = semantic_inputs;
+        let payload = crate::code_intel_payload::normalize_provider_payload_typed(
+            &crate::code_intel_payload::ProviderPayload::Calls(payload),
+        )
+        .expect("normalized WATCH authority fixture");
+
+        let binding = crate::project_binding::ProjectBinding::explicit(&root, &data)
+            .expect("explicit watch binding");
+        let supervisor = IndexSupervisor::new(binding);
+        let service = IndexWatchService::start(
+            supervisor.clone(),
+            WatcherConfig::new(root.clone(), 10),
+            IndexSupervisorRequest::default(),
+            WatchCadence::new(Duration::from_secs(30), Duration::from_secs(30)),
+        )
+        .expect("start WATCH service");
+        let initial_epoch = wait_for_epoch_after(&supervisor, 0).await;
+
+        std::fs::write(worktree_git.join("commondir"), ".\n")
+            .expect("temporary non-linked topology");
+        supervisor.replace_watch_publication_for_test(vec![payload.clone()]);
+        let observed = timeout(Duration::from_secs(10), async {
+            loop {
+                let status = service.status();
+                if status.last_error.is_some() {
+                    return status;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("WATCH did not observe invalid transient Git authority");
+        assert!(
+            observed.running,
+            "transient root uncertainty must not terminate WATCH: {observed:?}"
+        );
+        assert!(
+            observed.desired_epoch > initial_epoch,
+            "transient root uncertainty must schedule authoritative reconciliation: {observed:?}"
+        );
+
+        std::fs::write(worktree_git.join("commondir"), "../..\n")
+            .expect("restore linked-worktree topology");
+        supervisor.replace_watch_publication_for_test(vec![payload]);
+        let recovered = timeout(Duration::from_secs(10), async {
+            loop {
+                let status = service.status();
+                if status.last_error.is_none() {
+                    return status;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "WATCH did not recover after linked-worktree authority was restored: {:?}",
+                service.status()
+            )
+        });
+        assert!(
+            recovered.running,
+            "restored semantic-root authority must leave WATCH operational: {recovered:?}"
+        );
+        assert!(
+            recovered.desired_epoch >= observed.desired_epoch,
+            "recovery must not roll scheduling authority backward: observed={observed:?} recovered={recovered:?}"
+        );
+        service.stop().await.expect("stop WATCH service");
+        supervisor.shutdown_and_wait().await;
+    }
+
     #[test]
     fn relevant_inputs_cover_current_and_planned_core_languages() {
         for path in [
@@ -1574,6 +2018,8 @@ mod tests {
         std::fs::write(&selector, "a\n").expect("declared semantic input");
         let config = WatcherConfig::new(root, 25);
         let declared = BTreeSet::from([DeclaredWatchInput {
+            root: ProviderSemanticPathRoot::Repository,
+            authority_root: config.root.clone(),
             path: selector.clone(),
             kind: ProviderSemanticPathKind::File,
         }]);
@@ -1609,6 +2055,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn typed_git_semantic_inputs_watch_only_their_proven_external_root() {
+        let temporary = TempDir::new().expect("Git-input watcher scratch");
+        let root = temporary.path().join("repo");
+        let common = temporary.path().join("main/.git");
+        let refs = common.join("refs/heads");
+        let branch = refs.join("fixture");
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        std::fs::create_dir_all(&refs).expect("Git common refs");
+        std::fs::write(root.join("src/lib.rs"), "pub fn control() {}\n")
+            .expect("source positive control");
+        std::fs::write(&branch, "1111111111111111111111111111111111111111\n").expect("shared ref");
+        let config = WatcherConfig::new(root, 25);
+        let declared = BTreeSet::from([DeclaredWatchInput {
+            root: ProviderSemanticPathRoot::GitCommon,
+            authority_root: common.clone(),
+            path: branch.clone(),
+            kind: ProviderSemanticPathKind::File,
+        }]);
+
+        let desired = desired_watch_directories_with_inputs(&config, &declared)
+            .expect("typed external Git watch population");
+        assert!(desired.contains(&refs), "shared ref parent must be watched");
+        let modify = EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Content,
+        ));
+        assert_eq!(
+            classify_path_with_declared_inputs(&config, &declared, &modify, &branch),
+            Some(WatchHintReason::GitState)
+        );
+
+        let unrelated = temporary.path().join("unrelated");
+        std::fs::create_dir_all(&unrelated).expect("outside negative root");
+        let forged = BTreeSet::from([DeclaredWatchInput {
+            root: ProviderSemanticPathRoot::GitCommon,
+            authority_root: common,
+            path: unrelated.join("secret"),
+            kind: ProviderSemanticPathKind::File,
+        }]);
+        assert!(
+            desired_watch_directories_with_inputs(&config, &forged).is_err(),
+            "a typed root must not authorize a path outside that exact root"
+        );
+    }
+
     /// A compiler access trace owns immediate directory membership, not every
     /// descendant byte. WATCH must therefore register exactly that directory
     /// and classify create/remove hints without recursively expanding it.
@@ -1624,6 +2115,8 @@ mod tests {
             .expect("source positive control");
         let config = WatcherConfig::new(root, 25);
         let declared = BTreeSet::from([DeclaredWatchInput {
+            root: ProviderSemanticPathRoot::Repository,
+            authority_root: config.root.clone(),
             path: listing.clone(),
             kind: ProviderSemanticPathKind::DirectoryListing,
         }]);

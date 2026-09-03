@@ -27,7 +27,7 @@ from h00_semantic_provider_test_harness import (
 )
 
 
-PROTOCOL = "h00/semantic-provider/v13"
+PROTOCOL = "h00/semantic-provider/v15"
 UPSTREAM_COMMIT = "8bab26f4f68e0e26f0bb7960be334d5b520ea452"
 RESOLVED_TOOLCHAIN_SHA256 = sha256(b"installed-test-toolchain")
 RUST_SEMANTIC_PROFILE = json.dumps(
@@ -1138,7 +1138,7 @@ def main() -> int:
         "protocol": PROTOCOL,
         "provider_id": "h00-rust-analyzer-scip",
         "language": "rust",
-        "implementation_version": "rust-analyzer-1.97.1/cargo-profile=explicit/cargo-lockfile=private-redirect/workspace-resolution=bound/build-scripts=required/proc-macros=required/runtime-executables=exact/durable-semantic-inputs=v1/v5",
+        "implementation_version": "rust-analyzer-1.97.1/cargo-profile=explicit/cargo-lockfile=private-redirect/workspace-resolution=bound/build-scripts=required/proc-macros=required/runtime-executables=exact/durable-semantic-inputs=v2/v6",
         "source_components": {
             "rust_analyzer": {
                 "version": "1.97.1",

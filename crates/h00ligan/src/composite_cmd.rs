@@ -52,20 +52,6 @@ fn parse_format(s: &str) -> Result<OutputFormat, LiganError> {
     s.parse::<OutputFormat>().map_err(LiganError::Config)
 }
 
-fn print_domain_error(
-    format: OutputFormat,
-    error: &h00ligan_engine::code_intel_domain::DomainError,
-) -> Result<(), LiganError> {
-    if format == OutputFormat::Json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&error.envelope())
-                .map_err(|serialize| LiganError::Config(serialize.to_string()))?
-        );
-    }
-    Ok(())
-}
-
 /// Truncate a string to at most `max` chars with trailing "...".
 ///
 /// CI-IND-06: truncation is char-boundary-safe. The previous implementation
@@ -216,37 +202,12 @@ pub async fn run_assess(args: AssessArgs, binding: &ProjectBinding) -> Result<()
     let format = parse_format(&args.format)?;
     let sections = match args.sections.as_deref() {
         None => AssessSection::ALL.into_iter().collect::<BTreeSet<_>>(),
-        Some(raw) => match raw
+        Some(raw) => raw
             .split(',')
             .map(parse_assess_section)
-            .collect::<Result<BTreeSet<_>, _>>()
-        {
-            Ok(sections) => sections,
-            Err(error) => {
-                if format == OutputFormat::Json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&error.envelope())
-                            .map_err(|serialize| LiganError::Config(serialize.to_string()))?
-                    );
-                }
-                return Err(error.into());
-            }
-        },
+            .collect::<Result<BTreeSet<_>, _>>()?,
     };
-    let filter = match parse_assess_filter(&args.filter) {
-        Ok(filter) => filter,
-        Err(error) => {
-            if format == OutputFormat::Json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&error.envelope())
-                        .map_err(|serialize| LiganError::Config(serialize.to_string()))?
-                );
-            }
-            return Err(error.into());
-        }
-    };
+    let filter = parse_assess_filter(&args.filter)?;
     let request = AssessRequest {
         symbol: args.symbol,
         file: args.file,
@@ -256,38 +217,13 @@ pub async fn run_assess(args: AssessArgs, binding: &ProjectBinding) -> Result<()
         limit: args.limit,
         cursor: args.cursor,
     };
-    if let Err(error) = validate_assess_request(&request) {
-        if format == OutputFormat::Json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&error.envelope())
-                    .map_err(|serialize| LiganError::Config(serialize.to_string()))?
-            );
-        }
-        return Err(error.into());
-    }
+    validate_assess_request(&request)?;
     let snapshot = h00ligan_interface::CodeIntelSnapshot::load(binding)
         .await
         .map_err(|error| LiganError::Config(error.to_string()))?;
-    let result = match snapshot.query_assess(binding, &request).await {
-        Ok(result) => result,
-        Err(error) => {
-            if format == OutputFormat::Json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&error.envelope())
-                        .map_err(|serialize| LiganError::Config(serialize.to_string()))?
-                );
-            }
-            return Err(error.into());
-        }
-    };
+    let result = snapshot.query_assess(binding, &request).await?;
     if format == OutputFormat::Json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result)
-                .map_err(|error| LiganError::Config(error.to_string()))?
-        );
+        crate::output::print_machine_json(&result)?;
     } else {
         render_assess(&result);
     }
@@ -362,7 +298,7 @@ fn render_assess(result: &ExactAssessResult) {
         println!("DIRECT CALLERS: {:?}", callers.applicability);
         if let Some(count) = callers.observed_direct_callers {
             println!(
-                "  {count} caller symbol{} at {} exact call site{}",
+                "  {count} source origin{} at {} exact call site{}",
                 if count == 1 { "" } else { "s" },
                 callers.observed_call_sites.unwrap_or(0),
                 if callers.observed_call_sites == Some(1) {
@@ -375,8 +311,8 @@ fn render_assess(result: &ExactAssessResult) {
         for item in &callers.items {
             println!(
                 "  {} ({}) line {}",
-                item.caller.name,
-                item.caller.document_path,
+                item.origin.display_name(),
+                item.origin.document_path(),
                 item.call_span.start_line + 1,
             );
         }
@@ -452,60 +388,21 @@ pub async fn run_inspect(args: InspectArgs, binding: &ProjectBinding) -> Result<
         None => h00ligan_engine::code_intel_inspect::InspectSection::ALL
             .into_iter()
             .collect::<BTreeSet<_>>(),
-        Some(raw) => {
-            match h00ligan_engine::code_intel_inspect::parse_inspect_sections(raw.split(',')) {
-                Ok(sections) => sections,
-                Err(error) => {
-                    if format == OutputFormat::Json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&error.envelope())
-                                .map_err(|serialize| LiganError::Config(serialize.to_string()))?
-                        );
-                    }
-                    return Err(error.into());
-                }
-            }
-        }
+        Some(raw) => h00ligan_engine::code_intel_inspect::parse_inspect_sections(raw.split(','))?,
     };
     let request = h00ligan_engine::code_intel_inspect::InspectRequest {
         symbol: args.symbol,
         file: args.file,
         sections,
     };
-    if let Err(error) = h00ligan_engine::code_intel_inspect::validate_inspect_request(&request) {
-        if format == OutputFormat::Json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&error.envelope())
-                    .map_err(|serialize| LiganError::Config(serialize.to_string()))?
-            );
-        }
-        return Err(error.into());
-    }
+    h00ligan_engine::code_intel_inspect::validate_inspect_request(&request)?;
 
     let snapshot = h00ligan_interface::CodeIntelSnapshot::load(binding)
         .await
         .map_err(|error| LiganError::Config(error.to_string()))?;
-    let result = match snapshot.query_inspect(binding, &request).await {
-        Ok(result) => result,
-        Err(error) => {
-            if format == OutputFormat::Json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&error.envelope())
-                        .map_err(|serialize| LiganError::Config(serialize.to_string()))?
-                );
-            }
-            return Err(error.into());
-        }
-    };
+    let result = snapshot.query_inspect(binding, &request).await?;
     if format == OutputFormat::Json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result)
-                .map_err(|error| LiganError::Config(error.to_string()))?
-        );
+        crate::output::print_machine_json(&result)?;
     } else {
         render_inspect(&result);
     }
@@ -588,11 +485,15 @@ fn render_inspect(result: &h00ligan_engine::code_intel_inspect::ExactInspectResu
         match callers {
             InspectFacet::Available { result } | InspectFacet::Qualified { result } => {
                 println!(
-                    "  {} exact caller(s); {} callable-value binding(s); {} exact caller occurrence(s) returned",
+                    "  {} exact source origin(s); {} callable-value binding(s); {} exact invocation occurrence(s) returned",
                     result.total_callers, result.callable_value_bindings, result.page.returned
                 );
                 for caller in &result.items {
-                    println!("  {} ({})", caller.caller.name, caller.caller.document_path);
+                    println!(
+                        "  {} ({})",
+                        caller.origin.display_name(),
+                        caller.origin.document_path()
+                    );
                 }
                 if result.page.has_more {
                     println!(
@@ -734,38 +635,13 @@ pub async fn run_dead(args: DeadArgs, binding: &ProjectBinding) -> Result<(), Li
         limit: args.limit,
         cursor: args.cursor,
     };
-    if let Err(error) = h00ligan_engine::code_intel_dead::validate_dead_request(&request) {
-        if format == OutputFormat::Json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&error.envelope())
-                    .map_err(|serialize| LiganError::Config(serialize.to_string()))?
-            );
-        }
-        return Err(error.into());
-    }
+    h00ligan_engine::code_intel_dead::validate_dead_request(&request)?;
     let snapshot = h00ligan_interface::CodeIntelSnapshot::load(binding)
         .await
         .map_err(|error| LiganError::Config(error.to_string()))?;
-    let result = match snapshot.query_dead(binding, &request).await {
-        Ok(result) => result,
-        Err(error) => {
-            if format == OutputFormat::Json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&error.envelope())
-                        .map_err(|serialize| LiganError::Config(serialize.to_string()))?
-                );
-            }
-            return Err(error.into());
-        }
-    };
+    let result = snapshot.query_dead(binding, &request).await?;
     if format == OutputFormat::Json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result)
-                .map_err(|error| LiganError::Config(error.to_string()))?
-        );
+        crate::output::print_machine_json(&result)?;
     } else {
         print!("{}", render_dead_text(&result));
     }
@@ -841,10 +717,8 @@ fn render_dead_text(result: &h00ligan_engine::code_intel_dead::ExactDeadResult) 
     if let Some(cursor) = result.page.next_cursor.as_deref() {
         let _ = writeln!(out, "\n  Next cursor: {cursor}");
     }
-    if result.query.symbol.is_none() {
-        for warning in &result.warnings {
-            let _ = writeln!(out, "  Note: {warning}");
-        }
+    for warning in &result.warnings {
+        let _ = writeln!(out, "  Note: {warning}");
     }
     out
 }
@@ -968,39 +842,14 @@ pub async fn run_tests(args: TestsArgs, binding: &ProjectBinding) -> Result<(), 
         limit: args.limit,
         cursor: args.cursor,
     };
-    if let Err(error) = validate_tests_request(&request) {
-        if format == OutputFormat::Json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&error.envelope())
-                    .map_err(|serialize| LiganError::Config(serialize.to_string()))?
-            );
-        }
-        return Err(error.into());
-    }
+    validate_tests_request(&request)?;
     let snapshot = h00ligan_interface::CodeIntelSnapshot::load(binding)
         .await
         .map_err(|error| LiganError::Config(error.to_string()))?;
-    let result = match snapshot.query_tests(binding, &request).await {
-        Ok(result) => result,
-        Err(error) => {
-            if format == OutputFormat::Json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&error.envelope())
-                        .map_err(|serialize| LiganError::Config(serialize.to_string()))?
-                );
-            }
-            return Err(error.into());
-        }
-    };
+    let result = snapshot.query_tests(binding, &request).await?;
 
     if format == OutputFormat::Json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result)
-                .map_err(|error| LiganError::Config(error.to_string()))?
-        );
+        crate::output::print_machine_json(&result)?;
     } else {
         render_tests(&result);
     }
@@ -1024,6 +873,12 @@ fn render_tests(result: &ExactTestsResult) {
         "  Page: offset {}, returned {}, limit {}",
         result.page.offset, result.page.returned, result.page.limit
     );
+    if result.authority.unnamed_test_execution_root_paths > 0 {
+        println!(
+            "  Unnamed test-source execution paths: {} (positive evidence; not named runnable tests)",
+            result.authority.unnamed_test_execution_root_paths
+        );
+    }
     println!();
 
     if result.items.is_empty() {
@@ -1050,7 +905,7 @@ fn render_tests(result: &ExactTestsResult) {
         let chain = item
             .chain
             .iter()
-            .map(|step| step.source().name.as_str())
+            .map(h00ligan_engine::code_intel_calls::CallablePathStep::source_name)
             .chain(item.chain.last().map(|step| step.target().name.as_str()))
             .collect::<Vec<_>>();
         if !chain.is_empty() {
@@ -1086,22 +941,25 @@ pub struct OverviewArgs {
     /// Output format: text or json.
     #[arg(long, default_value = "text")]
     pub format: String,
+
+    /// Maximum preview rows returned per Overview collection (1–100).
+    #[arg(
+        long,
+        default_value_t = h00ligan_engine::code_intel_overview::DEFAULT_OVERVIEW_COLLECTION_LIMIT
+    )]
+    pub limit: usize,
 }
 
 /// Run `overview` from one immutable graph + project-inventory generation.
 pub async fn run_overview(args: OverviewArgs, binding: &ProjectBinding) -> Result<(), LiganError> {
     let format = parse_format(&args.format)?;
+    let request = h00ligan_engine::code_intel_overview::OverviewRequest { limit: args.limit };
+    h00ligan_engine::code_intel_overview::validate_overview_request(&request)?;
     let (_graph, snapshot) = load_indexed_graph_snapshot(binding).await?;
-    let result = snapshot
-        .query_overview(binding)
-        .await
-        .map_err(|error| LiganError::Config(error.to_string()))?;
+    let result = snapshot.query_overview(binding, &request).await?;
 
     if format == OutputFormat::Json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result).unwrap_or_default()
-        );
+        crate::output::print_machine_json(&result)?;
         return Ok(());
     }
 
@@ -1143,7 +1001,7 @@ fn render_overview_text(
         let _ = writeln!(out);
         let _ = writeln!(
             out,
-            "⚠ UNCLASSIFIED — run `h00ligan index` first ({} nodes unclassified)",
+            "⚠ UNCLASSIFIED — this indexed generation has {} nodes without authoritative reachability",
             overview.unclassified_count
         );
     }
@@ -1171,8 +1029,9 @@ fn render_overview_text(
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "PROJECT UNITS ({})",
-        format_human_count(overview.project_units.len())
+        "PROJECT UNITS ({} of {})",
+        format_human_count(overview.projection.project_units.returned),
+        format_human_count(overview.projection.project_units.total_items)
     );
     for info in &overview.project_units {
         let label = unit_labels
@@ -1227,8 +1086,9 @@ fn render_overview_text(
         let _ = writeln!(out);
         let _ = writeln!(
             out,
-            "DEPENDENCIES ({} relationships)",
-            format_human_count(overview.project_unit_dependencies.len())
+            "DEPENDENCIES ({} of {} relationships)",
+            format_human_count(overview.projection.project_unit_dependencies.returned),
+            format_human_count(overview.projection.project_unit_dependencies.total_items)
         );
         for (from, mut targets) in dependencies {
             targets.sort();
@@ -1307,6 +1167,9 @@ fn render_overview_text(
                 .unwrap_or("generation health is not authoritative")
         );
     }
+    for warning in &overview.warnings {
+        let _ = writeln!(out, "WARNING: {warning}");
+    }
     out
 }
 
@@ -1318,6 +1181,7 @@ const fn project_unit_kind_label(
         ProjectUnitKind::Workspace => "workspace",
         ProjectUnitKind::Package => "package",
         ProjectUnitKind::Module => "module",
+        ProjectUnitKind::Application => "application",
         ProjectUnitKind::LooseSources => "loose sources",
         ProjectUnitKind::AuxiliarySources => "auxiliary sources",
     }
@@ -1395,13 +1259,7 @@ pub struct AuditArgs {
 pub async fn run_audit(args: AuditArgs, binding: &ProjectBinding) -> Result<(), LiganError> {
     let format = parse_format(&args.format)?;
     let (_graph, snapshot) = load_indexed_graph_snapshot(binding).await?;
-    let scope = match parse_audit_scope(&args.scope) {
-        Ok(scope) => scope,
-        Err(error) => {
-            print_domain_error(format, &error)?;
-            return Err(error.into());
-        }
-    };
+    let scope = parse_audit_scope(&args.scope)?;
     let request = AuditRequest {
         scope,
         min_fan_in: args.min_fan_in,
@@ -1409,23 +1267,11 @@ pub async fn run_audit(args: AuditArgs, binding: &ProjectBinding) -> Result<(), 
         limit: args.limit,
         cursor: args.cursor,
     };
-    if let Err(error) = validate_audit_request(&request) {
-        print_domain_error(format, &error)?;
-        return Err(error.into());
-    }
-    let result = match snapshot.query_audit(binding, &request).await {
-        Ok(result) => result,
-        Err(error) => {
-            print_domain_error(format, &error)?;
-            return Err(error.into());
-        }
-    };
+    validate_audit_request(&request)?;
+    let result = snapshot.query_audit(binding, &request).await?;
 
     if format == OutputFormat::Json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result).unwrap_or_default()
-        );
+        crate::output::print_machine_json(&result)?;
         return Ok(());
     }
 
@@ -2170,6 +2016,30 @@ mod tests {
                     issues: vec![],
                     unassigned_node_count: 5,
             },
+            projection: h00ligan_engine::code_intel_overview::OverviewProjection {
+                requested_limit: h00ligan_engine::code_intel_overview::DEFAULT_OVERVIEW_COLLECTION_LIMIT,
+                effective_limit: h00ligan_engine::code_intel_overview::DEFAULT_OVERVIEW_COLLECTION_LIMIT,
+                project_units: h00ligan_engine::code_intel_overview::OverviewCollectionProjection {
+                    returned: 0,
+                    total_items: 0,
+                    truncated: false,
+                },
+                project_unit_relationships: h00ligan_engine::code_intel_overview::OverviewCollectionProjection {
+                    returned: 0,
+                    total_items: 0,
+                    truncated: false,
+                },
+                project_unit_dependencies: h00ligan_engine::code_intel_overview::OverviewCollectionProjection {
+                    returned: 0,
+                    total_items: 0,
+                    truncated: false,
+                },
+                project_inventory_issues: h00ligan_engine::code_intel_overview::OverviewCollectionProjection {
+                    returned: 0,
+                    total_items: 0,
+                    truncated: false,
+                },
+            },
             dead_code_count,
             health_status,
             health_action_needed: dead_code_count.is_none(),
@@ -2203,6 +2073,8 @@ mod tests {
         );
         let text = render_overview_text(&overview);
         assert!(text.contains("UNCLASSIFIED"));
+        assert!(text.contains("indexed generation"));
+        assert!(!text.contains("run `h00ligan index` first"));
         assert!(text.contains("UNREACHED CALLABLES: unknown"));
         assert!(!text.contains("UNREACHED CALLABLES: 0"));
 
@@ -2276,6 +2148,10 @@ mod tests {
             from_project_unit_id: agent_id,
             to_project_unit_id: engine_id,
         }];
+        overview.projection.project_units.returned = 2;
+        overview.projection.project_units.total_items = 2;
+        overview.projection.project_unit_dependencies.returned = 1;
+        overview.projection.project_unit_dependencies.total_items = 1;
 
         let text = render_overview_text(&overview);
         assert!(
