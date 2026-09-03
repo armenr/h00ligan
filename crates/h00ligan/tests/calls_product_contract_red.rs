@@ -3911,8 +3911,19 @@ async fn shipped_type_reduces_a_default_page_to_the_product_envelope() {
         "actual machine surfaces exceed their envelopes: CLI={raw_cli_chars} chars, MCP={raw_mcp_chars} chars"
     );
     assert_ne!(mcp["result"]["isError"], true, "{mcp}");
-    assert_eq!(mcp["result"]["structuredContent"], cli);
-    assert_eq!(mcp_typed_payload(&mcp), cli);
+    let mcp_result = mcp["result"]["structuredContent"].clone();
+    assert!(mcp_result["page"]["next_cursor"].is_string());
+    assert!(mcp_result["page"]["expires_at_unix_seconds"].is_u64());
+    assert_eq!(
+        without_ephemeral_cursor_lease(mcp_result),
+        without_ephemeral_cursor_lease(cli.clone()),
+        "independently minted cursor leases may expire at different seconds, but CLI and MCP result truth must otherwise match"
+    );
+    assert_eq!(
+        without_ephemeral_cursor_lease(mcp_typed_payload(&mcp)),
+        without_ephemeral_cursor_lease(cli),
+        "MCP text and structured payloads must carry the same non-ephemeral result truth"
+    );
 }
 
 #[tokio::test]
@@ -6280,12 +6291,10 @@ async fn shipped_assess_pages_one_bound_provider_impact_population_and_exposes_d
 #[tokio::test]
 async fn shipped_assess_sheds_optional_facet_previews_before_refusing_one_impact_item() {
     let temporary = TempDir::new().expect("temporary directory");
-    let long_test = format!("test_{}", "t".repeat(3_900));
-    let long_test_document = (0..18)
-        .map(|index| format!("segment_{index}_{}", "x".repeat(190)))
-        .collect::<Vec<_>>()
-        .join("/")
-        + "/test.rs";
+    // Exercise the result envelope with source content, not a filesystem path
+    // that exceeds Darwin's substantially smaller PATH_MAX.
+    let long_test = format!("test_{}", "t".repeat(10_000));
+    let long_test_document = "tests/facet_budget.rs".to_owned();
     let root = create_source_root(
         &temporary,
         "assess-facet-budget-repo",
