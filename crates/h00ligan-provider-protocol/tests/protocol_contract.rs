@@ -367,6 +367,8 @@ fn linked_worktree_git_roots_accept_their_proven_parent_alias() {
     let alias = scratch.0.join("alias");
     std::fs::create_dir(&physical).expect("physical fixture root");
     symlink(&physical, &alias).expect("fixture parent alias");
+    let canonical_physical =
+        std::fs::canonicalize(&physical).expect("canonical physical fixture root");
 
     let repository = alias.join("worktree");
     let common_git = alias.join("main/.git");
@@ -412,7 +414,7 @@ fn linked_worktree_git_roots_accept_their_proven_parent_alias() {
     assert_eq!(
         classify_provider_semantic_input_path(
             &repository,
-            &physical.join("main/.git/worktrees/fixture/HEAD"),
+            &canonical_physical.join("main/.git/worktrees/fixture/HEAD"),
         )
         .expect("the canonical Git-worktree root remains authoritative"),
         worktree_coordinate
