@@ -3469,6 +3469,327 @@ async fn shipped_type_preserves_selected_truth_under_partial_language_coverage()
     assert_eq!(mcp_typed_payload(&mcp), cli);
 }
 
+#[test]
+fn shipped_read_exact_selector_owns_identity_under_unrelated_partial_language_coverage() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let root = temporary.path().join("repo");
+    std::fs::create_dir_all(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"read-exact-partial-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("fixture manifest");
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn selected_target() -> usize { 42 }\n",
+    )
+    .expect("represented target source");
+    std::fs::write(
+        root.join("src/broken.rs"),
+        "pub fn unfinished() -> usize {\n    let value =\n",
+    )
+    .expect("unrepresented source control");
+    let data_dir = temporary.path().join("bundle");
+
+    let indexed = h00ligan()
+        .arg("--root")
+        .arg(&root)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("index")
+        .output()
+        .expect("publish explicitly partial structural generation");
+    assert!(
+        indexed.status.success(),
+        "partial structural indexing must retain the represented target: stdout={} stderr={}",
+        String::from_utf8_lossy(&indexed.stdout),
+        String::from_utf8_lossy(&indexed.stderr),
+    );
+    let generation = resolve_generation(&data_dir, &root).expect("partial generation");
+    let receipt = generation
+        .manifest
+        .receipts
+        .iter()
+        .find(|receipt| receipt.capability_id == "structural_graph")
+        .expect("positive structural receipt control");
+    assert_eq!(receipt.status, CapabilityStatus::Partial);
+    assert_eq!(
+        receipt.reason_code.as_deref(),
+        Some("source_extraction_failed")
+    );
+
+    let selector = find_exact_selector(&root, &data_dir, "selected_target");
+    let bare_name = stdout_json(
+        &h00ligan()
+            .arg("--root")
+            .arg(&root)
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .args(["read", "selected_target", "--format", "json"])
+            .output()
+            .expect("read by repository-wide name under partial coverage"),
+    );
+    assert_eq!(bare_name["authority"]["status"], "qualified");
+    assert_eq!(
+        bare_name["authority"]["selection_scope"],
+        "repository_graph"
+    );
+    assert!(bare_name["warnings"].as_array().is_some_and(|warnings| {
+        warnings.iter().any(|warning| {
+            warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("Bare-symbol selection"))
+        })
+    }));
+    assert!(bare_name["warnings"].as_array().is_some_and(|warnings| {
+        warnings.iter().any(|warning| {
+            warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("returned resolved_symbol.symbol_id"))
+        })
+    }));
+
+    let exact_output = h00ligan()
+        .arg("--root")
+        .arg(&root)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["read", &selector, "--format", "json"])
+        .output()
+        .expect("read by exact generation-bound symbol identity");
+    assert!(
+        exact_output.status.success(),
+        "exact-ID Read must retain the represented source: stdout={} stderr={}",
+        String::from_utf8_lossy(&exact_output.stdout),
+        String::from_utf8_lossy(&exact_output.stderr),
+    );
+    let exact = stdout_json(&exact_output);
+    assert_eq!(exact["resolved_symbol"]["symbol_id"], selector);
+    assert_eq!(exact["authority"]["selection_scope"], "exact_symbol_id");
+    assert_eq!(
+        exact["authority"]["selected_symbol_identity_complete"],
+        true
+    );
+    assert_eq!(exact["authority"]["structural_graph"]["status"], "partial");
+    assert_eq!(
+        exact["authority"]["status"], "complete",
+        "an exact repository/generation/symbol identity must not inherit an unrelated language-wide extraction gap: {exact}"
+    );
+    assert!(
+        exact["warnings"]
+            .as_array()
+            .is_none_or(|warnings| warnings.iter().all(|warning| !warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("Bare-symbol selection")))),
+        "exact-ID selection must not ask for its already-implied file selector: {exact}"
+    );
+
+    let exact_file = stdout_json(
+        &h00ligan()
+            .arg("--root")
+            .arg(&root)
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .args([
+                "read",
+                &selector,
+                "--file",
+                "src/lib.rs",
+                "--format",
+                "json",
+            ])
+            .output()
+            .expect("read exact identity with redundant file selector"),
+    );
+    assert_eq!(exact_file["authority"]["status"], "complete");
+    for key in [
+        "source",
+        "source_span",
+        "resolved_symbol",
+        "indexed_file_blake3",
+        "observed_file_blake3",
+        "published_definition_blake3",
+    ] {
+        let (exact_value, exact_file_value) = if key.ends_with("blake3") {
+            (&exact["authority"][key], &exact_file["authority"][key])
+        } else {
+            (&exact[key], &exact_file[key])
+        };
+        assert_eq!(
+            exact_value, exact_file_value,
+            "the redundant file selector changed exact Read evidence at {key}"
+        );
+    }
+
+    let (child, mut stdin, mut stdout) = spawn_mcp(&root, &data_dir);
+    let mcp = call_mcp(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "read",
+        json!({"symbol": selector}),
+    );
+    let stopped = stop_mcp(child, stdin);
+    assert!(stopped.status.success());
+    assert_eq!(
+        mcp["result"]["structuredContent"], exact,
+        "CLI and MCP must share exact-ID selection authority"
+    );
+    assert_eq!(mcp_typed_payload(&mcp), exact);
+}
+
+#[test]
+fn shipped_read_exact_file_qualifies_a_same_file_structural_capture_gap() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let root = temporary.path().join("repo");
+    std::fs::create_dir_all(root.join("src")).expect("source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"read-file-capture-gap-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("fixture manifest");
+    std::fs::write(
+        root.join("src/lib.rs"),
+        concat!(
+            "pub fn selected_target() -> usize { 42 }\n",
+            "macro_rules! generate { ($name:ident) => { pub struct $name; } }\n",
+            "generate!(Generated);\n",
+        ),
+    )
+    .expect("represented target beside an unavailable expansion");
+    let data_dir = temporary.path().join("bundle");
+
+    let indexed = h00ligan()
+        .arg("--root")
+        .arg(&root)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("index")
+        .output()
+        .expect("publish capture-gap fixture");
+    assert!(
+        indexed.status.success(),
+        "capture-gap indexing must retain represented definitions: stdout={} stderr={}",
+        String::from_utf8_lossy(&indexed.stdout),
+        String::from_utf8_lossy(&indexed.stderr),
+    );
+    let generation = resolve_generation(&data_dir, &root).expect("capture-gap generation");
+    let receipt = generation
+        .manifest
+        .receipts
+        .iter()
+        .find(|receipt| receipt.capability_id == "structural_graph")
+        .expect("positive structural receipt control");
+    assert_eq!(receipt.status, CapabilityStatus::Partial);
+    assert_eq!(
+        receipt.reason_code.as_deref(),
+        Some("structural_capture_incomplete")
+    );
+
+    let exact_file = stdout_json(
+        &h00ligan()
+            .arg("--root")
+            .arg(&root)
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .args([
+                "read",
+                "selected_target",
+                "--file",
+                "src/lib.rs",
+                "--format",
+                "json",
+            ])
+            .output()
+            .expect("read represented target through exact-file selection"),
+    );
+    assert_eq!(exact_file["authority"]["selection_scope"], "exact_file");
+    assert_eq!(
+        exact_file["authority"]["selected_file_population_complete"], false,
+        "a same-file uncaptured declaration must prevent complete file-selection authority: {exact_file}"
+    );
+    assert_eq!(exact_file["authority"]["status"], "qualified");
+    assert!(exact_file["warnings"].as_array().is_some_and(|warnings| {
+        warnings.iter().any(|warning| {
+            warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("uncaptured declaration"))
+        })
+    }));
+
+    let selector = find_exact_selector(&root, &data_dir, "selected_target");
+    let exact_id = stdout_json(
+        &h00ligan()
+            .arg("--root")
+            .arg(&root)
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .args(["read", &selector, "--format", "json"])
+            .output()
+            .expect("read represented target through exact generation identity"),
+    );
+    assert_eq!(exact_id["authority"]["selection_scope"], "exact_symbol_id");
+    assert_eq!(exact_id["authority"]["status"], "complete");
+    assert_eq!(
+        exact_id["authority"]["selected_file_population_complete"],
+        false
+    );
+
+    let (child, mut stdin, mut stdout) = spawn_mcp(&root, &data_dir);
+    let mcp = call_mcp(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "read",
+        json!({"symbol": "selected_target", "file": "src/lib.rs"}),
+    );
+    let stopped = stop_mcp(child, stdin);
+    assert!(stopped.status.success());
+    assert_eq!(
+        mcp["result"]["structuredContent"], exact_file,
+        "CLI and MCP must share capture-gap qualification"
+    );
+    assert_eq!(mcp_typed_payload(&mcp), exact_file);
+
+    std::fs::write(
+        root.join("src/lib.rs"),
+        concat!(
+            "pub fn selected_target() -> usize { 42 }\n",
+            "macro_rules! generate { ($name:ident) => { pub struct $name; } }\n",
+            "generate!(ChangedAfterIndex);\n",
+        ),
+    )
+    .expect("change only the uncaptured declaration after indexing");
+    let stale_file = h00ligan()
+        .arg("--root")
+        .arg(&root)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["read", &selector, "--format", "json"])
+        .output()
+        .expect("read unchanged exact definition after unrelated file drift");
+    assert!(
+        stale_file.status.success(),
+        "an unchanged exact definition must remain available with qualified live-file authority: stdout={} stderr={}",
+        String::from_utf8_lossy(&stale_file.stdout),
+        String::from_utf8_lossy(&stale_file.stderr),
+    );
+    let stale_file = stdout_json(&stale_file);
+    assert_eq!(stale_file["authority"]["status"], "qualified");
+    assert_eq!(
+        stale_file["authority"]["whole_file_matches_generation"],
+        false
+    );
+    assert_eq!(
+        stale_file["authority"]["selected_file_population_complete"],
+        false
+    );
+    assert_eq!(
+        stale_file["source"],
+        "pub fn selected_target() -> usize { 42 }"
+    );
+}
+
 #[tokio::test]
 async fn shipped_type_reduces_a_default_page_to_the_product_envelope() {
     let temporary = TempDir::new().expect("temporary directory");

@@ -5,7 +5,11 @@ from __future__ import annotations
 
 import argparse
 import copy
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -260,6 +264,9 @@ PYREFLY_BUILDER_FORBIDDEN_FRAGMENTS = (
 
 INSTALLED_GATE_REQUIRED_FRAGMENTS = (
     "export PYTHONDONTWRITEBYTECODE=1",
+    "cleanup() {",
+    "trap cleanup EXIT",
+    'owned_tmp_root="$(mktemp -d "$test_tmp_parent/installed-product.XXXXXX")"',
     'scripts/build-h00ligan-portable.sh" --machine',
     "--binary-arg __h00-internal-rust-provider",
     "H00_PYREFLY_PROVIDER_BINARY=",
@@ -276,7 +283,6 @@ INSTALLED_GATE_REQUIRED_FRAGMENTS = (
     "process_population_comparator --self-test",
     'product-process-baseline.json',
     'process_population_comparator "$process_baseline" "$process_after"',
-    'trap cleanup EXIT',
     'H00_TEST_H00LIGAN_RECEIPT',
     'H00_TEST_H00LIGAN_PRODUCT_SOURCE_RECEIPT',
     'scripts/check-h00ligan-binary.py',
@@ -289,11 +295,22 @@ INSTALLED_GATE_REQUIRED_FRAGMENTS = (
     "Pyrefly interrupted-cache residue positive control did not fire",
     "Pyrefly provider retained interrupted cache residue after replay",
     "repeated Pyrefly provider build did not retain the exact artifact identity",
+    'watch_test_source="$repo_root/crates/h00ligan/tests/watch_lifecycle.rs"',
+    'declared_watch_population="$(',
+    'discovered_watch_population="$(',
+    "-- --list --ignored",
+    '[[ -n "$declared_watch_population" ]]',
+    '[[ "$declared_watch_population" == "$discovered_watch_population" ]]',
+    "installed WATCH declaration/discovery mismatch",
+    "while IFS= read -r test_name; do",
+    '--test watch_lifecycle "$test_name"',
+    "watch_test_count=$((watch_test_count + 1))",
 )
 
-INSTALLED_WATCH_TESTS = (
+INSTALLED_WATCH_REQUIRED_TESTS = (
     "installed_typescript_watch_source_and_configuration_lifecycle_matches_full_baselines",
     "installed_python_watch_source_and_configuration_lifecycle_matches_full_baselines",
+    "installed_staged_python_watch_reuses_rust_and_owns_both_publications",
     "installed_mixed_watch_does_not_rerun_go_for_a_rust_only_edit",
     "installed_go_watch_body_edit_reuses_one_session_with_full_baseline_parity",
     "installed_go_watch_import_change_succeeds_in_first_reconciliation",
@@ -649,41 +666,125 @@ def validate_pyrefly_builder(builder: str | None) -> list[str]:
     return failures
 
 
-def validate_installed_gate(gate: str | None) -> list[str]:
+def validate_installed_gate(
+    gate: str | None, watch_test_source: str | None
+) -> list[str]:
     """Require the exact installed product to exercise provider, MCP, and WATCH."""
     if gate is None:
         return ["missing installed one-file product gate"]
+    executable_gate = "\n".join(
+        line for line in gate.splitlines() if not line.lstrip().startswith("#")
+    )
     failures = [
         f"installed product gate is missing boundary {fragment!r}"
         for fragment in INSTALLED_GATE_REQUIRED_FRAGMENTS
-        if fragment not in gate
+        if fragment not in executable_gate
     ]
-    watch_tests = shell_array_members(gate, "watch_tests")
-    if watch_tests != INSTALLED_WATCH_TESTS:
+    cleanup_definition = executable_gate.find("cleanup() {")
+    cleanup_trap = executable_gate.find("trap cleanup EXIT")
+    owned_root_creation = executable_gate.find(
+        'owned_tmp_root="$(mktemp -d "$test_tmp_parent/installed-product.XXXXXX")"'
+    )
+    if (
+        min(cleanup_definition, cleanup_trap, owned_root_creation) >= 0
+        and not cleanup_definition < cleanup_trap < owned_root_creation
+    ):
         failures.append(
-            "installed product WATCH population is "
-            f"{watch_tests!r}, expected {INSTALLED_WATCH_TESTS!r}"
+            "installed product gate must arm cleanup before allocating its owned "
+            "temporary root"
         )
+    if watch_test_source is None:
+        failures.append("missing installed WATCH lifecycle test source")
+    else:
+        declared = {
+            line.removeprefix("fn ").removesuffix("() {")
+            for line in watch_test_source.splitlines()
+            if line.startswith("fn installed_") and line.endswith("() {")
+        }
+        missing = [
+            test_name
+            for test_name in INSTALLED_WATCH_REQUIRED_TESTS
+            if test_name not in declared
+        ]
+        if missing:
+            failures.append(
+                "installed WATCH source is missing required lifecycle tests "
+                f"{missing!r}"
+            )
+        if not declared:
+            failures.append("installed WATCH source declares no installed lifecycle tests")
     return failures
 
 
-def shell_array_members(source: str, name: str) -> tuple[str, ...] | None:
-    """Parse one simple, executable shell array without treating comments as members."""
-    lines = source.splitlines()
-    starts = [index for index, line in enumerate(lines) if line.strip() == f"{name}=("]
-    if len(starts) != 1:
-        return None
-    members: list[str] = []
-    for line in lines[starts[0] + 1 :]:
-        stripped = line.strip()
-        if stripped == ")":
-            return tuple(members)
-        if not stripped or stripped.startswith("#"):
-            continue
-        if any(character.isspace() for character in stripped):
-            return None
-        members.append(stripped)
-    return None
+def prove_installed_gate_early_failure_cleanup(gate: str) -> None:
+    """Fail after owned-root allocation and require the armed trap to remove it."""
+    bash = shutil.which("bash")
+    real_mkdir = shutil.which("mkdir")
+    if bash is None or real_mkdir is None:
+        raise AssertionError("installed cleanup self-test requires bash and mkdir")
+
+    with tempfile.TemporaryDirectory(prefix="h00ligan-installed-cleanup.") as raw_root:
+        probe_root = Path(raw_root)
+        repo = probe_root / "repo"
+        scripts = repo / "scripts"
+        scripts.mkdir(parents=True)
+        gate_path = scripts / "test-h00ligan-installed-product.sh"
+        gate_path.write_text(gate, encoding="utf-8")
+        gate_path.chmod(0o755)
+
+        fake_bin = probe_root / "bin"
+        fake_bin.mkdir()
+        failure_marker = probe_root / "injected-mkdir-failure"
+        fake_mkdir = fake_bin / "mkdir"
+        fake_mkdir.write_text(
+            """#!/usr/bin/env bash
+set -euo pipefail
+for candidate in "$@"; do
+    case "$candidate" in
+        */installed-product.*/acceptance)
+            printf '%s\\n' "$candidate" > "$H00_TEST_FAILED_PATH"
+            exit 73
+            ;;
+    esac
+done
+exec "$H00_TEST_REAL_MKDIR" "$@"
+""",
+            encoding="utf-8",
+        )
+        fake_mkdir.chmod(0o755)
+
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "DEVBOX_PACKAGES_DIR": "ci-contract-self-test",
+                "H00_TEST_FAILED_PATH": str(failure_marker),
+                "H00_TEST_REAL_MKDIR": real_mkdir,
+                "PATH": f"{fake_bin}{os.pathsep}{environment.get('PATH', '')}",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+        )
+        completed = subprocess.run(
+            [bash, str(gate_path)],
+            cwd=repo,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+        if completed.returncode != 73 or not failure_marker.is_file():
+            raise AssertionError(
+                "installed cleanup probe did not reach the injected owned-root "
+                f"failure: exit={completed.returncode}, "
+                f"stderr={completed.stderr.decode(errors='replace')[-500:]!r}"
+            )
+        temp_parent = repo / "target/h00ligan-test-tmp"
+        residue = sorted(temp_parent.glob("installed-product.*"))
+        if residue:
+            raise AssertionError(
+                "installed gate left its owned temporary root after an early "
+                f"failure: {[path.name for path in residue]!r}"
+            )
 
 
 def validate_pyrefly_provider_test(test: str | None) -> list[str]:
@@ -1171,32 +1272,55 @@ def self_test() -> int:
                 f"Pyrefly builder retained-cache sabotage did not fire for {fragment!r}"
             )
 
-    valid_installed_gate = "\n".join(
-        (
-            *INSTALLED_GATE_REQUIRED_FRAGMENTS,
-            "watch_tests=(",
-            *(f"    {test_name}" for test_name in INSTALLED_WATCH_TESTS),
-            ")",
-        )
+    valid_installed_gate = "\n".join(INSTALLED_GATE_REQUIRED_FRAGMENTS)
+    valid_watch_test_source = "\n".join(
+        f"fn {test_name}() {{\n}}" for test_name in INSTALLED_WATCH_REQUIRED_TESTS
     )
-    if failures := validate_installed_gate(valid_installed_gate):
+    if failures := validate_installed_gate(valid_installed_gate, valid_watch_test_source):
         raise AssertionError(f"valid installed product gate rejected: {failures!r}")
     for fragment in INSTALLED_GATE_REQUIRED_FRAGMENTS:
         sabotaged = valid_installed_gate.replace(fragment, "", 1)
-        if not validate_installed_gate(sabotaged):
+        if not validate_installed_gate(sabotaged, valid_watch_test_source):
             raise AssertionError(
                 f"installed product omission did not fire for {fragment!r}"
             )
-    watch_regression = "installed_go_workspace_watch_does_not_rerun_an_unchanged_module"
-    comment_only_watch = valid_installed_gate.replace(
-        watch_regression,
-        f"# {watch_regression}",
+    discovery_fragment = 'discovered_watch_population="$('
+    comment_only_discovery = valid_installed_gate.replace(
+        discovery_fragment,
+        f"# {discovery_fragment}",
         1,
     )
-    if not validate_installed_gate(comment_only_watch):
+    if not validate_installed_gate(comment_only_discovery, valid_watch_test_source):
         raise AssertionError(
-            "comment-only installed WATCH regression still satisfied executable wiring"
+            "comment-only installed WATCH discovery still satisfied executable wiring"
         )
+    cleanup_trap = "trap cleanup EXIT"
+    owned_root_creation = (
+        'owned_tmp_root="$(mktemp -d "$test_tmp_parent/installed-product.XXXXXX")"'
+    )
+    late_cleanup = valid_installed_gate.replace(
+        f"{cleanup_trap}\n{owned_root_creation}",
+        f"{owned_root_creation}\n{cleanup_trap}",
+        1,
+    )
+    late_cleanup_failures = validate_installed_gate(
+        late_cleanup, valid_watch_test_source
+    )
+    if not any("arm cleanup before allocating" in failure for failure in late_cleanup_failures):
+        raise AssertionError(
+            "late installed-product cleanup trap satisfied the ownership ordering"
+        )
+    missing_required_watch = valid_watch_test_source.replace(
+        f"fn {INSTALLED_WATCH_REQUIRED_TESTS[0]}() {{\n}}", "", 1
+    )
+    if not validate_installed_gate(valid_installed_gate, missing_required_watch):
+        raise AssertionError("missing required installed WATCH source test was accepted")
+    live_installed_gate = Path(__file__).resolve().with_name(
+        "test-h00ligan-installed-product.sh"
+    )
+    prove_installed_gate_early_failure_cleanup(
+        live_installed_gate.read_text(encoding="utf-8")
+    )
 
     valid_pyrefly_test = "\n".join(PYREFLY_PROVIDER_TEST_REQUIRED_FRAGMENTS)
     if failures := validate_pyrefly_provider_test(valid_pyrefly_test):
@@ -1364,6 +1488,7 @@ dependencies = [
         + len(PYREFLY_BUILDER_REQUIRED_FRAGMENTS)
         + len(PYREFLY_BUILDER_FORBIDDEN_FRAGMENTS)
         + len(INSTALLED_GATE_REQUIRED_FRAGMENTS)
+        + 4
         + len(PYREFLY_PROVIDER_TEST_REQUIRED_FRAGMENTS)
         + len(BUILD_AUTHORITY_REQUIRED_FRAGMENTS)
         + len(PERFORMANCE_HARNESS_REQUIRED_FRAGMENTS)
@@ -1426,7 +1551,13 @@ def main() -> int:
         if installed_gate_path.is_file()
         else None
     )
-    failures.extend(validate_installed_gate(installed_gate))
+    watch_test_source_path = root / "crates/h00ligan/tests/watch_lifecycle.rs"
+    watch_test_source = (
+        watch_test_source_path.read_text(encoding="utf-8")
+        if watch_test_source_path.is_file()
+        else None
+    )
+    failures.extend(validate_installed_gate(installed_gate, watch_test_source))
     pyrefly_provider_test_path = (
         root / "scripts/test-h00-pyrefly-semantic-provider.py"
     )

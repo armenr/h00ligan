@@ -289,31 +289,58 @@ pub async fn query_published_read(
     )?;
     let source_span = source_span(&materialized.file_bytes, absolute_start, absolute_end)?;
 
-    let selection_complete =
-        normalized_file.is_some() || language_status == CapabilityCoverageStatus::Complete;
+    let selection_scope = if is_exact_symbol_selector(&request.symbol) {
+        ReadSelectionScope::ExactSymbolId
+    } else if normalized_file.is_some() {
+        ReadSelectionScope::ExactFile
+    } else {
+        ReadSelectionScope::RepositoryGraph
+    };
+    let selected_population_complete = match selection_scope {
+        ReadSelectionScope::ExactSymbolId => true,
+        ReadSelectionScope::ExactFile => identity.selected_file_population_complete,
+        ReadSelectionScope::RepositoryGraph => {
+            language_status == CapabilityCoverageStatus::Complete
+                && identity.selected_file_population_complete
+        }
+    };
     let inventory_coverage = generation
         .project_inventory
         .coverage_for_language(&language_id);
     let inventory_complete =
         inventory_coverage == ProjectInventoryCoverage::IndexedSourcePopulationComplete;
-    let status = if selection_complete
-        && identity.selected_file_population_complete
+    let selection_inventory_complete = match selection_scope {
+        ReadSelectionScope::ExactSymbolId | ReadSelectionScope::ExactFile => true,
+        ReadSelectionScope::RepositoryGraph => inventory_complete,
+    };
+    let status = if selected_population_complete
         && whole_file_matches_generation
-        && (normalized_file.is_some() || inventory_complete)
+        && selection_inventory_complete
     {
         AuthorityStatus::Complete
     } else {
         AuthorityStatus::Qualified
     };
     let mut warnings = Vec::new();
-    if normalized_file.is_none() && language_status != CapabilityCoverageStatus::Complete {
+    let bare_structural_coverage_incomplete = selection_scope
+        == ReadSelectionScope::RepositoryGraph
+        && language_status != CapabilityCoverageStatus::Complete;
+    let bare_inventory_incomplete =
+        selection_scope == ReadSelectionScope::RepositoryGraph && !inventory_complete;
+    if bare_structural_coverage_incomplete {
         warnings.push(format!(
-            "Bare-symbol selection is qualified because {language_id} structural coverage is not complete; pass the exact file selector shown by Find when identity matters."
+            "Bare-symbol selection is qualified because {language_id} structural coverage is not complete."
         ));
     }
-    if normalized_file.is_none() && !inventory_complete {
+    if bare_inventory_incomplete {
         warnings.push(
             "Bare-symbol selection is qualified because the indexed project inventory is partial."
+                .into(),
+        );
+    }
+    if bare_structural_coverage_incomplete || bare_inventory_incomplete {
+        warnings.push(
+            "Use the returned resolved_symbol.symbol_id for exact generation-bound selection when identity matters."
                 .into(),
         );
     }
@@ -324,10 +351,13 @@ pub async fn query_published_read(
         );
     }
     if !identity.selected_file_population_complete {
-        warnings.push(
+        warnings.push(if node.has_uncaptured_items {
+            "The selected source identity was revalidated against the exact indexed file bytes, but the structural extractor reported an uncaptured declaration in that file; file-scoped selection remains qualified."
+                .into()
+        } else {
             "The selected source identity was revalidated against the exact indexed file bytes, but the published graph does not represent that file's complete extracted symbol population; unrelated identities were collapsed."
-                .into(),
-        );
+                .into()
+        });
     }
 
     let result = ExactReadResult {
@@ -359,13 +389,7 @@ pub async fn query_published_read(
         authority: ReadAuthority {
             status,
             population: ReadPopulation::SelectedPublishedSymbolSourceCharacters,
-            selection_scope: if is_exact_symbol_selector(&request.symbol) {
-                ReadSelectionScope::ExactSymbolId
-            } else if normalized_file.is_some() {
-                ReadSelectionScope::ExactFile
-            } else {
-                ReadSelectionScope::RepositoryGraph
-            },
+            selection_scope,
             source_consistency: ReadSourceConsistency::LiveDefinitionHashMatchesGeneration,
             structural_graph,
             project_inventory_coverage: inventory_coverage,
@@ -425,9 +449,11 @@ fn validate_selected_identity(
             ),
         }
     })?;
-    let selected_file_population_complete = graph_symbols == extracted_symbols;
+    let extracted_population_survived = graph_symbols == extracted_symbols;
+    let selected_file_population_complete =
+        extracted_population_survived && !node.has_uncaptured_items;
 
-    if selected_file_population_complete {
+    if extracted_population_survived {
         return Ok(SelectedIdentityAuthority {
             selected_file_population_complete,
             evidence: ReadIdentityEvidence::PublishedGraphPopulation,

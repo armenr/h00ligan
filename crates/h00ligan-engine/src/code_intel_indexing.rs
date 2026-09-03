@@ -960,6 +960,7 @@ async fn try_reuse_current_generation(
     let files_discovered = indexed_files.len();
     let nodes_total = graph.node_count();
     let edges_total = graph.edge_count();
+    let reused_publication_control_token = current_control_token.clone();
     let reused_live_basis = Some(Box::new(LiveGenerationBasis::from_resolved(
         &resolved,
         current_control_token,
@@ -998,6 +999,7 @@ async fn try_reuse_current_generation(
                 database_path: resolved.database_path,
                 maintenance: PublicationMaintenance::default(),
             },
+            publication_control_token: Some(reused_publication_control_token),
             calls_authority,
             callable_liveness_authority,
             publication_timings: Vec::new(),

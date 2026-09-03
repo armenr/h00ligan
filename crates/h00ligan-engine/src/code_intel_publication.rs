@@ -610,11 +610,16 @@ fn enforce_capability_floor(
     }
 }
 
-/// Telemetry and immutable publication produced by one fresh indexing run.
+/// Telemetry and immutable publication selected or produced by one indexing run.
 #[derive(Debug)]
 pub struct PublishedIndexGeneration {
     pub telemetry: IndexReport,
     pub publication: PublishedGeneration,
+    /// Exact bounded control identity for the selected publication. Fresh
+    /// writers capture it while the one-writer lock is still held. `None` on
+    /// a durable write means its identity could not be re-read; consumers must
+    /// then fail closed rather than infer ownership from timing or sequence.
+    pub(crate) publication_control_token: Option<PublicationControlToken>,
     /// Compact, generation-authoritative Calls assessment computed while the
     /// exact graph, receipts, provider payloads, and inventory are co-resident.
     /// Terminal operation receipts retain this summary instead of retaining
@@ -2292,19 +2297,22 @@ pub(crate) async fn publish_prepared_index_generation_with_live_basis(
         ),
         Some(publish_duration),
     );
-    let authority = publication_control_token(&publisher.publication_root.path, &config.root)
-        .ok()
-        .map(|control_token| LiveGenerationAuthority {
-            resolved: Arc::new(ResolvedGeneration {
-                slot: publication.slot,
-                head: publication.head.clone(),
-                manifest: publication.manifest.clone(),
-                project_inventory: Arc::clone(&publication.project_inventory),
-                provider_payloads: publication.provider_payloads.clone(),
-                database_path: publication.database_path.clone(),
-            }),
-            control_token,
-        });
+    let publication_control_token =
+        publication_control_token(&publisher.publication_root.path, &config.root).ok();
+    let authority =
+        publication_control_token
+            .clone()
+            .map(|control_token| LiveGenerationAuthority {
+                resolved: Arc::new(ResolvedGeneration {
+                    slot: publication.slot,
+                    head: publication.head.clone(),
+                    manifest: publication.manifest.clone(),
+                    project_inventory: Arc::clone(&publication.project_inventory),
+                    provider_payloads: publication.provider_payloads.clone(),
+                    database_path: publication.database_path.clone(),
+                }),
+                control_token,
+            });
     let calls_authority = assess_calls_capability(
         &structural_basis.graph,
         &publication.manifest.receipts,
@@ -2328,6 +2336,7 @@ pub(crate) async fn publish_prepared_index_generation_with_live_basis(
     let published = PublishedIndexGeneration {
         telemetry: *telemetry,
         publication,
+        publication_control_token,
         calls_authority,
         callable_liveness_authority,
         publication_timings,

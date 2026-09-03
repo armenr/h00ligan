@@ -4916,7 +4916,17 @@ impl IndexPipeline {
             );
             return Err(error);
         }
-        let semantic_bases = admitted_canonical_semantic_bases(canonical_scip_snapshots, &evidence);
+        let semantic_bases = if needs_scip_generation {
+            admitted_canonical_semantic_bases(canonical_scip_snapshots, &evidence)
+        } else {
+            // A structural-only publication deliberately exposes no semantic
+            // payload or receipt, but its process-local successor still needs
+            // the prior canonical bases to decide which language actually
+            // changed. These bytes are disposable acceleration, not authority:
+            // every later reuse/refresh lane revalidates them against current
+            // source, inventory, toolchain, runtime, and published evidence.
+            prior_semantic_bases
+        };
         profiler.record_phase(
             "evidence",
             8,

@@ -956,11 +956,17 @@ impl IndexWatchService {
                         }
                     }
                     _ = publication_probe.tick() => {
-                        let schedule = task_supervisor.schedule_snapshot();
+                        let probe_snapshot = task_supervisor.publication_probe_snapshot();
+                        let schedule = &probe_snapshot.schedule;
                         let witness = task_supervisor.publication_control_witness();
-                        let probe = publication_tracker.observe(&schedule, witness, || {
-                            PublicationProbeState::capture(&task_supervisor)
-                        });
+                        let probe = publication_tracker.observe(
+                            schedule,
+                            probe_snapshot.owned_publication_revision,
+                            probe_snapshot.owned_publication_control_token.as_ref(),
+                            witness,
+                            || PublicationProbeState::capture(&task_supervisor),
+                            || task_supervisor.publication_probe_snapshot() == probe_snapshot,
+                        );
                         let probe_failed = probe.control_unavailable
                             && schedule.published_epoch > 0
                             && schedule.active_operation.is_none()
@@ -1062,7 +1068,7 @@ impl PublicationProbeState {
 
 #[derive(Default)]
 struct PublicationProbeTracker {
-    observed_published_epoch: u64,
+    observed_owned_publication_revision: u64,
     last_witness: Option<PublicationControlWitness>,
     last_state: Option<PublicationProbeState>,
 }
@@ -1080,10 +1086,14 @@ impl PublicationProbeTracker {
     fn observe(
         &mut self,
         schedule: &IndexScheduleSnapshot,
+        owned_publication_revision: u64,
+        owned_publication_control_token: Option<&PublicationControlToken>,
         witness: PublicationControlWitness,
         capture_control: impl FnOnce() -> PublicationProbeState,
+        local_snapshot_stable: impl FnOnce() -> bool,
     ) -> PublicationProbeObservation {
-        let own_publication_advanced = schedule.published_epoch != self.observed_published_epoch;
+        let own_publication_advanced =
+            owned_publication_revision != self.observed_owned_publication_revision;
         let baseline_missing = self.last_witness.is_none() || self.last_state.is_none();
         if !own_publication_advanced
             && !baseline_missing
@@ -1093,15 +1103,31 @@ impl PublicationProbeTracker {
         }
         let idle = schedule.active_operation.is_none()
             && schedule.desired_epoch == schedule.published_epoch;
-        if !own_publication_advanced && !baseline_missing && !idle {
+        if !baseline_missing && !idle {
             return PublicationProbeObservation::default();
         }
 
         let state = capture_control();
-        let drifted = !own_publication_advanced
-            && !baseline_missing
-            && self.last_state.as_ref() != Some(&state);
-        self.observed_published_epoch = schedule.published_epoch;
+        if !local_snapshot_stable() {
+            // A local operation started, published, or settled while control
+            // bytes were being read. Do not classify that mixed observation;
+            // retain the prior baseline and retry after a stable idle tick.
+            return PublicationProbeObservation {
+                control_read: true,
+                ..PublicationProbeObservation::default()
+            };
+        }
+        let observed_owned_publication = own_publication_advanced
+            && matches!(
+                (&state, owned_publication_control_token),
+                (PublicationProbeState::Current(observed), Some(expected)) if observed == expected
+            );
+        let drifted = if own_publication_advanced {
+            !observed_owned_publication
+        } else {
+            !baseline_missing && self.last_state.as_ref() != Some(&state)
+        };
+        self.observed_owned_publication_revision = owned_publication_revision;
         self.last_witness = Some(witness);
         self.last_state = Some(state);
         PublicationProbeObservation {
@@ -1135,10 +1161,12 @@ mod tests {
     use tokio::time::timeout;
 
     fn probe_token(value: &str) -> PublicationProbeState {
-        PublicationProbeState::Current(
-            serde_json::from_value(serde_json::Value::String(value.into()))
-                .expect("opaque publication token"),
-        )
+        PublicationProbeState::Current(probe_control_token(value))
+    }
+
+    fn probe_control_token(value: &str) -> PublicationControlToken {
+        serde_json::from_value(serde_json::Value::String(value.into()))
+            .expect("opaque publication token")
     }
 
     fn probe_witness(temporary: &TempDir, label: &str) -> PublicationControlWitness {
@@ -1210,24 +1238,28 @@ mod tests {
         let later_self_witness = probe_witness(&temporary, "later-self");
         let mut tracker = PublicationProbeTracker::default();
 
-        let initial_build = IndexScheduleSnapshot {
-            desired_epoch: 1,
-            published_epoch: 0,
-            active_operation: None,
-            active_trigger: Some(IndexOperationTrigger::Watch),
-            manual_queued: false,
-            watch_enabled: true,
-        };
-        let initial = tracker.observe(&initial_build, initial_witness, || {
-            PublicationProbeState::Unavailable
-        });
+        let initial_unpublished = idle_schedule(0);
+        let initial = tracker.observe(
+            &initial_unpublished,
+            0,
+            None,
+            initial_witness,
+            || PublicationProbeState::Unavailable,
+            || true,
+        );
         assert!(initial.control_read);
         assert!(initial.control_unavailable);
         assert!(!initial.drifted);
 
-        let own_publication = tracker.observe(&idle_schedule(1), self_witness.clone(), || {
-            probe_token("self-a")
-        });
+        let self_token = probe_control_token("self-a");
+        let own_publication = tracker.observe(
+            &idle_schedule(1),
+            1,
+            Some(&self_token),
+            self_witness.clone(),
+            || probe_token("self-a"),
+            || true,
+        );
         assert!(own_publication.control_read);
         assert!(
             !own_publication.drifted,
@@ -1235,50 +1267,288 @@ mod tests {
         );
 
         for _ in 0..100 {
-            let unchanged = tracker.observe(&idle_schedule(1), self_witness.clone(), || {
-                panic!("unchanged metadata must not read validated control bytes")
-            });
+            let unchanged = tracker.observe(
+                &idle_schedule(1),
+                1,
+                Some(&self_token),
+                self_witness.clone(),
+                || panic!("unchanged metadata must not read validated control bytes"),
+                || panic!("unchanged metadata must not recheck local state"),
+            );
             assert_eq!(unchanged, PublicationProbeObservation::default());
         }
 
-        let metadata_only =
-            tracker.observe(&idle_schedule(1), touched_witness, || probe_token("self-a"));
+        let metadata_only = tracker.observe(
+            &idle_schedule(1),
+            1,
+            Some(&self_token),
+            touched_witness,
+            || probe_token("self-a"),
+            || true,
+        );
         assert!(metadata_only.control_read);
         assert!(
             !metadata_only.drifted,
             "metadata-only churn with identical validated controls is not publication drift"
         );
 
-        let foreign = tracker.observe(&idle_schedule(1), foreign_witness.clone(), || {
-            probe_token("foreign-b")
-        });
+        let foreign = tracker.observe(
+            &idle_schedule(1),
+            1,
+            Some(&self_token),
+            foreign_witness.clone(),
+            || probe_token("foreign-b"),
+            || true,
+        );
         assert!(foreign.control_read);
         assert!(
             foreign.drifted,
             "positive control: foreign idle control drift must schedule authority"
         );
-        let replay = tracker.observe(&idle_schedule(1), foreign_witness, || {
-            panic!("an unchanged foreign witness must not reread control bytes")
-        });
+        let replay = tracker.observe(
+            &idle_schedule(1),
+            1,
+            Some(&self_token),
+            foreign_witness,
+            || panic!("an unchanged foreign witness must not reread control bytes"),
+            || panic!("an unchanged foreign witness must not recheck local state"),
+        );
         assert!(
             !replay.drifted && !replay.control_read,
             "an unchanged drift token must not replay reconciliation"
         );
 
-        let unavailable = tracker.observe(&idle_schedule(1), unavailable_witness, || {
-            PublicationProbeState::Unavailable
-        });
+        let unavailable = tracker.observe(
+            &idle_schedule(1),
+            1,
+            Some(&self_token),
+            unavailable_witness,
+            || PublicationProbeState::Unavailable,
+            || true,
+        );
         assert!(
             unavailable.drifted && unavailable.control_read && unavailable.control_unavailable,
             "loss of readable control authority must also schedule one fail-closed reconciliation"
         );
 
-        let later_self = tracker.observe(&idle_schedule(2), later_self_witness, || {
-            probe_token("self-c")
-        });
+        let later_self_token = probe_control_token("self-c");
+        let later_self = tracker.observe(
+            &idle_schedule(2),
+            2,
+            Some(&later_self_token),
+            later_self_witness,
+            || probe_token("self-c"),
+            || true,
+        );
         assert!(
             later_self.control_read && !later_self.drifted,
             "a later self-publication advances the owned epoch and must not look foreign"
+        );
+
+        let uncertain_witness = probe_witness(&temporary, "uncertain-self");
+        let uncertain_self = tracker.observe(
+            &idle_schedule(3),
+            3,
+            None,
+            uncertain_witness,
+            || PublicationProbeState::Unavailable,
+            || true,
+        );
+        assert!(
+            uncertain_self.control_read
+                && uncertain_self.drifted
+                && uncertain_self.control_unavailable,
+            "a durable write without an exact locked control token must fail closed"
+        );
+    }
+
+    /// RIGHT-REASON REGRESSION: one semantic WATCH reconciliation may publish
+    /// fresh structural truth and then replace it with final semantic truth.
+    /// Both writes belong to the same source epoch. Source-epoch equality
+    /// therefore cannot be used as publication ownership identity.
+    #[test]
+    fn publication_probe_does_not_misclassify_two_owned_writes_in_one_source_epoch() {
+        let temporary = TempDir::new().expect("owned publication scratch");
+        let structural_witness = probe_witness(&temporary, "owned-structural");
+        let semantic_witness = probe_witness(&temporary, "owned-semantic");
+        let mut tracker = PublicationProbeTracker::default();
+
+        let structural_token = probe_control_token("owned-structural");
+        let structural = tracker.observe(
+            &idle_schedule(1),
+            1,
+            Some(&structural_token),
+            structural_witness,
+            || probe_token("owned-structural"),
+            || true,
+        );
+        assert!(structural.control_read && !structural.drifted);
+
+        let semantic_token = probe_control_token("owned-semantic");
+        let semantic = tracker.observe(
+            &idle_schedule(1),
+            2,
+            Some(&semantic_token),
+            semantic_witness,
+            || probe_token("owned-semantic"),
+            || true,
+        );
+        assert!(
+            semantic.control_read && !semantic.drifted,
+            "the final semantic write shares its source epoch with the owned structural stage and must not schedule foreign-drift reconciliation"
+        );
+    }
+
+    /// RIGHT-REASON REGRESSION: the durable semantic head may become visible
+    /// after WATCH snapshots the earlier owned structural identity but before
+    /// the supervisor records the semantic write. While that operation is
+    /// still active, the probe must defer instead of calling the later owned
+    /// token foreign and scheduling a redundant reconciliation.
+    #[test]
+    fn publication_probe_defers_during_an_active_owned_publication_sequence() {
+        let temporary = TempDir::new().expect("active publication scratch");
+        let initial_witness = probe_witness(&temporary, "active-initial");
+        let semantic_witness = probe_witness(&temporary, "active-semantic");
+        let initial_token = probe_control_token("owned-a");
+        let structural_token = probe_control_token("owned-b");
+        let semantic_token = probe_control_token("owned-c");
+        let mut tracker = PublicationProbeTracker::default();
+
+        let initial = tracker.observe(
+            &idle_schedule(1),
+            1,
+            Some(&initial_token),
+            initial_witness,
+            || probe_token("owned-a"),
+            || true,
+        );
+        assert!(initial.control_read && !initial.drifted);
+
+        let mut active = idle_schedule(2);
+        active.published_epoch = 1;
+        active.active_operation = Some(
+            "index-00000000000000000000000000000000-1"
+                .parse()
+                .expect("synthetic active operation ID"),
+        );
+        active.active_trigger = Some(IndexOperationTrigger::Watch);
+        let in_flight = tracker.observe(
+            &active,
+            2,
+            Some(&structural_token),
+            semantic_witness.clone(),
+            || probe_token("owned-c"),
+            || true,
+        );
+        assert_eq!(
+            in_flight,
+            PublicationProbeObservation::default(),
+            "an active owned publication sequence is not a stable foreign-drift boundary"
+        );
+
+        let settled = tracker.observe(
+            &idle_schedule(2),
+            3,
+            Some(&semantic_token),
+            semantic_witness,
+            || probe_token("owned-c"),
+            || true,
+        );
+        assert!(
+            settled.control_read && !settled.drifted,
+            "the settled final semantic token is the supervisor's exact owned head"
+        );
+    }
+
+    /// RIGHT-REASON REGRESSION: an operation may start and publish after the
+    /// probe's local snapshot but before its control read completes. A mixed
+    /// local/filesystem observation has no ownership authority; it must retain
+    /// the prior baseline and be classified only on the next stable tick.
+    #[test]
+    fn publication_probe_defers_when_local_state_changes_during_control_read() {
+        let temporary = TempDir::new().expect("concurrent probe scratch");
+        let initial_witness = probe_witness(&temporary, "concurrent-initial");
+        let changed_witness = probe_witness(&temporary, "concurrent-changed");
+        let initial_token = probe_control_token("owned-a");
+        let changed_token = probe_control_token("owned-b");
+        let mut tracker = PublicationProbeTracker::default();
+
+        let initial = tracker.observe(
+            &idle_schedule(1),
+            1,
+            Some(&initial_token),
+            initial_witness,
+            || probe_token("owned-a"),
+            || true,
+        );
+        assert!(initial.control_read && !initial.drifted);
+
+        let mixed = tracker.observe(
+            &idle_schedule(1),
+            1,
+            Some(&initial_token),
+            changed_witness.clone(),
+            || probe_token("owned-b"),
+            || false,
+        );
+        assert_eq!(
+            mixed,
+            PublicationProbeObservation {
+                control_read: true,
+                ..PublicationProbeObservation::default()
+            },
+            "a control token joined to a changed local snapshot is not classifiable"
+        );
+        assert_eq!(tracker.observed_owned_publication_revision, 1);
+        assert_eq!(tracker.last_state, Some(probe_token("owned-a")));
+
+        let settled = tracker.observe(
+            &idle_schedule(2),
+            2,
+            Some(&changed_token),
+            changed_witness,
+            || probe_token("owned-b"),
+            || true,
+        );
+        assert!(
+            settled.control_read && !settled.drifted,
+            "the next stable observation must recognize the exact owned head"
+        );
+    }
+
+    /// RIGHT-REASON REGRESSION: a foreign writer may advance the durable head
+    /// after our write but before WATCH observes either token. A scalar local
+    /// revision cannot prove that the finally observed token belongs to us.
+    #[test]
+    fn publication_probe_rejects_foreign_token_coalesced_after_owned_write() {
+        let temporary = TempDir::new().expect("coalesced publication scratch");
+        let initial_witness = probe_witness(&temporary, "coalesced-initial");
+        let foreign_witness = probe_witness(&temporary, "coalesced-foreign");
+        let initial_token = probe_control_token("initial-a");
+        let owned_token = probe_control_token("owned-b");
+        let mut tracker = PublicationProbeTracker::default();
+
+        let initial = tracker.observe(
+            &idle_schedule(1),
+            1,
+            Some(&initial_token),
+            initial_witness,
+            || probe_token("initial-a"),
+            || true,
+        );
+        assert!(initial.control_read && !initial.drifted);
+
+        let coalesced = tracker.observe(
+            &idle_schedule(2),
+            2,
+            Some(&owned_token),
+            foreign_witness,
+            || probe_token("foreign-c"),
+            || true,
+        );
+        assert!(
+            coalesced.control_read && coalesced.drifted,
+            "an advanced local revision owns only its exact locked publication token"
         );
     }
 
