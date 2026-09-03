@@ -1574,8 +1574,14 @@ const MAX_GIT_CONTROL_POINTER_BYTES: u64 = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GitControlRoots {
+    /// Canonical roots used when persisted coordinates are re-resolved.
     worktree: PathBuf,
     common: PathBuf,
+    /// Exact normalized spellings mechanically declared by the repository's
+    /// `.git` and `commondir` pointers. On Darwin these may be below `/var`
+    /// while the canonical roots are below `/private/var`.
+    declared_worktree: PathBuf,
+    declared_common: PathBuf,
     linked: bool,
 }
 
@@ -1648,7 +1654,9 @@ fn resolve_git_control_roots(
         let root = canonical_git_directory(&marker, "Git control directory")?;
         return Ok(GitControlRoots {
             worktree: root.clone(),
-            common: root,
+            common: root.clone(),
+            declared_worktree: root.clone(),
+            declared_common: root,
             linked: false,
         });
     }
@@ -1678,7 +1686,8 @@ fn resolve_git_control_roots(
     } else {
         repository_root.join(git_dir)
     };
-    let worktree = canonical_git_directory(&git_dir, "linked-worktree gitdir")?;
+    let declared_worktree = normalize_absolute_semantic_input(&git_dir)?;
+    let worktree = canonical_git_directory(&declared_worktree, "linked-worktree gitdir")?;
     let head = std::fs::symlink_metadata(worktree.join("HEAD"))
         .map_err(|error| SemanticProviderProtocolError::Io(error.to_string()))?;
     if !head.file_type().is_file() || head.file_type().is_symlink() {
@@ -1717,11 +1726,24 @@ fn resolve_git_control_roots(
     let value = read_git_control_pointer(&commondir_marker, "Git commondir pointer")?;
     let value = PathBuf::from(value);
     let candidate = if value.is_absolute() {
-        value
+        value.clone()
     } else {
-        worktree.join(value)
+        worktree.join(&value)
     };
     let common = canonical_git_directory(&candidate, "Git common directory")?;
+    let declared_common_candidate = if value.is_absolute() {
+        value
+    } else {
+        declared_worktree.join(value)
+    };
+    let declared_common = normalize_absolute_semantic_input(&declared_common_candidate)?;
+    let declared_common_target =
+        canonical_git_directory(&declared_common, "declared Git common directory")?;
+    if declared_common_target != common {
+        return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
+            "Git commondir spelling resolves outside its proven common directory".into(),
+        ));
+    }
     if common == worktree {
         return Err(SemanticProviderProtocolError::InvalidSemanticInputs(
             "linked-worktree gitdir does not identify a distinct common Git directory".into(),
@@ -1742,6 +1764,8 @@ fn resolve_git_control_roots(
     Ok(GitControlRoots {
         worktree,
         common,
+        declared_worktree,
+        declared_common,
         linked: true,
     })
 }
@@ -1815,17 +1839,19 @@ pub fn classify_provider_semantic_input_path(
             ),
         ));
     }
-    if let Some(coordinate) = coordinate_below(
-        ProviderSemanticPathRoot::GitWorktree,
-        &roots.worktree,
-        &path,
-    )? {
-        return Ok(coordinate);
+    for authority_root in [&roots.declared_worktree, &roots.worktree] {
+        if let Some(coordinate) =
+            coordinate_below(ProviderSemanticPathRoot::GitWorktree, authority_root, &path)?
+        {
+            return Ok(coordinate);
+        }
     }
-    if let Some(coordinate) =
-        coordinate_below(ProviderSemanticPathRoot::GitCommon, &roots.common, &path)?
-    {
-        return Ok(coordinate);
+    for authority_root in [&roots.declared_common, &roots.common] {
+        if let Some(coordinate) =
+            coordinate_below(ProviderSemanticPathRoot::GitCommon, authority_root, &path)?
+        {
+            return Ok(coordinate);
+        }
     }
     Err(SemanticProviderProtocolError::InvalidSemanticInputs(
         format!(

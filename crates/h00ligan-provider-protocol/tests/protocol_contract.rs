@@ -352,6 +352,101 @@ fn semantic_inputs_bind_linked_worktree_git_roots_without_absolute_paths() {
     );
 }
 
+/// RIGHT-REASON REGRESSION: Darwin commonly exposes a temporary directory
+/// below `/var` while canonicalization resolves the same directory below
+/// `/private/var`. Linked-worktree Git inputs must retain the mechanically
+/// proven spelling from `.git`/`commondir` as well as the canonical root, so a
+/// platform alias cannot make an owned control file look external.
+#[cfg(unix)]
+#[test]
+fn linked_worktree_git_roots_accept_their_proven_parent_alias() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = ScratchDirectory::new("linked-worktree-parent-alias");
+    let physical = scratch.0.join("physical");
+    let alias = scratch.0.join("alias");
+    std::fs::create_dir(&physical).expect("physical fixture root");
+    symlink(&physical, &alias).expect("fixture parent alias");
+
+    let repository = alias.join("worktree");
+    let common_git = alias.join("main/.git");
+    let worktree_git = common_git.join("worktrees/fixture");
+    let branch_ref = common_git.join("refs/heads/fixture");
+    std::fs::create_dir_all(&repository).expect("worktree source root");
+    std::fs::create_dir_all(&worktree_git).expect("worktree gitdir");
+    std::fs::create_dir_all(branch_ref.parent().expect("branch-ref parent")).expect("common refs");
+    std::fs::write(
+        repository.join(".git"),
+        format!("gitdir: {}\n", worktree_git.display()),
+    )
+    .expect("linked-worktree marker");
+    std::fs::write(worktree_git.join("commondir"), "../..\n").expect("commondir");
+    std::fs::write(worktree_git.join("HEAD"), "ref: refs/heads/fixture\n")
+        .expect("per-worktree HEAD");
+    std::fs::write(&branch_ref, format!("{}\n", "1".repeat(40))).expect("shared ref");
+    std::fs::write(
+        worktree_git.join("gitdir"),
+        format!("{}\n", repository.join(".git").display()),
+    )
+    .expect("reciprocal worktree pointer");
+
+    let worktree_coordinate =
+        classify_provider_semantic_input_path(&repository, &worktree_git.join("HEAD"))
+            .expect("a proven parent alias must retain Git-worktree authority");
+    assert_eq!(
+        worktree_coordinate,
+        h00ligan_provider_protocol::ProviderSemanticPathCoordinate {
+            root: ProviderSemanticPathRoot::GitWorktree,
+            path: "HEAD".into(),
+        }
+    );
+    let common_coordinate = classify_provider_semantic_input_path(&repository, &branch_ref)
+        .expect("a proven parent alias must retain common-Git authority");
+    assert_eq!(
+        common_coordinate,
+        h00ligan_provider_protocol::ProviderSemanticPathCoordinate {
+            root: ProviderSemanticPathRoot::GitCommon,
+            path: "refs/heads/fixture".into(),
+        }
+    );
+    assert_eq!(
+        classify_provider_semantic_input_path(
+            &repository,
+            &physical.join("main/.git/worktrees/fixture/HEAD"),
+        )
+        .expect("the canonical Git-worktree root remains authoritative"),
+        worktree_coordinate
+    );
+
+    let unproven_alias = scratch.0.join("unproven-alias");
+    symlink(&physical, &unproven_alias).expect("unproven parent alias");
+    assert!(
+        classify_provider_semantic_input_path(
+            &repository,
+            &unproven_alias.join("main/.git/worktrees/fixture/HEAD"),
+        )
+        .is_err(),
+        "an equivalent target through an undeclared alias must not gain authority"
+    );
+
+    let manifest = capture_provider_semantic_inputs_at_coordinates(
+        &repository,
+        &BTreeSet::from([worktree_coordinate, common_coordinate]),
+        &BTreeSet::new(),
+        &ProviderFrameLimits::default(),
+    )
+    .expect("capture through canonical Git authority");
+    assert!(
+        provider_semantic_paths_are_current(
+            &repository,
+            &manifest,
+            &ProviderFrameLimits::default(),
+        )
+        .expect("re-observe the aliased linked-worktree controls"),
+        "the alias spelling and canonical Git location must identify one authority"
+    );
+}
+
 /// FALSIFIER: the per-worktree `commondir` file participates in locating every
 /// external Git root, even when the selected semantic input itself lives only
 /// in the per-worktree directory. Its exact bytes must therefore be captured
