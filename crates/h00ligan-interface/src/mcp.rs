@@ -466,16 +466,14 @@ enum ServeEvent {
 }
 
 async fn read_incoming_request<R>(
-    input: &mut R,
-    line: &mut String,
+    lines: &mut tokio::io::Lines<R>,
 ) -> Result<Option<IncomingRequest>, std::io::Error>
 where
     R: AsyncBufRead + Unpin,
 {
-    line.clear();
-    if input.read_line(line).await? == 0 {
+    let Some(line) = lines.next_line().await? else {
         return Ok(None);
-    }
+    };
     let request: JsonRpcRequest = match serde_json::from_str(line.trim()) {
         Ok(request) => request,
         Err(error) => {
@@ -543,9 +541,13 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    // `Lines::next_line` retains its partial buffer when the select below
+    // cancels a pending read because another request completes. Calling
+    // `AsyncBufReadExt::read_line` directly here can consume bytes and lose
+    // them at that exact concurrency boundary.
+    let mut lines = input.lines();
     let mut tasks = tokio::task::JoinSet::new();
     let mut completed = std::collections::BTreeMap::new();
-    let mut line = String::new();
     let mut input_closed = false;
     let mut next_sequence = 0_u64;
     let mut next_write = 0_u64;
@@ -568,14 +570,14 @@ where
                     .expect("an outstanding MCP response task must exist"),
             )
         } else if tasks.is_empty() {
-            ServeEvent::Input(read_incoming_request(input, &mut line).await?)
+            ServeEvent::Input(read_incoming_request(&mut lines).await?)
         } else {
             tokio::select! {
                 biased;
                 completed = tasks.join_next() => ServeEvent::Completed(
                     completed.expect("a tracked MCP response task must exist")
                 ),
-                incoming = read_incoming_request(input, &mut line) => {
+                incoming = read_incoming_request(&mut lines) => {
                     ServeEvent::Input(incoming?)
                 }
             }
@@ -1122,6 +1124,156 @@ mod tests {
             self.shutdowns
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    struct PartialReadDispatcher {
+        definitions: Vec<ToolDefinition>,
+        first_started: tokio::sync::Notify,
+        release_first: tokio::sync::Notify,
+    }
+
+    impl PartialReadDispatcher {
+        fn new() -> Self {
+            Self {
+                definitions: vec![ToolDefinition {
+                    name: "status".into(),
+                    description: "partial-read cancellation probe".into(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "gate": {"type": "boolean"},
+                            "marker": {"type": "string"}
+                        },
+                        "additionalProperties": false
+                    }),
+                    server_tool_type: None,
+                }],
+                first_started: tokio::sync::Notify::new(),
+                release_first: tokio::sync::Notify::new(),
+            }
+        }
+
+        async fn wait_for_first(&self) {
+            self.first_started.notified().await;
+        }
+
+        fn release_first(&self) {
+            self.release_first.notify_one();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl McpToolDispatcher for PartialReadDispatcher {
+        fn definitions(&self) -> &[ToolDefinition] {
+            &self.definitions
+        }
+
+        async fn execute(
+            &self,
+            _name: &str,
+            input: serde_json::Value,
+        ) -> Result<serde_json::Value, ToolError> {
+            if input.get("gate").and_then(serde_json::Value::as_bool) == Some(true) {
+                self.first_started.notify_one();
+                self.release_first.notified().await;
+            }
+            Ok(serde_json::json!({"complete": true}))
+        }
+    }
+
+    /// FALSIFIER: completing one dispatched request must not cancel and lose a
+    /// partially buffered successor request. The production stdio loop reads
+    /// while work is in flight, so this exact boundary must be cancellation
+    /// safe rather than merely likely to receive whole lines in one poll.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stdio_preserves_a_partial_request_across_concurrent_completion() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+        let dispatcher = std::sync::Arc::new(PartialReadDispatcher::new());
+        let (server_stream, client_stream) = tokio::io::duplex(64);
+        let (server_read, server_write) = tokio::io::split(server_stream);
+        let (client_read, mut client_write) = tokio::io::split(client_stream);
+        let server_dispatcher: std::sync::Arc<dyn McpToolDispatcher> = dispatcher.clone();
+        let server = serve(
+            tokio::io::BufReader::new(server_read),
+            server_write,
+            server_dispatcher,
+            McpServerIdentity::new("partial-read-probe", "0.0.0"),
+        );
+        let client_dispatcher = dispatcher.clone();
+        let client = async move {
+            let first = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "status", "arguments": {"gate": true}}
+            });
+            client_write
+                .write_all(format!("{first}\n").as_bytes())
+                .await
+                .expect("write gated first request");
+            client_dispatcher.wait_for_first().await;
+
+            let second = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "status",
+                    "arguments": {"marker": "x".repeat(4_096)}
+                }
+            })
+            .to_string();
+            client_write
+                .write_all(second.as_bytes())
+                .await
+                .expect("write a request body larger than the transport buffer");
+
+            client_dispatcher.release_first();
+            let mut client_read = tokio::io::BufReader::new(client_read);
+            let mut output = String::new();
+            client_read
+                .read_line(&mut output)
+                .await
+                .expect("read the first response after cancelling the partial read");
+            client_write
+                .write_all(b"\n")
+                .await
+                .expect("terminate the partially buffered request");
+            client_write.shutdown().await.expect("close MCP input");
+
+            let mut remainder = String::new();
+            client_read
+                .read_to_string(&mut remainder)
+                .await
+                .expect("read MCP responses");
+            output.push_str(&remainder);
+            output.into_bytes()
+        };
+        let (server_result, output) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::join!(server, client)
+            })
+            .await
+            .expect("partial request lifecycle did not terminate");
+        server_result.expect("serve partial request lifecycle");
+
+        let responses = String::from_utf8(output)
+            .expect("UTF-8 MCP output")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("MCP response"))
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2, "positive response-population control");
+        assert_eq!(responses[0]["id"], 1, "first request control");
+        assert_eq!(
+            responses[1]["id"], 2,
+            "the successor request must survive cancellation of its pending read: {responses:?}"
+        );
+        assert!(
+            responses
+                .iter()
+                .all(|response| response.get("error").is_none())
+        );
     }
 
     /// FALSIFIER: one MCP connection must be able to execute independent tool
