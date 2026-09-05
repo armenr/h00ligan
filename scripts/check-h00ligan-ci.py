@@ -364,9 +364,14 @@ BUILD_AUTHORITY_REQUIRED_FRAGMENTS = (
 )
 
 DISTRIBUTION_REQUIRED_FRAGMENTS = (
-    "if: matrix.platform == 'macos-amd64'",
-    "cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1 (checked 2026-09-05)",
-    "skip-nix-installation: ${{ matrix.platform == 'macos-amd64' }}",
+    "if: startsWith(matrix.platform, 'linux-')",
+    "Prepare native macOS product environment",
+    "if: startsWith(matrix.platform, 'macos-')",
+    'exec shasum -a 256 "$@"',
+    'echo "DEVBOX_PACKAGES_DIR=$native_root/packages" >> "$GITHUB_ENV"',
+    "run_product python3",
+    "details=\"$(run_product scripts/build-h00ligan-portable.sh",
+    "run_product scripts/test-h00ligan-installed-product.sh",
     "Check out the exact distribution tooling",
     "ref: ${{ github.workflow_sha }}",
     "path: target/release-tooling",
@@ -385,7 +390,14 @@ DISTRIBUTION_REQUIRED_FRAGMENTS = (
     "cargo fetch --locked",
 )
 
+DISTRIBUTION_REQUIRED_FRAGMENT_COUNTS = (
+    ("run_product()", 3),
+    ('if [[ "$PLATFORM" == macos-* ]]; then', 3),
+    ("PLATFORM: ${{ matrix.platform }}", 4),
+)
+
 DISTRIBUTION_FORBIDDEN_FRAGMENTS = (
+    "cachix/install-nix-action@",
     "-p h00ligan --bin h00ligan",
     "h00ligan_bin.cdx.json",
 )
@@ -854,6 +866,12 @@ def validate_distribution_workflow(workflow: str) -> list[str]:
         for fragment in DISTRIBUTION_REQUIRED_FRAGMENTS
         if fragment not in workflow
     ]
+    failures.extend(
+        f"distribution workflow has {workflow.count(fragment)} of required {count} "
+        f"exact-product boundaries {fragment!r}"
+        for fragment, count in DISTRIBUTION_REQUIRED_FRAGMENT_COUNTS
+        if workflow.count(fragment) != count
+    )
     failures.extend(
         f"distribution workflow retains provider-less build {fragment!r}"
         for fragment in DISTRIBUTION_FORBIDDEN_FRAGMENTS
@@ -1376,7 +1394,14 @@ def self_test() -> int:
                 f"performance-wrapper omission did not fire for {fragment!r}"
             )
 
-    valid_distribution = "\n".join(DISTRIBUTION_REQUIRED_FRAGMENTS)
+    valid_distribution = "\n".join(
+        DISTRIBUTION_REQUIRED_FRAGMENTS
+        + tuple(
+            fragment
+            for fragment, count in DISTRIBUTION_REQUIRED_FRAGMENT_COUNTS
+            for _ in range(count)
+        )
+    )
     if failures := validate_distribution_workflow(valid_distribution):
         raise AssertionError(f"valid distribution workflow rejected: {failures!r}")
     for fragment in DISTRIBUTION_REQUIRED_FRAGMENTS:
@@ -1384,6 +1409,12 @@ def self_test() -> int:
         if not validate_distribution_workflow(sabotaged):
             raise AssertionError(
                 f"distribution omission did not fire for {fragment!r}"
+            )
+    for fragment, _count in DISTRIBUTION_REQUIRED_FRAGMENT_COUNTS:
+        sabotaged = valid_distribution.replace(fragment, "", 1)
+        if not validate_distribution_workflow(sabotaged):
+            raise AssertionError(
+                f"distribution population omission did not fire for {fragment!r}"
             )
     for fragment in DISTRIBUTION_FORBIDDEN_FRAGMENTS:
         invalid_distribution = valid_distribution + "\n" + fragment
@@ -1504,6 +1535,7 @@ dependencies = [
         + len(PERFORMANCE_HARNESS_FORBIDDEN_FRAGMENTS)
         + len(PERFORMANCE_WRAPPER_REQUIRED_FRAGMENTS)
         + len(DISTRIBUTION_REQUIRED_FRAGMENTS)
+        + len(DISTRIBUTION_REQUIRED_FRAGMENT_COUNTS)
         + len(DISTRIBUTION_FORBIDDEN_FRAGMENTS)
         + len(integration_sabotages)
         + len(test_profile_sabotages)
