@@ -1,6 +1,6 @@
 # Publication and authority
 
-Last verified: 2026-08-28
+Last verified: 2026-09-05
 
 ## Immutable bundle model
 
@@ -48,6 +48,8 @@ h00ligan keeps these dimensions separate:
 - **structural authority** — registered source was parsed and joined into the structural graph;
 - **Calls authority** — compiler-backed coverage is complete, qualified, partial, or unavailable
   per language and project unit;
+- **classification authority** — language-owned reachability evidence exists for the selected
+  population; complete Calls alone does not supply it (Python/TypeScript lack it in 0.3.0);
 - **source authority** — selected indexed bytes and spans match their recorded source evidence;
 - **live freshness** — current repository inputs are fresh, stale, or unknown relative to the
   immutable generation.
@@ -66,6 +68,7 @@ evidence while preventing it from masquerading as current source.
 current registered-language bytes and attaches a graph symbol only when the whole-file content
 hash still matches the generation. `read` and `inspect` refuse materialization when the selected
 file's bytes have changed because returning a stale span as current source would be false.
+For `inspect`, this can be a withheld source facet rather than rejection of the entire dossier.
 
 ## WATCH and recovery
 
@@ -73,6 +76,11 @@ WATCH coalesces relevant source, configuration, and toolchain events into superv
 It may supersede obsolete work, but readers keep using the last valid generation until one
 complete replacement is published. Terminal operation receipts distinguish success, failure,
 cancellation, and supersession.
+
+With semantic WATCH and explicit capability-downgrade permission, current structure can be
+published first and semantics enriched afterward. These are separate complete generations with
+different capability evidence. Strict complete-Calls mode remains atomic; a structural-stage
+receipt is not a successful semantic terminal. The default debounce is not an end-to-end SLO.
 
 Publication recovery is explicit. It may replace damaged or conflicting state only through the
 same repository-binding and immutable-publication checks; ordinary reads never infer ownership

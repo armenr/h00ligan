@@ -6,8 +6,10 @@ and WATCH refreshes for Rust, Go, Python, and TypeScript/JavaScript.
 
 ## Start here
 
-Read the root `README.md`, then `crates/h00ligan/README.md` for the current CLI, MCP,
-provider, authority, and packaging contracts. Route current product judgment through
+Read the root `README.md`, then `docs/agent-integration.md` for productive tool use and
+`docs/reference.md` for shared CLI/MCP semantics. `docs/getting-started.md` and `docs/mcp.md`
+cover setup; `docs/languages.md` states the depth limits. The compact
+`crates/h00ligan/README.md` also ships in release archives. Route current product judgment through
 `docs/project/status.md`, `docs/project/work-plan.md`, and the relevant `docs/architecture/`
 page. Read only the source and documentation needed for the active task; historical prose is
 context, not authority over live behavior.
@@ -24,14 +26,17 @@ evidence, independently verified tests, then documentation and history—in that
   structured envelope, but authority, freshness, ambiguity, and refusal behavior must agree.
 - Structural evidence and compiler-backed Calls evidence are distinct. Never turn partial,
   qualified, unavailable, stale, or unknown authority into a confident negative answer.
+- Complete Calls does not imply reachability classification support. Python/TypeScript/JavaScript
+  classification is not implemented in 0.3.0; retain that limitation in dead-code/risk conclusions.
 - Published generations are immutable and repository-bound. WATCH and reindex publish a
   complete replacement or retain the last good generation; they never expose a partial graph.
 - MCP is bound to one repository for its process lifetime. Reindex operations are asynchronous,
   exact-ID controlled, cancellation-safe, and terminal-receipt backed.
 - Compiler-specific behavior stays explicit behind language-neutral lifecycle contracts. Do
   not force Rust, Go, Python, and TypeScript into a lowest-common-denominator abstraction.
-- Distribution targets are native Linux AMD64/ARM64 and macOS Intel/Apple Silicon artifacts.
-  Host-development binaries are not evidence that the portable product works.
+- Released 0.3.0 targets are native Linux AMD64/ARM64 and Apple Silicon. Intel Mac is parked;
+  the existing four-target workflow still needs policy reconciliation. Host-development binaries
+  are not evidence that the portable product works.
 
 ## Working rules
 

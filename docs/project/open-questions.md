@@ -1,6 +1,6 @@
 # Open questions
 
-Last reconciled: 2026-08-28
+Last reconciled: 2026-09-05
 
 Only unresolved product choices belong here. Implemented behavior is documented in the
 architecture pages and verified by source and executable gates.
@@ -21,6 +21,16 @@ notarized release lane. No persistent service, login item, or elevated installat
 introduced merely to satisfy this decision.
 
 ## Semantic authority breadth
+
+### Python/TypeScript entry roots and reachability
+
+The 0.3.0 documentation tour proves complete Python Calls and useful test paths
+without dead-code availability. The current reachability owner admits Rust/Go only.
+Which language-owned roots, externally callable APIs, and dynamic execution exclusions
+should govern Python/TypeScript classification? Implement the owning policy with
+standalone and mixed-language falsifiers; do not equate complete Calls with that policy.
+This correctness work is sequenced in the [work plan](work-plan.md), not a reason to
+hide already-useful caller queries or repeat an unchanged index.
 
 ### Managed compiler toolchains
 

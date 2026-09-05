@@ -66,11 +66,11 @@ transcripts, session identities, and machine-local agent state are excluded.
 
 ## Cutover boundary
 
-The clean-import strategy is ratified, but no commit, standalone remote, release lineage,
-publication, parent-removal operation, or source-of-record cutover is implied by this document.
-Those outward or destructive steps require explicit operator checkpoints after the exact final
-candidate, manifests, and local repository state are verified.
+The preceding inventory and strategy record the pre-cutover extraction stage.
+By 2026-09-05, the authorized standalone import, remote, source-of-record cutover,
+and 0.3.0 release are complete; see [current status](../project/status.md).
+The historical candidate counts above are not counts of the evolving repository.
 
-Until cutover, h00.sh remains the working source of record. After cutover, h00.sh removal or
-archival is a separate decision; the standalone repository must not be maintained by dual-writing
-two evolving implementations.
+h00ligan now evolves in its standalone repository. Removing or archiving the
+incubator's old product files remains a separate decision; do not maintain two
+evolving implementations or disturb unrelated h00.sh work.
