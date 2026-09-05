@@ -35,7 +35,7 @@ The shared coordinator owns:
 
 - typed request/terminal framing and size limits;
 - process startup, health, cancellation, quarantine, and cleanup;
-- bounded parallelism across execution roots;
+- a concurrency limit across execution roots;
 - exact source-population and structural joins;
 - canonical relationship normalization;
 - common terminal identity and freshness checks.
@@ -57,7 +57,7 @@ lifecycles, and pretending otherwise would hide authority gaps.
 | Language | Installed execution | Ambient requirement |
 | --- | --- | --- |
 | Rust | Hidden same-executable provider entrypoint | Compatible repository Cargo/Rust toolchain for semantic Calls |
-| Go | Content-verified private provider embedded and materialized beneath the selected data directory | None for the installed-product provider path |
+| Go | Content-verified private provider embedded and materialized beneath the selected data directory | Compatible repository Go toolchain for semantic Calls |
 | Python | Content-verified private provider embedded and materialized beneath the selected data directory | None for the installed-product provider path |
 | TypeScript/JavaScript | Content-verified private provider embedded and materialized beneath the selected data directory | None for the installed-product provider path |
 
@@ -67,10 +67,10 @@ source trees, patches, lockfiles, and transforming scripts are bound into build 
 ## WATCH and invalidation
 
 Source, project configuration, execution-root membership, provider build, and resolved toolchain
-identity are semantic inputs. A relevant change invalidates the affected certification. WATCH may
-publish current structural truth while semantic work proceeds, but Calls authority remains
-qualified until the provider result for the new epoch is admitted and a complete generation is
-published.
+identity are semantic inputs. A relevant change invalidates the affected certification. With
+explicit capability-downgrade permission, semantic WATCH may publish current structural truth
+before semantic enrichment. That publication does not claim complete Calls; a later semantic
+generation must be admitted separately. Strict complete-Calls mode remains atomic.
 
 If inputs change during a provider operation, the terminal is discarded. Cancellation,
 supersession, provider exit, malformed framing, identity drift, or incomplete persistence cannot
@@ -79,7 +79,7 @@ stably absent.
 
 ## Performance boundary
 
-Provider roots may run concurrently under a bounded CPU-aware limit. Persistent sessions and
+Provider roots may run concurrently up to a CPU-aware limit. Persistent sessions and
 affected-document refresh avoid unnecessary cold compiler loads, but exact terminal validation is
 never skipped for speed. Current profiling identifies cold provider work and broad refresh scope
 as major remaining latency targets.

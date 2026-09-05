@@ -108,7 +108,7 @@ For a server rooted at `examples/quickstart`, call these in order:
 
 These match the [CLI tour](getting-started.md#try-the-guided-tour). A real
 project will have different names; use `find` output, not invented IDs.
-`inspect` combines a bounded dossier; `assess` asks about change impact.
+`inspect` combines a concise dossier; `assess` asks about change impact.
 Use [the shared reference](reference.md) for all tools, defaults, and paging.
 
 ## Keep the index current

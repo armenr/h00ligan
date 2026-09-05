@@ -2,7 +2,7 @@
 
 Last reconciled: 2026-08-30
 
-This page records bounded review outcomes, not raw reviewer prose and not product authority. Live
+This page summarizes review outcomes, not raw reviewer prose and not product authority. Live
 source, executable controls, and accepted receipts outrank every historical review.
 
 ## Review method
@@ -17,7 +17,7 @@ Design observations are adjudicated as `reshape now`, `accept then refactor`, `n
 evidenced`, or `speculative`. Architectural preference does not become a correctness blocker
 without a concrete failure path.
 
-External reviews receive a bounded named source tranche and prompt. They are read-only. Findings
+External reviews receive a specifically identified source selection and prompt. They are read-only. Findings
 must be reproduced against the current tree; severity labels from a reviewer are not accepted
 without independent classification.
 
@@ -86,5 +86,5 @@ complete installed-product gate, sealing, replay, and exact-source audit. A late
 WATCH falsifier exposed an invalid `token.FileSet` pointer-identity assumption; the provider now
 builds and validates one exact non-overlapping file-set union for SSA, and the regression plus its
 restart companion pass. This source delta and the clean-import documentation reconciliation have
-not been sent externally. Any further external send requires a new bounded packet and operator
+not been sent externally. Any further external send requires a new explicitly scoped packet and operator
 authorization.

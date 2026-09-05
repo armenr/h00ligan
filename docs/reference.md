@@ -11,18 +11,18 @@ the exhaustive argument schema of your installed build.
 | Question | CLI | MCP | What the answer means |
 | --- | --- | --- | --- |
 | What can I trust right now? | `status` | `status` | Publication, freshness, capability coverage, classification, and remedies. |
-| What is this repository made of? | `overview` | `overview` | Project units, topology, bounded previews, and qualified health. |
+| What is this repository made of? | `overview` | `overview` | Project units, topology, previews, and qualified health. |
 | Where is this definition? | `find QUERY` | `find` | Matching names/paths, kinds, and exact symbol selectors. |
 | What defines this type? | `type SYMBOL` | `type` | Structural members, methods, and represented relationships. |
 | Show me its source. | `read SYMBOL` | `read` | A paged source slice whose file still matches the indexed bytes. |
 | Who calls this? | `calls SYMBOL` | `calls` | Incoming, provider-evidenced source invocations—not outgoing callees. |
 | What could this change affect? | `assess SYMBOL` | `assess` | Transitive impact/blast radius, callers, tests, and qualified risk. |
-| Give me the useful context together. | `inspect SYMBOL` | `inspect` | A bounded dossier of source, structure, callers, tests, and warnings. |
+| Give me the useful context together. | `inspect SYMBOL` | `inspect` | A concise dossier of source, structure, callers, tests, and warnings. |
 | What tests could exercise this? | `tests SYMBOL` | `tests` | Runnable test entries connected through evidenced call paths; no test execution. |
 | What code deserves a dead-code review? | `dead [SYMBOL]` | `dead_code` | Qualified candidates or a single verdict, when reachability evidence exists. |
 | Where is coupling concentrated? | `audit` | `audit` | Ranked incoming coupling and qualified per-unit dead-code health, not complexity. |
 | What crosses this file/directory boundary? | `deps PATH` | `deps` | Direct dependencies and dependents, not transitive blast radius. |
-| Where does this text occur now? | `grep-context PATTERN` | `grep_context` | Bounded live registered-source search with qualified symbol context. |
+| Where does this text occur now? | `grep-context PATTERN` | `grep_context` | Live registered-source search with a match limit and qualified symbol context. |
 | What changed since indexing? | `diff [PATH]` | `diff` | Live structural changes against the indexed generation, not Git history. |
 | Build or refresh the index. | `index` | `reindex` | Structural by default; explicit `--scip` / `scip:true` requests semantics. |
 | Observe that refresh. | Foreground progress | `reindex_status` | Exact operation progress and terminal receipt. |
@@ -87,7 +87,7 @@ report; `dead SYMBOL` selects a single verdict.
 | `calls`, `type`, `tests`, `deps`, full `dead`, `assess` impact | 50 items | 100 | `page.next_cursor` |
 | `read` | 8,000 Unicode characters | 20,000 | `page.next_cursor` |
 | `overview` | 50 rows per preview | 100 | No cursor; use the dedicated query for detail. |
-| `inspect` | Bounded facet previews | Product-bounded | No top-level limit/cursor; use dedicated queries. |
+| `inspect` | Facet previews | Serialized result size limit | No top-level limit/cursor; use dedicated queries. |
 | `diff`, `grep-context` | 50 items | 100 | No cursor; narrow the path/pattern if truncated. |
 
 For pageable results, `page.returned` is this page, `page.total_items` is the

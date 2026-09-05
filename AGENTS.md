@@ -22,7 +22,7 @@ evidence, independently verified tests, then documentation and history—in that
 - The shipped product remains one executable. Private provider artifacts may be embedded
   and materialized beneath the selected data directory; users must not install a companion
   h00ligan service or helper product.
-- CLI and MCP expose the same query semantics. Human rendering may differ from MCP's bounded
+- CLI and MCP expose the same query semantics. Human rendering may differ from MCP's
   structured envelope, but authority, freshness, ambiguity, and refusal behavior must agree.
 - Structural evidence and compiler-backed Calls evidence are distinct. Never turn partial,
   qualified, unavailable, stale, or unknown authority into a confident negative answer.

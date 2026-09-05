@@ -18,7 +18,7 @@ transfer, or Git-cutover program. Preserve the incubator's unrelated work.
 - One getting-started guide with install/prerequisites and a runnable tour.
 - Human CLI investigations; host-neutral MCP setup and exact operation lifecycle.
 - A shared verb/argument/result reference, not two competing semantics guides.
-- Copyable agent guidance for selection, bounded reading, evidence, and refresh.
+- Copyable agent guidance for selection, focused reading, evidence, and refresh.
 - Honest language depth and troubleshooting, including Python/TypeScript
   classification being unavailable despite complete Calls.
 - Released-binary examples, CLI/MCP parity, WATCH, links, and documentation contracts.

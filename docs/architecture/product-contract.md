@@ -7,7 +7,7 @@ Last verified: 2026-09-05 (released 0.3.0)
 The shipped product is one `h00ligan` executable:
 
 - CLI: human text by default, typed query results with `--format json`.
-- MCP: bounded tools over stdio, one repository/data binding per process.
+- MCP: tools over stdio, one repository/data binding per process.
 - WATCH: source/configuration/toolchain observation and immutable publication.
 
 The executable crate owns assembly and CLI rendering. `h00ligan-engine`
@@ -23,7 +23,7 @@ indexing owns the operation until it ends. `dead` / `dead_code` and
 `grep-context` / `grep_context` are spelling differences.
 
 `calls` is incoming explicit source invocations, not outgoing callees.
-`assess` is bounded transitive impact; `deps` is a direct boundary view.
+`assess` is transitive impact with an explicit depth limit; `deps` is a direct boundary view.
 `tests` identifies runnable test entries through evidenced paths, not
 runtime coverage. `audit` ranks observed coupling, not cyclomatic complexity.
 Source editing, `init`, `replace_symbol`, and `match` are not shipped.

@@ -59,7 +59,7 @@ occurrences but must be reacquired after the generation changes.
 | Question | Verb |
 | --- | --- |
 | Find a definition / read it / inspect its type | `find`, `read`, `type` |
-| Show a bounded dossier | `inspect` |
+| Show a concise dossier | `inspect` |
 | Who calls it? What could a change affect? | `calls`, `assess` |
 | Which tests could exercise it? | `tests` (does not run tests) |
 | What dependencies cross a file/directory? | `deps` |
@@ -129,7 +129,7 @@ not a guarantee about all runtime behavior or every build variant.
 
 On pageable verbs follow `page.next_cursor` with unchanged arguments. Most
 limits are 1–100 items; `read` is 1–20,000 Unicode characters, default 8,000.
-`inspect`/`overview` use bounded previews; `diff`/`grep-context` have
+`inspect`/`overview` use previews; `diff`/`grep-context` have
 no cursor and may require narrower scopes. Don't combine generations.
 
 Schema identifiers retain historical names, not runtime dependencies:

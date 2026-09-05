@@ -18,7 +18,7 @@ Suppose you need to change a function without missing a caller or a test:
    use the existing watcher. Wait for the exact terminal outcome.
 2. **Resolve the name.** `find` a definition; retain its file and
    `symbol_id`. Resolve ambiguity before using another symbol verb.
-3. **Read just enough.** `inspect` gives a bounded dossier; `read` supplies
+3. **Read just enough.** `inspect` gives a concise dossier; `read` supplies
    exact source and `type` describes members. Request selected sections when
    a full dossier would add noise.
 4. **Trace the relevant edges.** `calls` finds incoming callers; `assess`

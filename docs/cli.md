@@ -17,7 +17,7 @@ h00ligan --root examples/quickstart inspect greeting --file app.py
 ```
 
 `find` resolves identity; `read` returns source; `type` lists structural members;
-`inspect` combines source, structure, callers, tests, and warnings into a bounded
+`inspect` combines source, structure, callers, tests, and warnings into a concise
 dossier. A missing facet does not necessarily make the other facets unusable.
 
 Use `--sections source,callers,tests` with `inspect` to request only those facets.

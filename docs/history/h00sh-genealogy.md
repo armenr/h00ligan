@@ -39,7 +39,7 @@ roughly 290 commits with mixed h00/Engram ownership, while current bytes for 101
 inputs are not represented by parent HEAD. A filtered graph would therefore carry unrelated
 history and still fail to explain much of the product that was actually accepted.
 
-Useful genealogy instead lives in this bounded document and an ignored, hash-addressed migration
+Useful genealogy instead lives in this summary and an ignored, hash-addressed migration
 archive containing source/reconciliation/assembly/acceptance receipts plus selected context and
 review evidence. A mechanically filtered incubator bundle or non-default private ref may be
 retained later for forensic browsing. It is not a parent of `main`, a release ref, or a development

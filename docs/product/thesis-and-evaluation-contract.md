@@ -6,7 +6,7 @@ Last verified: 2026-08-28
 
 h00ligan is a local code-intelligence engine for humans and coding agents. It turns a repository
 into an immutable, queryable model and exposes that model through one portable executable: a
-human-oriented CLI, a bounded MCP server, and a WATCH lifecycle that publishes complete
+human-oriented CLI, an MCP server, and a WATCH lifecycle that publishes complete
 replacement generations.
 
 Its differentiation is not that graphs, parsers, or compiler indexes are novel. The product bet
@@ -19,7 +19,7 @@ The primary workflow is:
 > Can I safely change or delete this code, what might it affect, and exactly what evidence supports
 > that conclusion?
 
-Orientation, symbol lookup, dependency inspection, bounded source search, test discovery, and
+Orientation, symbol lookup, dependency inspection, focused source search, test discovery, and
 coupling analysis are supporting workflows around that core question.
 
 ## Product contract
