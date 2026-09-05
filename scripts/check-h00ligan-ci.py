@@ -364,6 +364,15 @@ BUILD_AUTHORITY_REQUIRED_FRAGMENTS = (
 )
 
 DISTRIBUTION_REQUIRED_FRAGMENTS = (
+    "if: matrix.platform == 'macos-amd64'",
+    "cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1 (checked 2026-09-05)",
+    "skip-nix-installation: ${{ matrix.platform == 'macos-amd64' }}",
+    "Check out the exact distribution tooling",
+    "ref: ${{ github.workflow_sha }}",
+    "path: target/release-tooling",
+    '"$GITHUB_WORKSPACE/target/release-tooling/scripts/fetch-h00ligan-release-cargo.py"',
+    '--source-root "$GITHUB_WORKSPACE"',
+    '--rust-source "$H00_RUST_SOURCE_DIR"',
     "scripts/build-h00ligan-portable.sh",
     "scripts/test-h00ligan-installed-product.sh",
     "target/upstream-rust-1.97.1",
