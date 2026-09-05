@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -35,11 +36,39 @@ def replace_refs(value: Any, replacements: dict[str, str]) -> Any:
     return value
 
 
-def normalize_document(document: dict[str, Any], workspace_root: Path) -> dict[str, Any]:
-    workspace_file_uri = workspace_root.resolve().as_uri()
-    workspace_ref_prefix = f"path+{workspace_file_uri}/"
+def iter_components(component: Any):
+    if isinstance(component, dict):
+        yield component
+        for child in component.get("components", []):
+            yield from iter_components(child)
+
+
+def normalize_document(
+    document: dict[str, Any],
+    workspace_root: Path,
+    source_roots: dict[str, Path] | None = None,
+) -> dict[str, Any]:
+    roots = {"": workspace_root.resolve().as_uri()}
+    for label, path in (source_roots or {}).items():
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", label):
+            raise NormalizationError("additional source roots require a stable single-segment label")
+        uri = path.resolve().as_uri()
+        if any(
+            uri == other or uri.startswith(other + "/") or other.startswith(uri + "/")
+            for other in roots.values()
+        ):
+            raise NormalizationError("source roots overlap or repeat")
+        roots[label] = uri
     metadata_component = document.get("metadata", {}).get("component")
-    candidates = [metadata_component, *document.get("components", [])]
+    metadata_source = (
+        metadata_component.get("bom-ref", "").rpartition("#")[0]
+        if isinstance(metadata_component, dict) else ""
+    )
+    candidates = [
+        nested
+        for component in [metadata_component, *document.get("components", [])]
+        for nested in iter_components(component)
+    ]
     replacements: dict[str, str] = {}
     source_paths: dict[str, str] = {}
 
@@ -47,8 +76,16 @@ def normalize_document(document: dict[str, Any], workspace_root: Path) -> dict[s
         if not isinstance(component, dict):
             continue
         bom_ref = component.get("bom-ref")
-        if not isinstance(bom_ref, str) or not bom_ref.startswith(workspace_ref_prefix):
+        if not isinstance(bom_ref, str):
             continue
+        matched = [
+            (label, uri) for label, uri in roots.items()
+            if bom_ref.startswith(f"path+{uri}/")
+        ]
+        if not matched:
+            continue
+        label, source_uri = matched[0]
+        workspace_ref_prefix = f"path+{source_uri}/"
         source_and_version = bom_ref.removeprefix(workspace_ref_prefix)
         source_path, separator, _version = source_and_version.rpartition("#")
         if (
@@ -69,18 +106,21 @@ def normalize_document(document: dict[str, Any], workspace_root: Path) -> dict[s
         canonical_purl, query_separator, qualifiers = purl_without_subpath.partition("?")
         if subpath_separator:
             canonical_purl = f"{canonical_purl}#{subpath}"
-        expected_qualifiers = f"download_url={workspace_file_uri}/{source_path}"
+        expected_qualifiers = f"download_url={source_uri}/{source_path}"
         root_qualifiers = "download_url=file://."
         if not query_separator or (
             qualifiers != expected_qualifiers
-            and not (component is metadata_component and qualifiers == root_qualifiers)
+            and not (
+                bom_ref.rpartition("#")[0] == metadata_source
+                and qualifiers == root_qualifiers
+            )
         ):
             raise NormalizationError(
                 f"workspace component {component.get('name')!r} has an unexpected source URL"
             )
         if canonical_purl in source_paths:
             raise NormalizationError("workspace component purls are not unique")
-        source_paths[canonical_purl] = source_path
+        source_paths[canonical_purl] = f"{label}/{source_path}" if label else source_path
         replacements[bom_ref] = canonical_purl
         replacements[purl] = canonical_purl
 
@@ -89,8 +129,12 @@ def normalize_document(document: dict[str, Any], workspace_root: Path) -> dict[s
 
     normalized = replace_refs(document, replacements)
     normalized_components = [
-        normalized.get("metadata", {}).get("component"),
-        *normalized.get("components", []),
+        nested
+        for component in [
+            normalized.get("metadata", {}).get("component"),
+            *normalized.get("components", []),
+        ]
+        for nested in iter_components(component)
     ]
     for component in normalized_components:
         if not isinstance(component, dict):
@@ -116,7 +160,8 @@ def normalize_document(document: dict[str, Any], workspace_root: Path) -> dict[s
         )
 
     remaining_workspace_refs = [
-        value for value in iter_strings(normalized) if workspace_file_uri in value
+        value for value in iter_strings(normalized)
+        if any(uri in value for uri in roots.values())
     ]
     if remaining_workspace_refs:
         raise NormalizationError(
@@ -202,6 +247,60 @@ def self_test() -> None:
     }
     assert not any("file:///" in value for value in iter_strings(normalized))
 
+    # cargo-cyclonedx --describe crate nests the executable under its Cargo
+    # package. That target is still a local component, not an opaque payload.
+    nested = json.loads(json.dumps(fixture))
+    nested_target = {
+        "name": "h00ligan-cli",
+        "bom-ref": f"{local_root} bin-target-0",
+        "purl": "pkg:cargo/h00ligan@0.2.0?download_url=file://.#src/bin/cli.rs",
+    }
+    nested["metadata"]["component"]["components"] = [nested_target]
+    normalized_nested = normalize_document(nested, root)
+    assert normalized_nested["metadata"]["component"]["components"][0]["bom-ref"] == (
+        "pkg:cargo/h00ligan@0.2.0#src/bin/cli.rs"
+    )
+    assert not any("file:///" in value for value in iter_strings(normalized_nested))
+
+    provider_root = root.parent / "rust-analyzer-source"
+    provider_uri = provider_root.resolve().as_uri()
+    provider_ref = f"path+{provider_uri}/crates/hir#0.0.0"
+    multi_root = json.loads(json.dumps(nested))
+    multi_root["components"].append({
+        "name": "hir", "bom-ref": provider_ref,
+        "purl": f"pkg:cargo/hir@0.0.0?download_url={provider_uri}/crates/hir",
+    })
+    multi_root["dependencies"][0]["dependsOn"].append(provider_ref)
+    multi_root["dependencies"].append({"ref": provider_ref, "dependsOn": []})
+    normalized_multi = normalize_document(multi_root, root, {"rust-analyzer": provider_root})
+    assert normalized_multi["components"][-1]["properties"][-1] == {
+        "name": "h00ligan:source:relative-path", "value": "rust-analyzer/crates/hir",
+    }
+    assert normalized_multi["dependencies"][0]["dependsOn"][-1] == "pkg:cargo/hir@0.0.0"
+    assert not any("file:///" in value for value in iter_strings(normalized_multi))
+    for roots, expected in (
+        ({}, "absolute file URI"),
+        ({"rust-analyzer": root}, "overlap or repeat"),
+        ({"rust-analyzer": root / "nested"}, "overlap or repeat"),
+        ({"../escape": provider_root}, "single-segment label"),
+    ):
+        try:
+            normalize_document(multi_root, root, roots)
+        except NormalizationError as error:
+            assert expected in str(error), str(error)
+        else:
+            raise AssertionError(f"source-root canary did not fire: {expected}")
+
+    # Identical source graphs in independently named staging directories must
+    # normalize byte-for-byte, including their provenance properties.
+    relocated_text = json.dumps(multi_root).replace(
+        root.resolve().as_uri(), root.with_name("other-product").as_uri()
+    ).replace(provider_uri, provider_root.with_name("other-provider").as_uri())
+    assert normalize_document(
+        json.loads(relocated_text), root.with_name("other-product"),
+        {"rust-analyzer": provider_root.with_name("other-provider")},
+    ) == normalized_multi
+
     broken = json.loads(json.dumps(fixture))
     del broken["components"][0]["purl"]
     try:
@@ -245,6 +344,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sbom", type=Path)
     parser.add_argument("--workspace-root", type=Path)
+    parser.add_argument("--source-root", action="append", default=[], metavar="LABEL=PATH")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
@@ -256,8 +356,14 @@ def main() -> int:
         parser.error("--sbom and --workspace-root are required unless --self-test is used")
 
     try:
+        source_roots = {}
+        for entry in args.source_root:
+            label, separator, value = entry.partition("=")
+            if not separator or not value or label in source_roots:
+                raise NormalizationError("source roots require unique LABEL=PATH entries")
+            source_roots[label] = Path(value)
         document = json.loads(args.sbom.read_text(encoding="utf-8"))
-        normalized = normalize_document(document, args.workspace_root)
+        normalized = normalize_document(document, args.workspace_root, source_roots)
     except (OSError, json.JSONDecodeError, NormalizationError) as error:
         print(f"h00ligan-sbom-normalizer: FAIL: {error}", file=sys.stderr)
         return 1
