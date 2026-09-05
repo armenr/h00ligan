@@ -383,6 +383,11 @@ cargo test --locked --offline -p h00ligan \
 
 cargo test --locked --offline -p h00ligan \
     --test installed_one_file_mcp \
+    installed_go_build_tags_select_test_documents_and_bind_generation_reuse -- \
+    --exact --ignored --nocapture --test-threads=1
+
+cargo test --locked --offline -p h00ligan \
+    --test installed_one_file_mcp \
     installed_one_file_cli_and_mcp_share_exact_semantic_authority -- \
     --exact --ignored --nocapture --test-threads=1
 

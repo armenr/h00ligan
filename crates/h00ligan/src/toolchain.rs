@@ -269,10 +269,10 @@ impl SystemToolchainResolver {
     ) -> Result<Self, ToolchainResolutionError> {
         let mut environment = capture_environment(environment)?;
         environment.insert("CARGO_TERM_COLOR".into(), "never".into());
-        // The product chooses one deterministic Go configuration instead of
-        // inheriting a mutable per-user GOENV file or allowing module writes.
+        // Explicit environment is captured once. Go build flags are admitted
+        // by the Go resolver, not overwritten here or imposed on other languages.
+        // Mutable per-user defaults and implicit compiler downloads remain off.
         environment.insert("GOENV".into(), "off".into());
-        environment.insert("GOFLAGS".into(), "-mod=readonly".into());
         environment.insert("GOTOOLCHAIN".into(), "local".into());
         let captured = CapturedSystemToolchain {
             environment,
@@ -632,7 +632,9 @@ impl CapturedSystemToolchain {
             path_text("go", &selection.goroot, "GOROOT", &selection.execution_root)?,
         );
         environment.insert("GOENV".into(), "off".into());
-        environment.insert("GOFLAGS".into(), "-mod=readonly".into());
+        let flags = crate::go_flags::resolve(environment.get("GOFLAGS").map(String::as_str))
+            .map_err(|detail| resolution_error("go", &selection.execution_root, detail))?;
+        environment.insert("GOFLAGS".into(), flags);
         environment.insert("GOTOOLCHAIN".into(), "local".into());
         environment.insert(
             "PATH".into(),
@@ -1065,8 +1067,8 @@ impl SystemToolchainPolicy for GoSystemToolchainPolicy {
 
     fn policy_id(&self) -> &'static str {
         match self.provider_authority {
-            GoProviderAuthority::SystemScip => "h00ligan/system-go-scip-toolchain/v2",
-            GoProviderAuthority::ProductEmbedded => "h00ligan/product-go-toolchain/v2",
+            GoProviderAuthority::SystemScip => "h00ligan/system-go-scip-toolchain/v3",
+            GoProviderAuthority::ProductEmbedded => "h00ligan/product-go-toolchain/v3",
         }
     }
 
@@ -1801,6 +1803,90 @@ mod tests {
             target_cc.to_str(),
             "the typed component and exact child environment must name one executable"
         );
+    }
+
+    /// The real product capture must retain the requested Go build tags, not
+    /// silently replace them with the module-write policy before resolution.
+    #[tokio::test]
+    async fn go_explicit_build_tags_survive_capture_and_resolution() {
+        let (temporary, root, _resolver) = go_fixture();
+        for authority in [
+            GoProviderAuthority::SystemScip,
+            GoProviderAuthority::ProductEmbedded,
+        ] {
+            let mut identities = Vec::new();
+            for flags in [
+                "-mod=readonly",
+                "-mod=readonly -tags=persistent_session_contract_red",
+            ] {
+                let resolver = SystemToolchainResolver::capture_with_go_provider_from(
+                    [
+                        (
+                            OsString::from("PATH"),
+                            temporary.path().join("bin").into_os_string(),
+                        ),
+                        (OsString::from("GOFLAGS"), OsString::from(flags)),
+                    ],
+                    authority,
+                )
+                .expect("capture product inputs");
+                let resolved = resolver
+                    .resolve("go", &root, &IndexCancellation::new())
+                    .await
+                    .expect("resolve the requested Go configuration");
+                assert!(
+                    resolved.components.contains_key("go"),
+                    "positive compiler control"
+                );
+                assert_eq!(
+                    resolved.environment.get("GOFLAGS").map(String::as_str),
+                    Some(flags),
+                    "captured build tags must reach the env-cleared provider unchanged"
+                );
+                identities.push(resolved.fingerprint_sha256().to_owned());
+            }
+            assert_ne!(
+                identities[0], identities[1],
+                "tag changes must invalidate semantic reuse"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_go_flags_are_go_local_and_cannot_become_default_authority() {
+        let (temporary, root, _) = go_fixture();
+        for flags in [
+            "-mod=mod",
+            "-overlay=untracked.json",
+            "-tags missing_equals",
+        ] {
+            let resolver = SystemToolchainResolver::capture_with_go_provider_from(
+                [
+                    (
+                        OsString::from("PATH"),
+                        temporary.path().join("bin").into_os_string(),
+                    ),
+                    (OsString::from("GOFLAGS"), OsString::from(flags)),
+                ],
+                GoProviderAuthority::ProductEmbedded,
+            )
+            .expect("Go configuration must not prevent product assembly");
+            let error = resolver
+                .resolve("go", &root, &IndexCancellation::new())
+                .await
+                .expect_err("unsupported Go selection must not silently index a default profile");
+            assert!(
+                matches!(error, ToolchainResolutionError::Resolution { language, .. } if language == "go")
+            );
+            for language in ["python", "typescript"] {
+                let managed = resolver
+                    .resolve(language, &root, &IndexCancellation::new())
+                    .await
+                    .expect("unrelated managed language remains available");
+                assert_eq!(managed.origin, ToolchainOrigin::Managed);
+                assert!(!managed.environment.contains_key("GOFLAGS"));
+            }
+        }
     }
 
     #[tokio::test]

@@ -1927,7 +1927,7 @@ pub fn rust_analyzer_available() -> bool {
 /// rooted at `root`, writing it to `output` (WU-0023 P3b Bundle-3).
 ///
 /// The Go analogue of [`generate_scip_index`]. This adapter currently indexes
-/// one deterministic default Go configuration (`GOFLAGS=-mod=readonly`). Go
+/// the exact Go configuration admitted by the toolchain resolver. Go
 /// build tags, GOOS, and GOARCH can select different source populations; when
 /// this provider omits an indexed source document, normalization retains the
 /// covered evidence and records the omitted file as an exact query-visible
@@ -1994,7 +1994,6 @@ pub fn generate_scip_go_index(
         .current_dir(root)
         .env_clear()
         .envs(toolchain.process_environment())
-        .env("GOFLAGS", "-mod=readonly")
         .env("GOCACHE", build_cache)
         .env("GOMODCACHE", module_cache);
     // Same generous-but-finite bound as the rust-analyzer index (a wedged
@@ -2027,6 +2026,57 @@ pub fn generate_scip_go_index(
 mod tests {
     use super::*;
     use crate::reachability::ReachabilityClass;
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_scip_go_preserves_resolved_build_selection() {
+        use crate::code_intel_toolchain::{
+            ResolvedToolchain, ResolvedToolchainComponent, ToolchainOrigin,
+        };
+        use sha2::{Digest as _, Sha256};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().expect("Go adapter scratch");
+        let root = temporary.path().join("repo");
+        std::fs::create_dir(&root).expect("source root");
+        let provider = temporary.path().join("provider");
+        let source = "#!/bin/sh\n[ \"$1\" = index ] || exit 41\n[ \"$4\" = -o ] || exit 42\nprintf '%s' \"$GOFLAGS\" > \"$5\"\n";
+        std::fs::write(&provider, source).expect("provider probe");
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700))
+            .expect("executable");
+        let digest = Sha256::digest(source.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        for flags in ["-mod=readonly", "-mod=readonly -tags=adapter_control"] {
+            let toolchain = ResolvedToolchain::new(
+                "go",
+                std::fs::canonicalize(&root).unwrap(),
+                ToolchainOrigin::System,
+                [
+                    ResolvedToolchainComponent::new("go", &provider, &digest, "fixture").unwrap(),
+                    ResolvedToolchainComponent::new("scip-go", &provider, &digest, "fixture")
+                        .unwrap(),
+                ],
+                None,
+                std::collections::BTreeMap::from([("GOFLAGS".into(), flags.into())]),
+            )
+            .unwrap();
+            let artifact = generate_scip_go_index(
+                &root,
+                &temporary.path().join("index.scip"),
+                &temporary.path().join("cache"),
+                &toolchain,
+                &IndexCancellation::new(),
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(artifact.path).unwrap(),
+                flags,
+                "the subprocess must receive its resolver-owned flags without adapter substitution"
+            );
+        }
+    }
 
     /// Explicit package seed for narrow resolver tests that intentionally omit
     /// the `Document.symbols` population. Production indexes derive the same

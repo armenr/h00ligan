@@ -278,6 +278,7 @@ INSTALLED_GATE_REQUIRED_FRAGMENTS = (
     "H00_TEST_H00LIGAN_BINARY=",
     "installed_go_callable_liveness_distinguishes_callback_dispatch_from_unreached_code",
     "installed_go_callable_liveness_normalizes_build_exclusions",
+    "installed_go_build_tags_select_test_documents_and_bind_generation_reuse",
     "installed_one_file_cli_and_mcp_share_exact_semantic_authority",
     "installed_rust_linked_worktree_refuses_nonreciprocal_git_authority",
     "installed_python_cli_and_mcp_need_no_ambient_toolchain",
@@ -955,6 +956,91 @@ def validate_build_authority_gate(gate: str | None) -> list[str]:
         for fragment in BUILD_AUTHORITY_REQUIRED_FRAGMENTS
         if fragment not in gate
     ]
+
+
+def prove_build_lock_handoff(builder: str) -> None:
+    """Execute the live lock/cleanup code across controlled filesystem races."""
+    def section(pattern: str) -> str:
+        found = re.search(pattern, builder, flags=re.MULTILINE | re.DOTALL)
+        if found is None:
+            raise AssertionError(f"build-lock control lost its production section: {pattern}")
+        return found.group()
+
+    acquire = section(r"^acquire_target_build_lock\(\) \{\n.*?^\}")
+    cleanup = section(r"^cleanup\(\) \{\n.*?^\}")
+    source_admission = section(r'^if \[\[ ! -e "\$product_root" \]\]; then\n.*?^fi$')
+    with tempfile.TemporaryDirectory(prefix="h00ligan-build-lock.") as raw:
+        root = Path(raw)
+        for mode in ("free", "release", "timeout", "file", "symlink", "fifo", "source"):
+            case = root / mode
+            case.mkdir()
+            locks = case / "build-locks"
+            locks.mkdir()
+            lock = case / "product.lock" if mode == "source" else locks / "test.lock"
+            marker = case / "release-once"
+            sentinel = case / "foreign"
+            sentinel.mkdir()
+            (sentinel / "keep").write_text("foreign owner\n", encoding="utf-8")
+            if mode in ("release", "timeout", "source"):
+                lock.mkdir()
+            elif mode == "file":
+                lock.write_text("not a lock directory\n", encoding="utf-8")
+            elif mode == "symlink":
+                lock.symlink_to(sentinel, target_is_directory=True)
+            elif mode == "fifo":
+                os.mkfifo(lock)
+            if mode == "release":
+                marker.touch()
+            body = r'''
+set -euo pipefail
+portable_cache_root="$1"
+target=test
+authority_test=0
+build_lock=""
+product_lock=""
+install_temp=""
+product_candidate=""
+artifact_candidate=""
+product_build_candidate=""
+invocation_root=""
+product_root="$1/product"
+H00LIGAN_BUILD_LOCK_TIMEOUT_SECONDS="$2"
+mkdir() {
+    if [[ "$1" == "$portable_cache_root/build-locks/test.lock" && -f "$portable_cache_root/release-once" ]]; then
+        # The owner releases after mkdir reports contention, before the waiter
+        # inspects the path. This is a legitimate handoff, not invalid state.
+        command rm "$portable_cache_root/release-once"
+        command rmdir "$1"
+        return 1
+    fi
+    command mkdir "$@"
+}
+'''
+            body += cleanup + "\ntrap cleanup EXIT\n"
+            body += source_admission if mode == "source" else acquire + "\nacquire_target_build_lock\n"
+            completed = subprocess.run(
+                ["bash", "-c", body, "lock-control", str(case), "0" if mode == "timeout" else "2"],
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                text=True, capture_output=True, check=False, timeout=10,
+            )
+            if mode in ("free", "release"):
+                if completed.returncode != 0 or lock.exists() or marker.exists():
+                    raise AssertionError(
+                        f"build lock {mode} handoff failed: exit={completed.returncode}, "
+                        f"stderr={completed.stderr!r}"
+                    )
+            else:
+                expected = (
+                    "already active" if mode == "source" else
+                    "timed out" if mode == "timeout" else "lock is invalid"
+                )
+                if completed.returncode == 0 or expected not in completed.stderr:
+                    raise AssertionError(f"build lock {mode} refused for the wrong reason: {completed}")
+                if not os.path.lexists(lock):
+                    raise AssertionError(f"unadmitted {mode} waiter deleted another owner's lock")
+            if (sentinel / "keep").read_text(encoding="utf-8") != "foreign owner\n":
+                raise AssertionError(f"build lock {mode} touched foreign content")
+    print("build-lock-handoff: OK (free/released positives; timeout/type/source ownership controls)")
 
 
 def prove_build_authority_failure_diagnostics() -> None:
@@ -1678,6 +1764,9 @@ def self_test() -> int:
             raise AssertionError(
                 f"build-authority omission did not fire for {fragment!r}"
             )
+    prove_build_lock_handoff(
+        Path(__file__).with_name("build-h00ligan-portable.sh").read_text(encoding="utf-8")
+    )
     prove_build_authority_failure_diagnostics()
 
     valid_performance_harness = "\n".join(PERFORMANCE_HARNESS_REQUIRED_FRAGMENTS)
@@ -1873,6 +1962,7 @@ dependencies = [
         + 2  # installed Go SDK resolution/executable failures before any build
         + len(PYREFLY_PROVIDER_TEST_REQUIRED_FRAGMENTS)
         + len(BUILD_AUTHORITY_REQUIRED_FRAGMENTS)
+        + 5  # target timeout/type and source-cache ownership controls
         + 3  # barrier timeout, terminal timeout, and early-exit diagnostic controls
         + len(PERFORMANCE_HARNESS_REQUIRED_FRAGMENTS)
         + len(PERFORMANCE_HARNESS_FORBIDDEN_FRAGMENTS)

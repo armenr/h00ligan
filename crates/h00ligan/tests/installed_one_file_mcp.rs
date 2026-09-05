@@ -471,6 +471,210 @@ fn installed_go_callable_liveness_normalizes_build_exclusions() {
     );
 }
 
+/// Switchboard's acceptance test was included by Go but omitted by h00ligan
+/// because product toolchain capture discarded GOFLAGS before provider launch.
+#[test]
+#[ignore = "requires H00_TEST_H00LIGAN_BINARY and Go"]
+fn installed_go_build_tags_select_test_documents_and_bind_generation_reuse() {
+    let binary =
+        PathBuf::from(std::env::var_os("H00_TEST_H00LIGAN_BINARY").expect("installed binary"));
+    let temporary = TempDir::new().expect("Go tags scratch");
+    let root = temporary.path().join("repo");
+    let data = temporary.path().join("data");
+    std::fs::create_dir(&root).expect("source root");
+    let manifest = "module example.test/buildtags\n\ngo 1.27\n";
+    std::fs::write(root.join("go.mod"), manifest).expect("manifest");
+    std::fs::write(root.join("main.go"),
+        "package buildtags\nfunc target() int { return 1 }\nfunc caller() int { return target() }\n")
+        .expect("positive untagged caller");
+    std::fs::write(
+        root.join("contract_test.go"),
+        concat!(
+            "//go:build persistent_session_contract_red\n\npackage buildtags\nimport \"testing\"\n",
+            "func TestTagged(t *testing.T) { if target() != 1 { t.Fatal(\"target\") } }\n",
+        ),
+    )
+    .expect("tagged test");
+    let flags = "-mod=readonly -tags=persistent_session_contract_red";
+    let native = Command::new("go")
+        .args(["list", "-json", "."])
+        .current_dir(&root)
+        .env("GOFLAGS", flags)
+        .env("GOENV", "off")
+        .env("GOTOOLCHAIN", "local")
+        .output()
+        .expect("native Go positive");
+    assert!(
+        native.status.success(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    let listed: Value = serde_json::from_slice(&native.stdout).expect("Go list JSON");
+    assert!(
+        listed["TestGoFiles"]
+            .as_array()
+            .expect("native test population")
+            .iter()
+            .any(|file| file == "contract_test.go"),
+        "{listed}"
+    );
+
+    let index = |go_flags: &str, strict: bool| {
+        let mut command = Command::new(&binary);
+        command
+            .arg("--root")
+            .arg(&root)
+            .arg("--data-dir")
+            .arg(&data)
+            .args(["index", "--scip", "--format", "json"])
+            .env("GOFLAGS", go_flags)
+            .env("GOENV", "off")
+            .env("GOTOOLCHAIN", "local");
+        if strict {
+            command.arg("--require-complete-calls");
+        } else {
+            command.arg("--allow-capability-downgrade");
+        }
+        let output = command.output().expect("index requested Go configuration");
+        assert!(
+            output.status.success(),
+            "Go flags {go_flags}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).expect("index JSON")
+    };
+    let callers = || {
+        run_json_query(
+            &binary,
+            &root,
+            &data,
+            &[
+                "calls", "target", "--file", "main.go", "--filter", "all", "--format", "json",
+            ],
+        )
+    };
+    let baseline = index("-mod=readonly", false);
+    assert_eq!(
+        baseline["capabilities"]["calls"]["status"], "qualified",
+        "{baseline}"
+    );
+    let baseline_calls = callers();
+    assert_eq!(
+        baseline_calls["items"]
+            .as_array()
+            .expect("baseline callers")
+            .len(),
+        1,
+        "{baseline_calls}"
+    );
+    assert_eq!(
+        baseline_calls["items"][0]["origin"]["identity"]["name"],
+        "caller"
+    );
+
+    let tagged = index(flags, true);
+    assert_eq!(
+        tagged["capabilities"]["calls"]["status"], "complete",
+        "{tagged}"
+    );
+    assert_ne!(
+        baseline["generation_id"], tagged["generation_id"],
+        "flags must defeat old-generation reuse"
+    );
+    let tagged_calls = callers();
+    let caller_names = |calls: &Value| {
+        let mut names = calls["items"]
+            .as_array()
+            .expect("caller population")
+            .iter()
+            .map(|item| {
+                item["origin"]["identity"]["name"]
+                    .as_str()
+                    .expect("caller name")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    };
+    assert_eq!(
+        caller_names(&tagged_calls),
+        ["TestTagged", "caller"],
+        "{tagged_calls}"
+    );
+    let tests = run_json_query(
+        &binary,
+        &root,
+        &data,
+        &["tests", "target", "--file", "main.go", "--format", "json"],
+    );
+    assert_eq!(
+        tests["items"]
+            .as_array()
+            .expect("runnable test roots")
+            .len(),
+        1,
+        "tagged runnable test: {tests}"
+    );
+    assert_eq!(tests["items"][0]["test"]["name"], "TestTagged", "{tests}");
+
+    let restored = index("-mod=readonly", false);
+    assert_eq!(
+        restored["capabilities"]["calls"]["status"], "qualified",
+        "{restored}"
+    );
+    assert_ne!(restored["generation_id"], tagged["generation_id"]);
+    assert_eq!(caller_names(&callers()), ["caller"]);
+
+    // The MCP mutation must honor the new process selection too, not merely
+    // answer queries against a generation previously produced by tagged CLI.
+    let mut child = Command::new(&binary)
+        .arg("--root")
+        .arg(&root)
+        .arg("--data-dir")
+        .arg(&data)
+        .arg("mcp-serve")
+        .env("GOFLAGS", flags)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("tag-selected MCP");
+    let mut stdin = child.stdin.take().expect("MCP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("MCP stdout"));
+    let mut id = 1;
+    let mcp_index = reindex_terminal(&mut stdin, &mut stdout, &mut id);
+    let response = call_mcp(
+        &mut stdin,
+        &mut stdout,
+        id,
+        "calls",
+        json!({"symbol":"target", "file":"main.go", "filter":"all"}),
+    );
+    // Reap before assertions, including on a product-parity failure.
+    stop_mcp(child, stdin);
+    assert_eq!(
+        mcp_index["capabilities"]["calls"]["status"], "complete",
+        "{mcp_index}"
+    );
+    assert_ne!(restored["generation_id"], mcp_index["generation_id"]);
+    let mcp_calls = callers();
+    assert_eq!(caller_names(&mcp_calls), ["TestTagged", "caller"]);
+    assert_eq!(
+        structured_content(&response, "tag-selected calls"),
+        &mcp_calls
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("go.mod")).expect("unchanged manifest"),
+        manifest
+    );
+    assert!(
+        !root.join("go.sum").exists(),
+        "indexing must not write module state"
+    );
+}
+
 #[test]
 #[ignore = "requires H00_TEST_H00LIGAN_BINARY and an installed Rust toolchain"]
 fn installed_one_file_cli_and_mcp_share_exact_semantic_authority() {

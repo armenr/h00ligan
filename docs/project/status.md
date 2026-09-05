@@ -1,6 +1,6 @@
 # Project status
 
-Last verified: 2026-09-05
+Last verified: 2026-09-06
 
 ## Released product
 
@@ -70,8 +70,29 @@ When classification is implemented, reconcile this probe and the guides.
 
 ## Current sequence and evidence limits
 
-Finish the documentation checks, then return to the queued PR baseline and
-three-target release automation/CI-cost follow-up. Address the evidenced
+The documentation and plain-language cleanup landed on main at `79b5300`.
+Current correctness work addresses Go build tags being discarded before
+provider launch; both a resolver regression and an installed-product fixture
+reproduce the omission with native Go and an untagged caller as controls.
+The development repair passes the full local Linux AMD64 `just ci-product`
+gate: explicit flags reach CLI and MCP indexing, configuration switches cannot
+reuse the old semantic generation, and tagged WATCH edits/restoration and
+restart under different tags preserve the selected caller population. The gate
+also exercises 18 installed WATCH lifecycles and four-language performance
+smoke with zero new process residue. This is not a new macOS/ARM64 acceptance
+claim and is not part of the published 0.3.0 binaries.
+
+The verification repeat also exposed a portable-builder lock handoff race.
+Lock cleanup now owns only successfully acquired locks; a lock released
+between contention and inspection is a normal handoff. Deterministic controls
+cover release, timed-out waiters, invalid entries and source-cache ownership.
+This is build machinery, not a new runtime dependency or lock subsystem.
+
+The exact Switchboard worktree still needs a controlled retest. Do not attribute
+its other document omissions or dynamic regions to the tag defect without
+separate evidence.
+Then return to the queued PR baseline and three-target release automation/
+CI-cost follow-up. Address the evidenced
 classification depth gap before advertising full four-language dead-code
 parity. Preserve real-repository dogfood, task-level comparison, and the
 performance program in [the work plan](work-plan.md).

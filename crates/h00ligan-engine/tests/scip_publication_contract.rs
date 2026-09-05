@@ -85,10 +85,14 @@ impl FixtureGoToolchainResolver {
         let bin = PathBuf::from(
             std::env::var_os(GO_TOOLCHAIN_BIN).expect("explicit fixture Go toolchain directory"),
         );
-        let environment = ["PATH", GO_PROVIDER_ARTIFACT, GO_PROVIDER_CACHE_LOG]
-            .into_iter()
-            .filter_map(|name| std::env::var(name).ok().map(|value| (name.into(), value)))
-            .collect();
+        let mut environment: BTreeMap<String, String> =
+            ["PATH", GO_PROVIDER_ARTIFACT, GO_PROVIDER_CACHE_LOG]
+                .into_iter()
+                .filter_map(|name| std::env::var(name).ok().map(|value| (name.into(), value)))
+                .collect();
+        // Like the product resolver, this fixture owns its complete launch
+        // environment; the provider adapter must not invent build flags.
+        environment.insert("GOFLAGS".into(), "-mod=readonly".into());
         Self { bin, environment }
     }
 }

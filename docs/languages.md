@@ -93,6 +93,42 @@ project/semantic-input symlinks have separately validated ownership rules.
 
 ## Toolchain and configuration changes
 
+### Go build tags
+
+**Released 0.3.0 discards explicit `GOFLAGS`.** The development repair retains
+supported flags and has passed local Linux AMD64 source and installed-product
+checks. It is not in the released binaries; rebuilding an unchanged 0.3.0 index
+with different tags does not work around that release's defect.
+
+With the repaired build, select tags explicitly when starting the process:
+
+```bash
+GOFLAGS='-tags=integration,contract' h00ligan index --scip
+GOFLAGS='-tags=integration,contract' h00ligan watch --scip
+GOFLAGS='-tags=integration,contract' h00ligan mcp-serve
+```
+
+The resolver adds `-mod=readonly` if absent. It preserves Go's quoted-field
+syntax, including `GOFLAGS='"-tags=integration contract"'`. Supported options
+are `-tags`, `-mod=readonly`, `-p`, `-race`, `-msan`, `-asan`, `-trimpath`,
+`-buildvcs`, `-a`, `-v`, and `-x`. Unsupported flags are reported rather than
+discarded. Module writes, vendor mode, alternate manifests, source overlays,
+and compiler/package redirection need additional input tracking before support.
+
+The process captures its environment at startup: changing another shell's
+`GOFLAGS` does not change a running MCP server or watcher. Restart with the
+desired selection and reindex; a changed selection cannot reuse the previous
+configuration's semantic authority. Results describe that selection, not the
+union of every platform/tag combination. Files excluded by it remain qualified.
+An intentional reduction from complete to partial coverage can require
+`--allow-capability-downgrade` / `allow_capability_downgrade:true`.
+
+Explicit environment values are used, not the mutable per-user `go env -w`
+defaults (`GOENV=off`). Automatic Go toolchain downloads remain disabled
+(`GOTOOLCHAIN=local`). Prepare the project's compiler and dependencies first.
+
+### Other input changes
+
 Toolchain identity and project inputs participate in semantic validity.
 WATCH observes relevant source/configuration changes and reconciles against
 current evidence; identity changes can require semantic recertification rather
