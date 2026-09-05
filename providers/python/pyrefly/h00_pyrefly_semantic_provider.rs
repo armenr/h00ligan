@@ -1976,6 +1976,8 @@ mod tests {
         let source_path = root.join("tests/arango_harness.py");
         let source = "from typing import Any\n\ndef _thread_doc(value: int) -> int:\n    return value\n\ndef _edge_doc(value: int) -> int:\n    return value\n\ndef seed(db: Any) -> None:\n    db.collection(\"fixture\").insert_many(\n        [\n            _thread_doc(1),\n            _edge_doc(2),\n        ]\n    )\n";
         std::fs::write(&source_path, source).expect("source fixture");
+        let canonical_source_path =
+            std::fs::canonicalize(&source_path).expect("canonical source identity");
         let semantic = H00SemanticSession::open(
             &root,
             [
@@ -2009,7 +2011,7 @@ mod tests {
                 reference
                     .target_file
                     .as_deref()
-                    .is_some_and(|target| Path::new(target) == source_path),
+                    .is_some_and(|target| Path::new(target) == canonical_source_path),
                 "positive control: Pyrefly supplied exact same-document target evidence"
             );
         }
@@ -2024,7 +2026,7 @@ mod tests {
             if reference
                 .target_file
                 .as_deref()
-                .is_some_and(|target| Path::new(target) == source_path)
+                .is_some_and(|target| Path::new(target) == canonical_source_path)
             {
                 reference.target_file = Some("tests/arango_harness.py".into());
             }
