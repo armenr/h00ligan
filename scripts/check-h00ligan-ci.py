@@ -364,9 +364,21 @@ BUILD_AUTHORITY_REQUIRED_FRAGMENTS = (
 )
 
 DISTRIBUTION_REQUIRED_FRAGMENTS = (
-    "if: startsWith(matrix.platform, 'linux-')",
     "Prepare native macOS product environment",
-    "if: startsWith(matrix.platform, 'macos-')",
+    "actions-rust-lang/setup-rust-toolchain@"
+    "166cdcfd11aee3cb47222f9ddb555ce30ddb9659 "
+    "# v1.17.0 (checked 2026-08-16)\n"
+    "        if: startsWith(matrix.platform, 'macos-')",
+    "Install the pinned Rust toolchain inside Devbox",
+    'devbox run -- rustup toolchain install 1.97.1 \\\n'
+    '            --profile minimal \\\n'
+    '            --target "${{ matrix.target }}" \\\n'
+    "            --no-self-update",
+    "Install the pinned Rust inventory toolchain inside Devbox",
+    'devbox run -- rustup toolchain install 1.97.1 \\\n'
+    '            --profile minimal \\\n'
+    "            --target x86_64-unknown-linux-musl \\\n"
+    "            --no-self-update",
     'exec shasum -a 256 "$@"',
     'echo "DEVBOX_PACKAGES_DIR=$native_root/packages" >> "$GITHUB_ENV"',
     "run_product python3",
@@ -393,6 +405,8 @@ DISTRIBUTION_REQUIRED_FRAGMENTS = (
 DISTRIBUTION_REQUIRED_FRAGMENT_COUNTS = (
     ("run_product()", 3),
     ('if [[ "$PLATFORM" == macos-* ]]; then', 3),
+    ("if: startsWith(matrix.platform, 'linux-')", 2),
+    ("if: startsWith(matrix.platform, 'macos-')", 2),
     ("PLATFORM: ${{ matrix.platform }}", 4),
     ("toolchain: 1.97.1", 2),
 )
@@ -1395,14 +1409,15 @@ def self_test() -> int:
                 f"performance-wrapper omission did not fire for {fragment!r}"
             )
 
-    valid_distribution = "\n".join(
-        DISTRIBUTION_REQUIRED_FRAGMENTS
-        + tuple(
-            fragment
-            for fragment, count in DISTRIBUTION_REQUIRED_FRAGMENT_COUNTS
-            for _ in range(count)
-        )
-    )
+    valid_distribution = "\n".join(DISTRIBUTION_REQUIRED_FRAGMENTS)
+    for fragment, count in DISTRIBUTION_REQUIRED_FRAGMENT_COUNTS:
+        missing = count - valid_distribution.count(fragment)
+        if missing < 0:
+            raise AssertionError(
+                f"distribution fixture already exceeds {count} copies of {fragment!r}"
+            )
+        if missing:
+            valid_distribution += "\n" + "\n".join(fragment for _ in range(missing))
     if failures := validate_distribution_workflow(valid_distribution):
         raise AssertionError(f"valid distribution workflow rejected: {failures!r}")
     for fragment in DISTRIBUTION_REQUIRED_FRAGMENTS:
