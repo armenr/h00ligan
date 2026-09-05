@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -363,7 +364,7 @@ BUILD_AUTHORITY_REQUIRED_FRAGMENTS = (
     "normal builder accepted authority-test source cache",
 )
 
-DISTRIBUTION_REQUIRED_FRAGMENTS = (
+DISTRIBUTION_DISK_REQUIRED_FRAGMENTS = (
     "Establish the Linux release disk budget",
     "/usr/local/lib/android",
     "/usr/share/dotnet",
@@ -375,6 +376,10 @@ DISTRIBUTION_REQUIRED_FRAGMENTS = (
     'if [[ -L "$path" ]]; then',
     '[[ -d "$path" ]] || {',
     'sudo rm -rf -- "$path"',
+)
+
+DISTRIBUTION_REQUIRED_FRAGMENTS = (
+    *DISTRIBUTION_DISK_REQUIRED_FRAGMENTS,
     "Prepare native macOS product environment",
     "actions-rust-lang/setup-rust-toolchain@"
     "166cdcfd11aee3cb47222f9ddb555ce30ddb9659 "
@@ -903,19 +908,28 @@ def validate_distribution_workflow(workflow: str) -> list[str]:
         for fragment in DISTRIBUTION_FORBIDDEN_FRAGMENTS
         if fragment in workflow
     )
-    disk_boundary = workflow.find("Establish the Linux release disk budget")
-    environment_boundary = workflow.find(
-        "Install the pinned product build environment"
-    )
-    if (
-        disk_boundary >= 0
-        and environment_boundary >= 0
-        and disk_boundary > environment_boundary
-    ):
-        failures.append(
-            "Linux release disk capacity must be established before installing "
-            "the pinned product build environment"
+    # Both jobs prepare the native providers. A build-job-only capacity check
+    # cannot protect the fresh runner used to assemble the dependency inventory.
+    for job in ("build", "package"):
+        section = re.search(
+            rf"^  {job}:\n(.*?)(?=^  \S|\Z)", workflow, re.MULTILINE | re.DOTALL
         )
+        if section is None:
+            failures.append(f"distribution workflow is missing {job} job")
+            continue
+        body = section.group(1)
+        failures.extend(
+            f"distribution {job} job is missing Linux disk boundary {fragment!r}"
+            for fragment in DISTRIBUTION_DISK_REQUIRED_FRAGMENTS
+            if body.count(fragment) != 1
+        )
+        disk_boundary = body.find("Establish the Linux release disk budget")
+        environment_boundary = body.find("Install the pinned product build environment")
+        if environment_boundary < 0 or disk_boundary > environment_boundary:
+            failures.append(
+                f"distribution {job} job must establish Linux disk capacity before "
+                "installing the pinned product build environment"
+            )
     return failures
 
 
@@ -1433,7 +1447,18 @@ def self_test() -> int:
                 f"performance-wrapper omission did not fire for {fragment!r}"
             )
 
-    valid_distribution = "\n".join(DISTRIBUTION_REQUIRED_FRAGMENTS)
+    disk_boundary = "Establish the Linux release disk budget"
+    environment_boundary = "Install the pinned product build environment"
+    valid_distribution = "\n".join(
+        fragment
+        for fragment in DISTRIBUTION_REQUIRED_FRAGMENTS
+        if fragment not in DISTRIBUTION_DISK_REQUIRED_FRAGMENTS
+    )
+    for job in ("build", "package"):
+        valid_distribution += f"\n  {job}:\n" + "\n".join(
+            "    " + fragment
+            for fragment in (*DISTRIBUTION_DISK_REQUIRED_FRAGMENTS, environment_boundary)
+        ) + "\n"
     for fragment, count in DISTRIBUTION_REQUIRED_FRAGMENT_COUNTS:
         missing = count - valid_distribution.count(fragment)
         if missing < 0:
@@ -1444,15 +1469,23 @@ def self_test() -> int:
             valid_distribution += "\n" + "\n".join(fragment for _ in range(missing))
     if failures := validate_distribution_workflow(valid_distribution):
         raise AssertionError(f"valid distribution workflow rejected: {failures!r}")
-    disk_boundary = "Establish the Linux release disk budget"
-    environment_boundary = "Install the pinned product build environment"
-    reordered_distribution = valid_distribution.replace(
-        disk_boundary, "__DISK_BOUNDARY__", 1
-    ).replace(environment_boundary, disk_boundary, 1).replace(
-        "__DISK_BOUNDARY__", environment_boundary, 1
-    )
-    if not validate_distribution_workflow(reordered_distribution):
-        raise AssertionError("distribution disk-boundary reorder did not fire")
+    for job in ("build", "package"):
+        prefix, body = valid_distribution.split(f"  {job}:\n", 1)
+        reordered = prefix + f"  {job}:\n" + body.replace(
+            disk_boundary, "__DISK_BOUNDARY__", 1
+        ).replace(environment_boundary, disk_boundary, 1).replace(
+            "__DISK_BOUNDARY__", environment_boundary, 1
+        )
+        expected = (
+            f"distribution {job} job must establish Linux disk capacity before "
+            "installing the pinned product build environment"
+        )
+        if validate_distribution_workflow(reordered) != [expected]:
+            raise AssertionError(f"distribution {job} disk-boundary reorder did not fire exactly")
+        omitted = prefix + f"  {job}:\n" + body.replace(disk_boundary, "", 1)
+        expected = f"distribution {job} job is missing Linux disk boundary {disk_boundary!r}"
+        if validate_distribution_workflow(omitted) != [expected]:
+            raise AssertionError(f"distribution {job} disk-boundary omission did not fire exactly")
     for fragment in DISTRIBUTION_REQUIRED_FRAGMENTS:
         sabotaged = valid_distribution.replace(fragment, "", 1)
         if not validate_distribution_workflow(sabotaged):
@@ -1586,6 +1619,7 @@ dependencies = [
         + len(DISTRIBUTION_REQUIRED_FRAGMENTS)
         + len(DISTRIBUTION_REQUIRED_FRAGMENT_COUNTS)
         + len(DISTRIBUTION_FORBIDDEN_FRAGMENTS)
+        + 4  # build/package disk-step omission and ordering controls
         + len(integration_sabotages)
         + len(test_profile_sabotages)
         + len(lock_sabotages)

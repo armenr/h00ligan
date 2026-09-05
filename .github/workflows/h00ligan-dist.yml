@@ -351,6 +351,39 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Establish the Linux release disk budget
+        run: |
+          reclaim_directory() {
+            local path="$1"
+            if [[ -L "$path" ]]; then
+              echo "refusing to reclaim symlinked hosted-runner path: $path" >&2
+              exit 1
+            fi
+            if [[ -e "$path" ]]; then
+              [[ -d "$path" ]] || {
+                echo "hosted-runner reclaim path is not a directory: $path" >&2
+                exit 1
+              }
+              sudo rm -rf -- "$path"
+            fi
+          }
+
+          before_kib="$(df -Pk / | awk 'NR == 2 {print $4}')"
+          for path in \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /usr/local/.ghcup \
+            /usr/share/swift; do
+            reclaim_directory "$path"
+          done
+          available_kib="$(df -Pk / | awk 'NR == 2 {print $4}')"
+          minimum_available_kib=$((20 * 1024 * 1024))
+          ((available_kib >= minimum_available_kib)) || {
+            echo "Linux release runner has only $available_kib KiB available after reclaim; $minimum_available_kib KiB required" >&2
+            exit 1
+          }
+          echo "Linux release disk budget: $before_kib KiB before, $available_kib KiB available after reclaim"
+
       - name: Install the pinned product build environment
         uses: jetify-com/devbox-install-action@8c6a66ed6273138b1915457069de78cb52fe3bd7 # v0.15.0 (checked 2026-08-22)
         with:
