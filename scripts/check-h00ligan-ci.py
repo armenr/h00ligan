@@ -394,6 +394,7 @@ DISTRIBUTION_REQUIRED_FRAGMENT_COUNTS = (
     ("run_product()", 3),
     ('if [[ "$PLATFORM" == macos-* ]]; then', 3),
     ("PLATFORM: ${{ matrix.platform }}", 4),
+    ("toolchain: 1.97.1", 2),
 )
 
 DISTRIBUTION_FORBIDDEN_FRAGMENTS = (

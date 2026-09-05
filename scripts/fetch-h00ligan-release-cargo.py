@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Sequence
+import contextlib
+import io
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import tomllib
 
@@ -17,13 +20,22 @@ Invoke = Callable[[Sequence[str], Path, bool], subprocess.CompletedProcess[str]]
 
 
 def invoke(command: Sequence[str], cwd: Path, capture: bool) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        command,
-        cwd=cwd,
-        check=True,
-        stdout=subprocess.PIPE if capture else None,
-        text=True,
-    )
+    try:
+        return subprocess.run(
+            command,
+            cwd=cwd,
+            check=True,
+            stdout=subprocess.PIPE if capture else None,
+            text=True,
+        )
+    except subprocess.CalledProcessError as error:
+        # Machine-readable builder output normally stays private to this
+        # orchestrator. On failure it contains the test harness's exact
+        # assertion, so replay it before preserving the original exit status.
+        if capture and error.stdout:
+            sys.stderr.write(error.stdout)
+            sys.stderr.flush()
+        raise
 
 
 def require_regular(path: Path, description: str) -> Path:
@@ -168,6 +180,18 @@ def fetch_release_cargo(
         )
         events.append("pyrefly")
 
+    # Build the exact native provider once its locked graph is available. This
+    # both warms the artifact reused by the product preparer and keeps provider
+    # test output at this direct orchestration boundary instead of losing it in
+    # the product builder's machine-output command substitution.
+    built_provider = runner((str(provider_builder), "--machine"), source_root, True)
+    provider_binary = require_descendant(
+        Path(machine_field(built_provider.stdout, "H00_PYREFLY_PROVIDER_BINARY")),
+        source_root / "target/portable-cache/python-provider",
+        "built Pyrefly provider",
+    )
+    require_regular(provider_binary, "built Pyrefly provider")
+
     product_command = [str(product_builder), "--prepare-only"]
     if rust_source:
         product_command.extend(("--rust-source", rust_source))
@@ -219,6 +243,7 @@ def write_fixture(root: Path) -> tuple[Path, Path]:
         "crates/h00ligan-provider-protocol/src",
         "target/semantic-provider/python/source/source-key/pyrefly",
         "target/portable-cache/product/product",
+        "target/portable-cache/python-provider/artifacts/host/build-key",
     )
     for relative in paths:
         (root / relative).mkdir(parents=True, exist_ok=True)
@@ -247,6 +272,9 @@ def write_fixture(root: Path) -> tuple[Path, Path]:
         "target/portable-cache/product/product/Cargo.toml": (
             "[package]\nname = \"product\"\nversion = \"0.0.0\"\n"
         ),
+        "target/portable-cache/python-provider/artifacts/host/build-key/provider": (
+            "provider-binary\n"
+        ),
     }
     for relative, contents in files.items():
         (root / relative).write_text(contents, encoding="utf-8")
@@ -270,9 +298,25 @@ def self_test() -> None:
             nonlocal adapter_root
             assert cwd == root
             if command[0].endswith("build-h00-pyrefly-semantic-provider.sh"):
-                assert tuple(command[1:]) == ("--prepare-only", "--machine")
+                if tuple(command[1:]) == ("--prepare-only", "--machine"):
+                    return subprocess.CompletedProcess(
+                        command, 0, f"H00_PYREFLY_SOURCE_ROOT={pyrefly_root}\n", ""
+                    )
+                assert tuple(command[1:]) == ("--machine",)
+                if observed != ["fetch:pyrefly"]:
+                    raise AssertionError(
+                        "Pyrefly build ran before its locked graph was fetched"
+                    )
+                observed.append("build:pyrefly")
+                provider_binary = (
+                    root
+                    / "target/portable-cache/python-provider/artifacts/host/build-key/provider"
+                )
                 return subprocess.CompletedProcess(
-                    command, 0, f"H00_PYREFLY_SOURCE_ROOT={pyrefly_root}\n", ""
+                    command,
+                    0,
+                    f"H00_PYREFLY_PROVIDER_BINARY={provider_binary}\n",
+                    "",
                 )
             if command[0] == "cargo":
                 manifest = Path(command[-1])
@@ -293,9 +337,9 @@ def self_test() -> None:
                     raise AssertionError(f"unexpected Cargo manifest: {manifest}")
                 return subprocess.CompletedProcess(command, 0, "", "")
             if command[0].endswith("build-h00ligan-portable.sh"):
-                if observed != ["fetch:pyrefly"]:
+                if observed != ["fetch:pyrefly", "build:pyrefly"]:
                     raise AssertionError(
-                        "portable preparation ran before the Pyrefly lock was fetched"
+                        "portable preparation ran before the Pyrefly artifact was proven"
                     )
                 assert "--prepare-only" in command and "--machine" in command
                 observed.append("prepare:product")
@@ -309,6 +353,7 @@ def self_test() -> None:
         )
         expected = (
             "fetch:pyrefly",
+            "build:pyrefly",
             "prepare:product",
             "fetch:product",
             "fetch:workspace",
@@ -345,7 +390,27 @@ def self_test() -> None:
         else:
             raise AssertionError("duplicate machine fields were accepted")
 
-    print("h00ligan-release-cargo: self-test OK (3 fetch stages, 2 sabotages)")
+        failure = Path(raw) / "failing-provider.py"
+        failure.write_text(
+            "import sys\nprint('darwin-provider-right-reason')\nraise SystemExit(19)\n",
+            encoding="utf-8",
+        )
+        replay = io.StringIO()
+        with contextlib.redirect_stderr(replay):
+            try:
+                invoke((sys.executable, str(failure)), root, True)
+            except subprocess.CalledProcessError as error:
+                if error.returncode != 19:
+                    raise
+            else:
+                raise AssertionError("failing captured provider command was accepted")
+        if "darwin-provider-right-reason" not in replay.getvalue():
+            raise AssertionError("captured provider failure output was discarded")
+
+    print(
+        "h00ligan-release-cargo: self-test OK "
+        "(3 fetch stages, 1 provider build, 3 sabotages)"
+    )
 
 
 def main() -> int:
