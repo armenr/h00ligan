@@ -69,6 +69,7 @@ release-check:
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/normalize-h00ligan-sbom.py --self-test
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/check-h00ligan-sbom.py --self-test
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/check-h00ligan-release.py
+    PYTHONDONTWRITEBYTECODE=1 python3 scripts/fetch-h00ligan-release-cargo.py --self-test
     scripts/package-h00ligan-release.sh --self-test
     shellcheck .githooks/commit-msg scripts/bench-h00ligan-product.sh scripts/build-h00-go-semantic-provider.sh scripts/build-h00-pyrefly-semantic-provider.sh scripts/build-h00-rust-semantic-provider.sh scripts/build-h00-typescript-semantic-provider.sh scripts/build-h00ligan-portable.sh scripts/package-h00ligan-release.sh scripts/resolve-h00-official-go-sdk.sh scripts/test-h00ligan-installed-product.sh
 
