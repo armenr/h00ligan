@@ -145,16 +145,26 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Install pinned Nix for Intel macOS
-        if: matrix.platform == 'macos-amd64'
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1 (checked 2026-09-05)
-
       - name: Install the pinned product build environment
+        if: startsWith(matrix.platform, 'linux-')
         uses: jetify-com/devbox-install-action@8c6a66ed6273138b1915457069de78cb52fe3bd7 # v0.15.0 (checked 2026-08-22)
         with:
           devbox-version: 0.17.5
           enable-cache: true
-          skip-nix-installation: ${{ matrix.platform == 'macos-amd64' }}
+
+      - name: Prepare native macOS product environment
+        if: startsWith(matrix.platform, 'macos-')
+        run: |
+          native_root="$RUNNER_TEMP/h00ligan-native-tools"
+          mkdir -p "$native_root/bin" "$native_root/packages"
+          printf '%s\n' '#!/usr/bin/env bash' 'exec shasum -a 256 "$@"' \
+            > "$native_root/bin/sha256sum"
+          chmod 0755 "$native_root/bin/sha256sum"
+          expected="$(shasum -a 256 Cargo.lock | awk '{print $1}')"
+          actual="$("$native_root/bin/sha256sum" Cargo.lock | awk '{print $1}')"
+          [[ "$actual" == "$expected" ]]
+          echo "DEVBOX_PACKAGES_DIR=$native_root/packages" >> "$GITHUB_ENV"
+          echo "$native_root/bin" >> "$GITHUB_PATH"
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0 (checked 2026-08-16)
         with:
@@ -165,8 +175,16 @@ jobs:
       - name: Fetch the exact locked build and acceptance dependencies
         env:
           H00_RUST_SOURCE_DIR: target/upstream-rust-1.97.1
+          PLATFORM: ${{ matrix.platform }}
         run: |
-          devbox run -- python3 \
+          run_product() {
+            if [[ "$PLATFORM" == macos-* ]]; then
+              "$@"
+            else
+              devbox run -- "$@"
+            fi
+          }
+          run_product python3 \
             "$GITHUB_WORKSPACE/target/release-tooling/scripts/fetch-h00ligan-release-cargo.py" \
             --source-root "$GITHUB_WORKSPACE" \
             --rust-source "$H00_RUST_SOURCE_DIR"
@@ -175,9 +193,17 @@ jobs:
         id: product
         env:
           H00_RUST_SOURCE_DIR: target/upstream-rust-1.97.1
+          PLATFORM: ${{ matrix.platform }}
           TARGET: ${{ matrix.target }}
         run: |
-          details="$(devbox run -- scripts/build-h00ligan-portable.sh \
+          run_product() {
+            if [[ "$PLATFORM" == macos-* ]]; then
+              "$@"
+            else
+              devbox run -- "$@"
+            fi
+          }
+          details="$(run_product scripts/build-h00ligan-portable.sh \
             --target "$TARGET" \
             --rust-source "$H00_RUST_SOURCE_DIR" \
             --machine)"
@@ -197,7 +223,16 @@ jobs:
           H00_TEST_H00LIGAN_BINARY: ${{ steps.product.outputs.binary }}
           H00_TEST_H00LIGAN_RECEIPT: ${{ steps.product.outputs.receipt }}
           H00_TEST_H00LIGAN_PRODUCT_SOURCE_RECEIPT: ${{ steps.product.outputs.source_receipt }}
-        run: devbox run -- scripts/test-h00ligan-installed-product.sh
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          run_product() {
+            if [[ "$PLATFORM" == macos-* ]]; then
+              "$@"
+            else
+              devbox run -- "$@"
+            fi
+          }
+          run_product scripts/test-h00ligan-installed-product.sh
 
       - name: Prove architecture, linkage, and real CLI reachability
         env:
