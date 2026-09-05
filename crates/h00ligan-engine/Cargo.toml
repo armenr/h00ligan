@@ -74,7 +74,7 @@ code-intel = [
 ]
 
 [dev-dependencies]
-serial_test = "3.5.0"
+serial_test = "4.0.1"
 h00ligan = { path = "../h00ligan" }
 
 [build-dependencies]
