@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import os
 import re
 import runpy
@@ -381,6 +382,7 @@ DISTRIBUTION_DISK_REQUIRED_FRAGMENTS = (
 
 DISTRIBUTION_REQUIRED_FRAGMENTS = (
     *DISTRIBUTION_DISK_REQUIRED_FRAGMENTS,
+    "timeout-minutes: ${{ matrix.platform == 'macos-amd64' && 150 || 90 }}",
     "Prepare native macOS product environment",
     "actions-rust-lang/setup-rust-toolchain@"
     "166cdcfd11aee3cb47222f9ddb555ce30ddb9659 "
@@ -413,7 +415,9 @@ DISTRIBUTION_REQUIRED_FRAGMENTS = (
     "H00LIGAN_PRODUCT_MANIFEST",
     "H00_TEST_H00LIGAN_RECEIPT",
     "H00_TEST_H00LIGAN_PRODUCT_SOURCE_RECEIPT",
-    "h00ligan-product_bin.cdx.json",
+    "--describe crate",
+    "h00ligan-product.cdx.json",
+    '--source-root "rust-analyzer=$provider_source_root"',
     '--receipt "${{ steps.product.outputs.receipt }}"',
     '--source-receipt "${{ steps.product.outputs.source_receipt }}"',
     "cargo fetch --locked",
@@ -431,7 +435,8 @@ DISTRIBUTION_REQUIRED_FRAGMENT_COUNTS = (
 DISTRIBUTION_FORBIDDEN_FRAGMENTS = (
     "cachix/install-nix-action@",
     "-p h00ligan --bin h00ligan",
-    "h00ligan_bin.cdx.json",
+    "h00ligan-product_bin.cdx.json",
+    "--describe binaries",
 )
 
 REPOSITORY_LOCAL_IGNORE_PATTERNS = (
@@ -1044,7 +1049,7 @@ def validate_distribution_workflow(workflow: str) -> list[str]:
         if workflow.count(fragment) != count
     )
     failures.extend(
-        f"distribution workflow retains provider-less build {fragment!r}"
+        f"distribution workflow retains obsolete product boundary {fragment!r}"
         for fragment in DISTRIBUTION_FORBIDDEN_FRAGMENTS
         if fragment in workflow
     )
@@ -1168,6 +1173,117 @@ def validate_portable_lockfile(lockfile: str | None) -> list[str]:
                 f"{dependencies!r}, expected {expected!r}"
             )
     return failures
+
+
+def prove_distribution_inventory_copy() -> None:
+    """Execute the live copy boundary with a real relative path dependency."""
+    workflow_path = Path(__file__).resolve().parents[1] / ".github/workflows/h00ligan-dist.yml"
+    workflow = workflow_path.read_text(encoding="utf-8")
+    start_marker = "          inventory_root="
+    end_marker = "          cargo metadata "
+    if workflow.count(start_marker) != 1 or workflow.count(end_marker) != 1:
+        raise AssertionError("distribution must have one executable inventory copy boundary")
+    start = workflow.index(start_marker)
+    end = workflow.index(end_marker, start)
+    body = "\n".join(line[10:] for line in workflow[start:end].splitlines())
+    probe = """
+import json
+import sys
+import tomllib
+from pathlib import Path
+inventory_root, manifest, expected_provider = map(Path, sys.argv[1:])
+assert manifest.is_file(), "inventory manifest was not copied"
+relative = tomllib.loads(manifest.read_text())["dependencies"]["hir"]["path"]
+provider = (manifest.parent / relative / "Cargo.toml").resolve()
+assert provider == expected_provider and provider.is_file(), "inventory moved the relative provider dependency"
+manifest.write_text(manifest.read_text() + "\\n# disposable inventory proof\\n")
+print(json.dumps({"inventory_root": str(inventory_root)}))
+"""
+
+    def exercise(copy_body: str) -> str | None:
+        with tempfile.TemporaryDirectory(prefix="h00ligan inventory copy ") as temporary:
+            root = Path(temporary).resolve()
+            product_root = root / "target/portable-cache/product-source-fixture"
+            manifest = product_root / "product/Cargo.toml"
+            provider = root / "target/semantic-provider/crates/hir/Cargo.toml"
+            files = {
+                manifest: (
+                    '[package]\nname = "product"\nversion = "0.1.0"\n'
+                    '[dependencies]\nhir = { path = "../../../semantic-provider/crates/hir" }\n'
+                ),
+                manifest.parent / "src/lib.rs": "pub fn product() {}\n",
+                provider: '[package]\nname = "hir"\nversion = "0.1.0"\n',
+                provider.parent / "src/lib.rs": "pub fn provider() {}\n",
+            }
+            for path, contents in files.items():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(contents)
+            before = {path: path.read_bytes() for path in files}
+            relative = tomllib.loads(manifest.read_text())["dependencies"]["hir"]["path"]
+            if (manifest.parent / relative / "Cargo.toml").resolve() != provider:
+                raise AssertionError("populated original relative-dependency control failed")
+            environment = os.environ | {
+                "product_root": str(product_root),
+                "product_manifest": str(manifest),
+                "RUNNER_TEMP": str(root),
+                "inventory_test_python": sys.executable,
+                "inventory_test_probe": probe,
+                "inventory_test_provider": str(provider),
+            }
+            command = (
+                "set -euo pipefail\n" + copy_body
+                + '\n"$inventory_test_python" -c "$inventory_test_probe" '
+                '"$inventory_root" "$inventory_manifest" "$inventory_test_provider"\n'
+            )
+            completed = subprocess.run(
+                ["bash", "-c", command], env=environment,
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+            if any(
+                not path.is_file() or path.read_bytes() != contents
+                for path, contents in before.items()
+            ):
+                return "inventory changed protected source inputs"
+            if completed.returncode != 0:
+                return completed.stderr[-2048:]
+            output = json.loads(completed.stdout)
+            if Path(output["inventory_root"]).exists():
+                return "inventory copy survived terminal cleanup"
+            return None
+
+    if failure := exercise(body):
+        raise AssertionError(f"live distribution inventory copy failed: {failure}")
+    mutants = {
+        "displaced relative dependency": (
+            re.sub(
+                r"^inventory_root=.*$",
+                'inventory_root="$RUNNER_TEMP/displaced"\nmkdir "$inventory_root"',
+                body, count=1, flags=re.MULTILINE,
+            ),
+            "inventory moved the relative provider dependency",
+        ),
+        "omitted source copy": (
+            re.sub(r"^cp -a.*$", ":", body, count=1, flags=re.MULTILINE),
+            "inventory manifest was not copied",
+        ),
+        "omitted terminal cleanup": (
+            body.replace('trap \'rm -rf -- "$inventory_root"\' EXIT', ":", 1),
+            "inventory copy survived terminal cleanup",
+        ),
+    }
+    for name, (mutant, expected) in mutants.items():
+        if mutant == body:
+            raise AssertionError(f"inventory copy mutant did not change {name}")
+        failure = exercise(mutant)
+        if failure is None or expected not in failure:
+            raise AssertionError(
+                f"inventory copy {name} did not fail for its exact reason: {failure}"
+            )
+    print(
+        "distribution-inventory-copy: OK "
+        "(4 protected files; relative dependency; isolated writes; "
+        "3 sabotages; zero copy residue)"
+    )
 
 
 def fixture() -> str:
@@ -1646,6 +1762,7 @@ def self_test() -> int:
             raise AssertionError(
                 f"forbidden distribution fragment did not fire: {fragment!r}"
             )
+    prove_distribution_inventory_copy()
 
     valid_integration = "\n".join(
         (
@@ -1764,6 +1881,7 @@ dependencies = [
         + len(DISTRIBUTION_REQUIRED_FRAGMENT_COUNTS)
         + len(DISTRIBUTION_FORBIDDEN_FRAGMENTS)
         + 4  # build/package disk-step omission and ordering controls
+        + 3  # relative dependency, copy omission, and terminal cleanup controls
         + len(integration_sabotages)
         + len(test_profile_sabotages)
         + len(lock_sabotages)

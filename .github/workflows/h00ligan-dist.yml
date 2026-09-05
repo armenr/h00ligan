@@ -120,7 +120,9 @@ jobs:
             target: aarch64-apple-darwin
             platform: macos-arm64
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    # The Intel runner's measured cold build takes ~82 minutes before installed
+    # acceptance starts. Preserve every test bound and give the whole job room.
+    timeout-minutes: ${{ matrix.platform == 'macos-amd64' && 150 || 90 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (checked 2026-08-16)
         with:
@@ -463,25 +465,34 @@ jobs:
           product_root="$(printf '%s\n' "$product_details" | sed -n 's/^H00LIGAN_PRODUCT_ROOT=//p')"
           product_manifest="$(printf '%s\n' "$product_details" | sed -n 's/^H00LIGAN_PRODUCT_MANIFEST=//p')"
           product_lockfile="$(printf '%s\n' "$product_details" | sed -n 's/^H00LIGAN_PRODUCT_LOCKFILE=//p')"
+          provider_source_root="$(printf '%s\n' "$product_details" | sed -n 's/^H00_RA_SOURCE_ROOT=//p')"
           [[ -d "$product_root" && -f "$product_manifest" && -f "$product_lockfile" ]]
+          [[ -d "$provider_source_root" ]]
           cmp "$product_lockfile" providers/rust-analyzer/h00ligan-product.Cargo.lock
           devbox run -- cargo fetch --locked --manifest-path "$product_manifest"
 
-          inventory_root="$RUNNER_TEMP/h00ligan-product-inventory"
-          cp -a "$product_root" "$inventory_root"
+          # Relative provider dependencies are rooted beside this generation.
+          # A disposable sibling preserves that topology without allowing the
+          # inventory tools to write into the immutable product source tree.
+          inventory_root="$(mktemp -d "${product_root%/*}/h00ligan-inventory.XXXXXX")"
+          trap 'rm -rf -- "$inventory_root"' EXIT
+          cp -a "$product_root/." "$inventory_root/"
           product_manifest_relative="${product_manifest#"$product_root"/}"
           inventory_manifest="$inventory_root/$product_manifest_relative"
           cargo metadata --locked --manifest-path "$inventory_manifest" \
             --format-version 1 >/dev/null
           while read -r platform target; do
+            # Preserve the assembled package identity and its nested binary
+            # target; binary-only mode aliases the h00ligan library coordinate.
             cargo cyclonedx \
               --manifest-path "$inventory_manifest" \
-              --format json --describe binaries --spec-version 1.5 \
+              --format json --describe crate --spec-version 1.5 \
               --target "$target" --no-default-features
-            generated_sbom="${inventory_manifest%/Cargo.toml}/h00ligan-product_bin.cdx.json"
+            generated_sbom="${inventory_manifest%/Cargo.toml}/h00ligan-product.cdx.json"
             python3 scripts/normalize-h00ligan-sbom.py \
               --sbom "$generated_sbom" \
-              --workspace-root "$inventory_root"
+              --workspace-root "$inventory_root" \
+              --source-root "rust-analyzer=$provider_source_root"
             install -m 0644 "$generated_sbom" \
               "$RUNNER_TEMP/h00ligan-inventory/$platform.cdx.json"
             python3 scripts/check-h00ligan-sbom.py \
