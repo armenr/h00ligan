@@ -3582,6 +3582,10 @@ fn installed_go_workspace_watch_does_not_rerun_an_unchanged_module() {
 #[test]
 #[ignore = "requires H00_TEST_H00LIGAN_BINARY, Go, and native signal delivery"]
 fn installed_independent_go_project_input_change_reuses_only_affected_root() {
+    assert!(
+        std::thread::available_parallelism().is_ok_and(|parallelism| parallelism.get() >= 2),
+        "installed provider-concurrency acceptance requires at least two logical CPUs"
+    );
     let binary = PathBuf::from(
         std::env::var_os("H00_TEST_H00LIGAN_BINARY")
             .expect("H00_TEST_H00LIGAN_BINARY for installed WATCH acceptance"),
@@ -3648,6 +3652,10 @@ fn installed_independent_go_project_input_change_reuses_only_affected_root() {
         .args([
             "watch",
             "--scip",
+            // This test asserts two concurrent roots; the automatic CPU
+            // budget deliberately permits only one on smaller machines.
+            "--jobs",
+            "2",
             "--format",
             "json",
             "--profile",

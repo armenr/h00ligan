@@ -7,6 +7,7 @@ import argparse
 import copy
 import os
 import re
+import runpy
 import shutil
 import subprocess
 import sys
@@ -839,6 +840,96 @@ exec "$H00_TEST_REAL_MKDIR" "$@"
             )
 
 
+def prove_installed_gate_go_environment(gate: str) -> None:
+    """Run the real entrypoint through SDK selection, stopping before any build."""
+    with tempfile.TemporaryDirectory(prefix="h00ligan-installed-go.") as raw_root:
+        root = Path(raw_root)
+        repo = root / "repo with spaces"
+        scripts = repo / "scripts"
+        scripts.mkdir(parents=True)
+        gate_path = scripts / "test-h00ligan-installed-product.sh"
+        gate_path.write_text(gate, encoding="utf-8")
+        gate_path.chmod(0o755)
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        # Deliberately exclude ambient Go, Cargo and Devbox. The fixture must
+        # reach the selected SDK and the build boundary without any of them.
+        for name in ("bash", "dirname", "mkdir", "mktemp", "rm", "rmdir", "sed"):
+            tool = shutil.which(name)
+            if tool is None:
+                raise AssertionError(f"installed Go environment probe requires {name}")
+            (bin_dir / name).symlink_to(tool)
+        sdk_bin = root / "pinned sdk/bin"
+        sdk_bin.mkdir(parents=True)
+        go_tool = sdk_bin / "go"
+        go_tool.write_text(
+            '#!/usr/bin/env bash\nprintf "pinned-go-positive\\n"\n',
+            encoding="utf-8",
+        )
+        go_tool.chmod(0o755)
+        resolver = scripts / "resolve-h00-official-go-sdk.sh"
+        resolver.write_text(
+            '#!/usr/bin/env bash\nset -euo pipefail\n'
+            '[[ "$H00_TEST_RESOLVER_MODE" != failed ]] || exit 71\n'
+            'printf "H00_GO_SDK_TOOL=%s\\n" "$H00_TEST_GO_TOOL"\n',
+            encoding="utf-8",
+        )
+        resolver.chmod(0o755)
+        builder = scripts / "build-h00ligan-portable.sh"
+        builder.write_text(
+            '#!/usr/bin/env bash\nset -euo pipefail\n'
+            'echo builder-reached >&2\n'
+            'go version >&2\n'
+            '[[ "$(command -v go)" == "$H00_TEST_GO_TOOL" ]]\n'
+            '[[ "${GOROOT:-}" == "$H00_TEST_GO_ROOT" ]]\n'
+            '[[ "${GOENV:-}" == off && "${GOTOOLCHAIN:-}" == local ]]\n'
+            'exit 73\n',
+            encoding="utf-8",
+        )
+        builder.chmod(0o755)
+        environment = {
+            "PATH": str(bin_dir),
+            "DEVBOX_PACKAGES_DIR": "ci-contract-self-test",
+            "H00_TEST_GO_TOOL": str(go_tool),
+            "H00_TEST_GO_ROOT": str(sdk_bin.parent),
+            "H00_TEST_RESOLVER_MODE": "ready",
+            "GOROOT": str(root / "wrong ambient SDK"),
+            "GOENV": str(root / "wrong ambient Go configuration"),
+            "GOTOOLCHAIN": "auto",
+        }
+        for mode in ("no-ambient-go", "wrong-ambient-go", "failed", "missing-tool"):
+            trial = environment.copy()
+            if mode == "wrong-ambient-go":
+                ambient_go = bin_dir / "go"
+                ambient_go.write_text(
+                    '#!/usr/bin/env bash\necho wrong-ambient-go >&2\nexit 72\n',
+                    encoding="utf-8",
+                )
+                ambient_go.chmod(0o755)
+            elif mode == "failed":
+                trial["H00_TEST_RESOLVER_MODE"] = "failed"
+            elif mode == "missing-tool":
+                trial["H00_TEST_GO_TOOL"] = str(root / "missing/bin/go")
+            completed = subprocess.run(
+                [str(bin_dir / "bash"), str(gate_path)], cwd=repo, env=trial,
+                capture_output=True, text=True, check=False, timeout=10,
+            )
+            if mode in ("no-ambient-go", "wrong-ambient-go"):
+                if completed.returncode != 73 or "pinned-go-positive" not in completed.stderr:
+                    raise AssertionError(
+                        f"installed entrypoint did not select the pinned SDK with {mode}: "
+                        f"exit={completed.returncode}, stderr={completed.stderr[-500:]!r}"
+                    )
+            elif mode == "failed":
+                if completed.returncode != 71 or "builder-reached" in completed.stderr:
+                    raise AssertionError("failed SDK resolution did not stop before the build")
+            elif completed.returncode != 1 or "builder-reached" in completed.stderr:
+                raise AssertionError("absent SDK executable did not stop before the build")
+            if list((repo / "target/h00ligan-test-tmp").glob("installed-product.*")):
+                raise AssertionError(f"installed Go environment probe left residue for {mode}")
+    print("installed-go-environment: OK (2 positive and 2 early-failure controls)")
+
+
 def validate_pyrefly_provider_test(test: str | None) -> list[str]:
     """Require the retained provider epoch to replace, not accumulate, call truth."""
     if test is None:
@@ -859,6 +950,55 @@ def validate_build_authority_gate(gate: str | None) -> list[str]:
         for fragment in BUILD_AUTHORITY_REQUIRED_FRAGMENTS
         if fragment not in gate
     ]
+
+
+def prove_build_authority_failure_diagnostics() -> None:
+    """A bounded failed wait must retain the child's actual diagnostic evidence."""
+    gate = runpy.run_path(str(Path(__file__).with_name("test-h00ligan-build-authority.py")))
+    with tempfile.TemporaryDirectory(prefix="h00-build-wait-controls.") as raw:
+        root = Path(raw)
+        for mode in ("ready", "barrier-timeout", "terminal-timeout", "early-exit"):
+            case = root / mode
+            case.mkdir()
+            ready = case / "ready"
+            child = (
+                "import pathlib, sys, time\n"
+                "print('x' * 32768 + 'stdout-tail-control', flush=True)\n"
+                "print('y' * 32768 + 'stderr-tail-control', file=sys.stderr, flush=True)\n"
+                "pathlib.Path(sys.argv[1]).touch()\n"
+                + ("sys.exit(7)\n" if mode == "early-exit" else "time.sleep(30)\n")
+            )
+            run = gate["BuilderRun"]([sys.executable, "-c", child, str(ready)], os.environ.copy(), case)
+            try:
+                gate["wait_for"](ready, run, "populated diagnostic control", timeout=10)
+                if mode == "ready":
+                    if run.process.poll() is not None:
+                        raise AssertionError("live barrier positive control did not fire")
+                    continue
+                try:
+                    if mode == "terminal-timeout":
+                        run.finish(timeout=0.1)
+                    else:
+                        gate["wait_for"](
+                            case / "never-ready", run, "controlled missing barrier",
+                            timeout=10 if mode == "early-exit" else 0.1,
+                        )
+                except AssertionError as error:
+                    message = str(error)
+                    expected = "builder exited 7" if mode == "early-exit" else "timed out"
+                    if expected not in message:
+                        raise AssertionError(f"{mode} failed for the wrong reason: {message!r}") from error
+                    if "stdout-tail-control" not in message or "stderr-tail-control" not in message:
+                        raise AssertionError(f"{mode} discarded the child's populated diagnostics") from error
+                    if len(message.encode()) > 18000:
+                        raise AssertionError(f"{mode} returned unbounded child diagnostics") from error
+                else:
+                    raise AssertionError(f"{mode} incorrectly succeeded")
+            finally:
+                run.terminate()
+                if run.process.poll() is None:
+                    raise AssertionError(f"{mode} left its child running")
+    print("build-authority-diagnostics: OK (live barrier plus 3 bounded failure controls)")
 
 
 def validate_performance_battery(
@@ -1401,6 +1541,7 @@ def self_test() -> int:
     prove_installed_gate_early_failure_cleanup(
         live_installed_gate.read_text(encoding="utf-8")
     )
+    prove_installed_gate_go_environment(live_installed_gate.read_text(encoding="utf-8"))
 
     valid_pyrefly_test = "\n".join(PYREFLY_PROVIDER_TEST_REQUIRED_FRAGMENTS)
     if failures := validate_pyrefly_provider_test(valid_pyrefly_test):
@@ -1421,6 +1562,7 @@ def self_test() -> int:
             raise AssertionError(
                 f"build-authority omission did not fire for {fragment!r}"
             )
+    prove_build_authority_failure_diagnostics()
 
     valid_performance_harness = "\n".join(PERFORMANCE_HARNESS_REQUIRED_FRAGMENTS)
     valid_performance_wrapper = "\n".join(PERFORMANCE_WRAPPER_REQUIRED_FRAGMENTS)
@@ -1611,8 +1753,10 @@ dependencies = [
         + len(PYREFLY_BUILDER_FORBIDDEN_FRAGMENTS)
         + len(INSTALLED_GATE_REQUIRED_FRAGMENTS)
         + 4
+        + 2  # installed Go SDK resolution/executable failures before any build
         + len(PYREFLY_PROVIDER_TEST_REQUIRED_FRAGMENTS)
         + len(BUILD_AUTHORITY_REQUIRED_FRAGMENTS)
+        + 3  # barrier timeout, terminal timeout, and early-exit diagnostic controls
         + len(PERFORMANCE_HARNESS_REQUIRED_FRAGMENTS)
         + len(PERFORMANCE_HARNESS_FORBIDDEN_FRAGMENTS)
         + len(PERFORMANCE_WRAPPER_REQUIRED_FRAGMENTS)
