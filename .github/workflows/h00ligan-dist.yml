@@ -166,7 +166,16 @@ jobs:
           echo "DEVBOX_PACKAGES_DIR=$native_root/packages" >> "$GITHUB_ENV"
           echo "$native_root/bin" >> "$GITHUB_PATH"
 
+      - name: Install the pinned Rust toolchain inside Devbox
+        if: startsWith(matrix.platform, 'linux-')
+        run: |
+          devbox run -- rustup toolchain install 1.97.1 \
+            --profile minimal \
+            --target "${{ matrix.target }}" \
+            --no-self-update
+
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0 (checked 2026-08-16)
+        if: startsWith(matrix.platform, 'macos-')
         with:
           toolchain: 1.97.1
           target: ${{ matrix.target }}
@@ -320,6 +329,13 @@ jobs:
           target: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,x86_64-apple-darwin,aarch64-apple-darwin
           rustflags: ""
           cache: false
+
+      - name: Install the pinned Rust inventory toolchain inside Devbox
+        run: |
+          devbox run -- rustup toolchain install 1.97.1 \
+            --profile minimal \
+            --target x86_64-unknown-linux-musl \
+            --no-self-update
 
       - name: Fetch the exact locked inventory dependencies
         run: |
