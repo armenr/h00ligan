@@ -252,14 +252,43 @@ fn isolated_toolchain_search_path(
     tools: &[&str],
 ) -> std::ffi::OsString {
     let current_path = std::env::var_os("PATH").unwrap_or_default();
+    // A rustup proxy is not a relocatable compiler: the child deliberately
+    // loses RUSTUP_HOME/RUSTUP_TOOLCHAIN when its environment is cleared.
+    // Resolve the selected compiler while that authority is still present,
+    // then expose only the concrete drivers from the same installed sysroot.
+    let rust_sysroot = tools
+        .iter()
+        .any(|tool| matches!(*tool, "cargo" | "rustc"))
+        .then(|| {
+            let report = Command::new("rustc")
+                .args(["--print", "sysroot"])
+                .output()
+                .expect("resolve selected Rust sysroot before isolating PATH");
+            assert!(report.status.success(), "selected Rust sysroot: {report:?}");
+            PathBuf::from(
+                String::from_utf8(report.stdout)
+                    .expect("UTF-8 selected Rust sysroot")
+                    .trim(),
+            )
+        });
     let isolated_bin = temporary.path().join(directory_name);
     std::fs::create_dir_all(&isolated_bin).expect("isolated toolchain PATH directory");
     for tool in tools {
-        let executable = std::env::split_paths(&current_path)
-            .map(|directory| directory.join(tool))
-            .find(|candidate| candidate.is_file())
-            .and_then(|candidate| std::fs::canonicalize(candidate).ok())
-            .unwrap_or_else(|| panic!("installed {tool} driver in PATH"));
+        let candidate = if matches!(*tool, "cargo" | "rustc") {
+            rust_sysroot
+                .as_ref()
+                .expect("selected Rust sysroot")
+                .join("bin")
+                .join(tool)
+        } else {
+            std::env::split_paths(&current_path)
+                .map(|directory| directory.join(tool))
+                .find(|candidate| candidate.is_file())
+                .unwrap_or_else(|| panic!("installed {tool} driver in PATH"))
+        };
+        let executable = std::fs::canonicalize(&candidate).unwrap_or_else(|error| {
+            panic!("resolve exact {} driver: {error}", candidate.display())
+        });
         std::os::unix::fs::symlink(&executable, isolated_bin.join(tool))
             .unwrap_or_else(|error| panic!("link exact {tool} driver into isolated PATH: {error}"));
         assert!(isolated_bin.join(tool).is_file(), "positive {tool} control");
@@ -281,6 +310,49 @@ fn go_only_search_path(temporary: &TempDir) -> std::ffi::OsString {
 
 fn go_and_rust_search_path(temporary: &TempDir) -> std::ffi::OsString {
     isolated_toolchain_search_path(temporary, "go-rust-only-bin", &["go", "cargo", "rustc"])
+}
+
+#[test]
+fn isolated_rust_toolchain_uses_selected_compiler_without_rustup_state() {
+    let temporary = TempDir::new().expect("isolated Rust toolchain fixture");
+    let report = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .expect("query selected Rust sysroot before clearing the environment");
+    assert!(report.status.success(), "selected Rust toolchain must work");
+    let sysroot = PathBuf::from(
+        String::from_utf8(report.stdout)
+            .expect("UTF-8 selected Rust sysroot")
+            .trim(),
+    );
+    let search_path =
+        isolated_toolchain_search_path(&temporary, "rust-only-bin", &["rustc", "cargo"]);
+    let isolated_bin = std::env::split_paths(&search_path)
+        .next()
+        .expect("one isolated toolchain directory");
+    for tool in ["rustc", "cargo"] {
+        let selected = std::fs::canonicalize(sysroot.join("bin").join(tool))
+            .expect("concrete selected Rust toolchain executable");
+        let isolated = isolated_bin.join(tool);
+        assert_eq!(
+            std::fs::canonicalize(&isolated).expect("isolated executable target"),
+            selected,
+            "isolated {tool} must preserve the selected compiler, not a rustup launcher that loses its environment"
+        );
+        let version = Command::new(&isolated)
+            .arg("--version")
+            .current_dir(temporary.path())
+            .env_clear()
+            .env("PATH", &search_path)
+            .env("CARGO_HOME", temporary.path().join("empty-cargo-home"))
+            .env("RUSTUP_HOME", temporary.path().join("empty-rustup-home"))
+            .output()
+            .expect("run isolated compiler without inherited toolchain state");
+        assert!(
+            version.status.success() && !version.stdout.is_empty(),
+            "isolated {tool} must execute without another rustup installation: {version:?}"
+        );
+    }
 }
 
 fn assert_one_embedded_go_provider(data_dir: &Path) -> PathBuf {
