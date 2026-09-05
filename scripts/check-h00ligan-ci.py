@@ -364,6 +364,17 @@ BUILD_AUTHORITY_REQUIRED_FRAGMENTS = (
 )
 
 DISTRIBUTION_REQUIRED_FRAGMENTS = (
+    "Establish the Linux release disk budget",
+    "/usr/local/lib/android",
+    "/usr/share/dotnet",
+    "/usr/local/.ghcup",
+    "/usr/share/swift",
+    'before_kib="$(df -Pk / | awk \'NR == 2 {print $4}\')"',
+    'available_kib="$(df -Pk / | awk \'NR == 2 {print $4}\')"',
+    "minimum_available_kib=$((20 * 1024 * 1024))",
+    'if [[ -L "$path" ]]; then',
+    '[[ -d "$path" ]] || {',
+    'sudo rm -rf -- "$path"',
     "Prepare native macOS product environment",
     "actions-rust-lang/setup-rust-toolchain@"
     "166cdcfd11aee3cb47222f9ddb555ce30ddb9659 "
@@ -405,7 +416,7 @@ DISTRIBUTION_REQUIRED_FRAGMENTS = (
 DISTRIBUTION_REQUIRED_FRAGMENT_COUNTS = (
     ("run_product()", 3),
     ('if [[ "$PLATFORM" == macos-* ]]; then', 3),
-    ("if: startsWith(matrix.platform, 'linux-')", 2),
+    ("if: startsWith(matrix.platform, 'linux-')", 3),
     ("if: startsWith(matrix.platform, 'macos-')", 2),
     ("PLATFORM: ${{ matrix.platform }}", 4),
     ("toolchain: 1.97.1", 2),
@@ -892,6 +903,19 @@ def validate_distribution_workflow(workflow: str) -> list[str]:
         for fragment in DISTRIBUTION_FORBIDDEN_FRAGMENTS
         if fragment in workflow
     )
+    disk_boundary = workflow.find("Establish the Linux release disk budget")
+    environment_boundary = workflow.find(
+        "Install the pinned product build environment"
+    )
+    if (
+        disk_boundary >= 0
+        and environment_boundary >= 0
+        and disk_boundary > environment_boundary
+    ):
+        failures.append(
+            "Linux release disk capacity must be established before installing "
+            "the pinned product build environment"
+        )
     return failures
 
 
@@ -1420,6 +1444,15 @@ def self_test() -> int:
             valid_distribution += "\n" + "\n".join(fragment for _ in range(missing))
     if failures := validate_distribution_workflow(valid_distribution):
         raise AssertionError(f"valid distribution workflow rejected: {failures!r}")
+    disk_boundary = "Establish the Linux release disk budget"
+    environment_boundary = "Install the pinned product build environment"
+    reordered_distribution = valid_distribution.replace(
+        disk_boundary, "__DISK_BOUNDARY__", 1
+    ).replace(environment_boundary, disk_boundary, 1).replace(
+        "__DISK_BOUNDARY__", environment_boundary, 1
+    )
+    if not validate_distribution_workflow(reordered_distribution):
+        raise AssertionError("distribution disk-boundary reorder did not fire")
     for fragment in DISTRIBUTION_REQUIRED_FRAGMENTS:
         sabotaged = valid_distribution.replace(fragment, "", 1)
         if not validate_distribution_workflow(sabotaged):
