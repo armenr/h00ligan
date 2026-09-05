@@ -57,6 +57,21 @@ export TMPDIR="$owned_tmp_root"
 scratch_root="$owned_tmp_root/acceptance"
 mkdir "$scratch_root"
 
+# Go fixtures need a project compiler in addition to the embedded provider.
+# Use the SDK already owned by our builders, including on native macOS where
+# Devbox does not supply an ambient Go. Resolve it before spending build time.
+go_sdk_details="$("$repo_root/scripts/resolve-h00-official-go-sdk.sh")"
+go_tool="$(printf '%s\n' "$go_sdk_details" | sed -n 's/^H00_GO_SDK_TOOL=//p')"
+[[ -x "$go_tool" && ! -L "$go_tool" && "$go_tool" == */bin/go ]] || {
+    echo "installed h00ligan acceptance requires the resolved official Go SDK executable" >&2
+    exit 1
+}
+go_bin_dir="${go_tool%/go}"
+export PATH="$go_bin_dir:$PATH"
+export GOROOT="${go_bin_dir%/bin}"
+export GOENV=off GOTOOLCHAIN=local
+go version
+
 binary="${H00_TEST_H00LIGAN_BINARY:-}"
 receipt="${H00_TEST_H00LIGAN_RECEIPT:-}"
 source_receipt="${H00_TEST_H00LIGAN_PRODUCT_SOURCE_RECEIPT:-}"

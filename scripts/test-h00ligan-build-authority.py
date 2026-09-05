@@ -12,6 +12,7 @@ import platform
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -83,12 +84,24 @@ class BuilderRun:
             start_new_session=True,
         )
 
+    def diagnostics(self) -> str:
+        def tail(path: Path) -> str:
+            with path.open("rb") as stream:
+                size = stream.seek(0, os.SEEK_END)
+                stream.seek(max(0, size - 4096))
+                contents = stream.read(4096).decode("utf-8", errors="replace")
+            return ("[tail] " if size > 4096 else "") + contents
+
+        return f"stdout={tail(self.stdout_path)!r} stderr={tail(self.stderr_path)!r}"
+
     def finish(self, timeout: float = 180.0) -> tuple[int, str, str]:
         try:
             returncode = self.process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             self.terminate()
-            raise AssertionError("portable builder did not terminate within the test bound")
+            raise AssertionError(
+                f"portable builder timed out before terminal exit: {self.diagnostics()}"
+            ) from None
         finally:
             self.stdout_file.close()
             self.stderr_file.close()
@@ -118,18 +131,26 @@ def wait_for(
     description: str,
     timeout: float = HARNESS_WAIT_TIMEOUT_SECONDS,
 ) -> None:
-    deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    deadline = started + timeout
+    print(f"build-authority: waiting for {description} (bound {timeout:g}s)", file=sys.stderr, flush=True)
     while time.monotonic() < deadline:
         if path.is_file() and not path.is_symlink():
+            print(
+                f"build-authority: reached {description} in {time.monotonic() - started:.3f}s",
+                file=sys.stderr, flush=True,
+            )
             return
         if run.process.poll() is not None:
-            code, stdout, stderr = run.finish()
+            run.terminate()
             raise AssertionError(
-                f"builder exited {code} before {description}: stdout={stdout!r} stderr={stderr!r}"
+                f"builder exited {run.process.returncode} before {description}: {run.diagnostics()}"
             )
         time.sleep(0.05)
     run.terminate()
-    raise AssertionError(f"timed out waiting for {description}: {path}")
+    raise AssertionError(
+        f"timed out waiting for {description}: {path}; {run.diagnostics()}"
+    )
 
 
 def parse_machine_output(stdout: str) -> dict[str, Path | str]:
