@@ -23,8 +23,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
     outputs:
       release-created: ${{ steps.release.outputs.release_created }}
       sha: ${{ steps.release.outputs.sha }}
@@ -46,12 +45,34 @@ jobs:
             echo "main advanced beyond verified $VERIFIED_SHA; a newer CI run owns release admission"
           fi
 
+      - name: Create repository-scoped release App token
+        if: steps.gate.outputs.current == 'true'
+        id: release-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0 (checked 2026-09-06)
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+          skip-token-revoke: false
+
+      - name: Verify release token repository scope
+        if: steps.gate.outputs.current == 'true'
+        env:
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh api installation/repositories | jq -e --arg repository "$GH_REPO" \
+            '.total_count == 1 and [.repositories[].full_name] == [$repository]'
+
       - name: Maintain the Release Please PR or create its draft release
         if: steps.gate.outputs.current == 'true'
         id: release
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0 (checked 2026-08-16)
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ steps.release-token.outputs.token }}
           target-branch: main
 
   distribution:
