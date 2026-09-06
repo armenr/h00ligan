@@ -2,6 +2,20 @@
 
 All notable changes to h00ligan are documented here.
 
+## [0.3.1](https://github.com/armenr/h00ligan/compare/h00ligan-v0.3.0...h00ligan-v0.3.1) (2026-09-06)
+
+
+### Bug Fixes
+
+* **ci:** authenticate release maintenance with a scoped app ([#22](https://github.com/armenr/h00ligan/issues/22)) ([1b26c87](https://github.com/armenr/h00ligan/commit/1b26c87e294081f59db78548d04a34ec18a2373e))
+* **h00ligan:** preserve explicit Go build selection ([#20](https://github.com/armenr/h00ligan/issues/20)) ([74dc46f](https://github.com/armenr/h00ligan/commit/74dc46f29ddfbb23a2c4561f67cda1abdafedd11))
+
+
+### Documentation
+
+* **h00ligan:** guide human and agent CLI MCP workflows ([76ee106](https://github.com/armenr/h00ligan/commit/76ee106b8cb30f1a4ca216b8b2596aac333011f5))
+* **h00ligan:** use plain language throughout documentation [skip ci] ([79b5300](https://github.com/armenr/h00ligan/commit/79b5300b02512f086e77e3d307c9b78a5bb930b0))
+
 ## [0.3.0](https://github.com/armenr/h00ligan/compare/h00ligan-v0.2.0...h00ligan-v0.3.0) (2026-09-03)
 
 
