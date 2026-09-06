@@ -1,6 +1,6 @@
 # Project status
 
-Last verified: 2026-09-05
+Last verified: 2026-09-06
 
 ## Released product
 
@@ -70,8 +70,36 @@ When classification is implemented, reconcile this probe and the guides.
 
 ## Current sequence and evidence limits
 
-Finish the documentation checks, then return to the queued PR baseline and
-three-target release automation/CI-cost follow-up. Address the evidenced
+The documentation and plain-language cleanup landed on main at `79b5300`.
+Current correctness work addresses Go build tags being discarded before
+provider launch; both a resolver regression and an installed-product fixture
+reproduce the omission with native Go and an untagged caller as controls.
+The development repair passes the full local Linux AMD64 `just ci-product`
+gate: explicit flags reach CLI and MCP indexing, configuration switches cannot
+reuse the old semantic generation, and tagged WATCH edits/restoration and
+restart under different tags preserve the selected caller population. The gate
+also exercises 18 installed WATCH lifecycles and four-language performance
+smoke with zero new process residue. This is not a new macOS/ARM64 acceptance
+claim and is not part of the published 0.3.0 binaries.
+
+The verification repeat also exposed a portable-builder lock handoff race.
+Lock cleanup now owns only successfully acquired locks; a lock released
+between contention and inspection is a normal handoff. Deterministic controls
+cover release, timed-out waiters, invalid entries and source-cache ownership.
+This is build machinery, not a new runtime dependency or lock subsystem.
+
+The [actual Switchboard retest](../evidence/go-build-selection-2026-09-06.md)
+now passes: the requested tag admits the previously omitted test helper, with
+seven source-verified call sites and one test root. Native Go agrees on tag
+selection; the untagged helper remains explicitly excluded. Both indexes used
+fresh scratch data and preserved all 727 tracked backend files. Native Go also
+excludes 138 explicitly constrained files under this selection; matching
+aggregate omission counts alone neither prove more defects nor establish exact
+provider per-file parity. Dynamic dispatch and bundled JavaScript qualifications
+remain visible and separate from the repaired tag-selection defect.
+
+Land this checked repair, then return to the queued PR baseline and three-target release automation/
+CI-cost follow-up. Address the evidenced
 classification depth gap before advertising full four-language dead-code
 parity. Preserve real-repository dogfood, task-level comparison, and the
 performance program in [the work plan](work-plan.md).

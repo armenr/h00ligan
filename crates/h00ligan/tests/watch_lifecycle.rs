@@ -3296,6 +3296,128 @@ fn installed_go_watch_import_change_succeeds_in_first_reconciliation() {
     );
 }
 
+/// Selected tags must survive the long-lived provider and its affected-refresh
+/// path. Restarting without them must not reuse the old semantic population.
+#[test]
+#[ignore = "requires H00_TEST_H00LIGAN_BINARY, Go, and native signal delivery"]
+fn installed_go_watch_retains_build_tags_and_recertifies_changed_selection() {
+    let binary =
+        PathBuf::from(std::env::var_os("H00_TEST_H00LIGAN_BINARY").expect("installed binary"));
+    let temporary = TempDir::new().expect("Go tag WATCH scratch");
+    let root = temporary.path().join("repo");
+    let data = temporary.path().join("data");
+    fs::create_dir(&root).expect("source directory");
+    fs::write(
+        root.join("go.mod"),
+        "module example.test/tagwatch\n\ngo 1.27\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("main.go"),
+        "package tagwatch\nfunc target() int { return 1 }\nfunc other() int { return 2 }\n",
+    )
+    .unwrap();
+    let tagged_source = concat!(
+        "//go:build contract_one && contract_two\n\npackage tagwatch\nimport \"testing\"\n",
+        "func TestTagged(t *testing.T) { if target() != 1 { t.Fatal(\"result\") } }\n",
+    );
+    let path = root.join("contract_test.go");
+    fs::write(&path, tagged_source).unwrap();
+    let search_path = go_only_search_path(&temporary);
+    let start = |flags: &str, name: &str| {
+        let stdout = temporary.path().join(format!("{name}.stdout"));
+        let stderr = temporary.path().join(format!("{name}.stderr"));
+        let child = Command::new(&binary)
+            .env_clear()
+            .env("TMPDIR", temporary.path())
+            .env("PATH", &search_path)
+            .env("GOFLAGS", flags)
+            .env("GOCACHE", temporary.path().join("go-cache"))
+            .env("GOMODCACHE", temporary.path().join("go-modules"))
+            .arg("--root")
+            .arg(&root)
+            .arg("--data-dir")
+            .arg(&data)
+            .args([
+                "watch",
+                "--scip",
+                "--allow-capability-downgrade",
+                "--format",
+                "json",
+                "--profile",
+                "--debounce-ms",
+                "25",
+                "--reconcile-secs",
+                "60",
+            ])
+            .stdout(Stdio::from(fs::File::create(&stdout).unwrap()))
+            .stderr(Stdio::from(fs::File::create(&stderr).unwrap()))
+            .spawn()
+            .expect("start Go WATCH");
+        RunningWatch {
+            child: Some(child),
+            stdout,
+            stderr,
+        }
+    };
+    let mut watch = start("-mod=readonly '-tags=contract_one contract_two'", "tagged");
+    let initial = wait_for_fresh_terminal(&mut watch, None);
+    let initial_calls = calls_json(&binary, &root, &data, "target");
+    assert_eq!(
+        initial_calls["authority"]["status"], "complete",
+        "{initial_calls}"
+    );
+    assert_eq!(
+        calls_items(&initial_calls).len(),
+        1,
+        "selected test caller: {initial_calls}"
+    );
+    assert_eq!(
+        calls_items(&initial_calls)[0]["origin"]["identity"]["name"],
+        "TestTagged"
+    );
+
+    fs::write(&path, tagged_source.replace("target()", "other()")).unwrap();
+    let changed = wait_for_fresh_terminal(&mut watch, Some(&initial));
+    let removed = calls_json(&binary, &root, &data, "target");
+    assert_eq!(removed["authority"]["status"], "complete", "{removed}");
+    assert!(
+        calls_items(&removed).is_empty(),
+        "old call survives tagged body edit: {removed}"
+    );
+    let added = calls_json(&binary, &root, &data, "other");
+    assert_eq!(calls_items(&added).len(), 1, "new tagged call: {added}");
+    fs::write(&path, tagged_source).unwrap();
+    let restored = wait_for_fresh_terminal(&mut watch, Some(&changed));
+    assert_eq!(
+        calls_items(&calls_json(&binary, &root, &data, "target")).len(),
+        1
+    );
+    assert!(watch.terminate().success());
+
+    let mut default_watch = start("-mod=readonly", "default");
+    let default_generation = wait_for_fresh_terminal(&mut default_watch, Some(&restored));
+    assert_ne!(
+        default_generation, restored,
+        "changed selection must not reuse tagged authority"
+    );
+    let default_calls = calls_json(&binary, &root, &data, "target");
+    assert_eq!(
+        default_calls["authority"]["status"], "qualified",
+        "{default_calls}"
+    );
+    assert!(
+        calls_items(&default_calls).is_empty(),
+        "excluded test is not an active caller"
+    );
+    assert!(default_watch.terminate().success());
+    assert_eq!(
+        fs::read_to_string(path).unwrap(),
+        tagged_source,
+        "byte-exact source restoration"
+    );
+}
+
 /// A healthy provider may intentionally omit a source file whose build
 /// constraints exclude it from the selected Go toolchain. The installed
 /// product must retain useful positive Calls evidence while qualifying every

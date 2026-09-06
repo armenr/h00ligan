@@ -725,20 +725,24 @@ artifact_candidate=""
 build_lock=""
 product_build_candidate=""
 cleanup() {
+    local owned_product_lock="$product_lock"
+    local owned_build_lock="$build_lock"
+    product_lock=""
+    build_lock=""
     if [[ -n "$install_temp" && -f "$install_temp" ]]; then
         rm -f -- "$install_temp"
     fi
     if [[ -n "$product_candidate" && -d "$product_candidate" ]]; then
         rm -rf -- "$product_candidate"
     fi
-    if [[ -n "$product_lock" && -d "$product_lock" ]]; then
-        rmdir -- "$product_lock" 2>/dev/null || true
+    if [[ -n "$owned_product_lock" && -d "$owned_product_lock" ]]; then
+        rmdir -- "$owned_product_lock" 2>/dev/null || true
     fi
     if [[ -n "$artifact_candidate" && -d "$artifact_candidate" ]]; then
         rm -rf -- "$artifact_candidate"
     fi
-    if [[ -n "$build_lock" && -d "$build_lock" ]]; then
-        rmdir -- "$build_lock" 2>/dev/null || true
+    if [[ -n "$owned_build_lock" && -d "$owned_build_lock" ]]; then
+        rmdir -- "$owned_build_lock" 2>/dev/null || true
     fi
     if [[ -n "$product_build_candidate" && -d "$product_build_candidate" ]]; then
         rm -rf -- "$product_build_candidate"
@@ -1145,18 +1149,19 @@ product_root="$portable_cache_root/product-source-$product_source_key"
 }
 
 if [[ ! -e "$product_root" ]]; then
-    product_lock="$product_root.lock"
-    if ! mkdir "$product_lock"; then
-        echo "h00ligan product-source preparation is already active: $product_lock" >&2
+    if ! mkdir "$product_root.lock"; then
+        echo "h00ligan product-source preparation is already active: $product_root.lock" >&2
         exit 1
     fi
+    product_lock="$product_root.lock"
     verify_live_product_inputs "$product_candidate"
     verify_product_workspace "$product_candidate" "$product_source_key" create \
         "${product_workspace_authority[@]}"
     mv "$product_candidate" "$product_root"
     product_candidate=""
-    rmdir "$product_lock"
+    lock_to_release="$product_lock"
     product_lock=""
+    rmdir "$lock_to_release"
 elif [[ ! -d "$product_root" ]]; then
     echo "h00ligan product-source cache path is not a directory: $product_root" >&2
     exit 1
@@ -1323,14 +1328,28 @@ mkdir -p "$artifact_parent" "$portable_cache_root/build-locks"
 }
 
 acquire_target_build_lock() {
-    build_lock="$portable_cache_root/build-locks/$target.lock"
+    local candidate_lock="$portable_cache_root/build-locks/$target.lock"
     local deadline=$((SECONDS + ${H00LIGAN_BUILD_LOCK_TIMEOUT_SECONDS:-900}))
     local contention_reported=0
-    while ! mkdir "$build_lock" 2>/dev/null; do
-        [[ ! -L "$build_lock" && -d "$build_lock" ]] || {
-            echo "portable target-build lock is invalid: $build_lock" >&2
+    while ! mkdir "$candidate_lock" 2>/dev/null; do
+        # One lstat distinguishes an invalid entry from a legitimate release
+        # between failed acquisition and inspection. A waiter owns no cleanup.
+        if ! python3 - "$candidate_lock" <<'PY'
+import os
+import stat
+import sys
+
+try:
+    mode = os.lstat(sys.argv[1]).st_mode
+except FileNotFoundError:
+    pass
+else:
+    if not stat.S_ISDIR(mode):
+        raise SystemExit("portable target-build lock is invalid: " + sys.argv[1])
+PY
+        then
             return 1
-        }
+        fi
         if [[ "$authority_test" == 1 && "$contention_reported" == 0 && -n "${H00LIGAN_BUILD_TEST_CAPTURE_BARRIER:-}" ]]; then
             local contention_path="$H00LIGAN_BUILD_TEST_CAPTURE_BARRIER"
             [[ "$contention_path" == "$test_root"/* && -d "$(dirname "$contention_path")" && ! -L "$(dirname "$contention_path")" ]] || {
@@ -1341,11 +1360,12 @@ acquire_target_build_lock() {
             contention_reported=1
         fi
         if ((SECONDS >= deadline)); then
-            echo "timed out waiting for portable target-build lock: $build_lock" >&2
+            echo "timed out waiting for portable target-build lock: $candidate_lock" >&2
             return 1
         fi
         sleep 0.1
     done
+    build_lock="$candidate_lock"
 }
 
 forbidden_path_args=(--forbid-path "$repo_root" --forbid-path "$HOME")
@@ -1569,8 +1589,9 @@ PY
             --source-key "$product_source_key" \
             --binary "$artifact_binary"
     fi
-    rmdir "$build_lock"
+    lock_to_release="$build_lock"
     build_lock=""
+    rmdir "$lock_to_release"
 elif [[ ! -d "$artifact_root" ]]; then
     echo "portable artifact cache path is not a directory: $artifact_root" >&2
     exit 1

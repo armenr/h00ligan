@@ -40,6 +40,7 @@ pub mod cli;
 pub mod composite_cmd;
 pub mod composite_cmd_query;
 pub mod error;
+mod go_flags;
 pub mod graph_cmd;
 pub mod index_cmd;
 pub mod ligan_cmd;
