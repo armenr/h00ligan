@@ -88,10 +88,17 @@ between contention and inspection is a normal handoff. Deterministic controls
 cover release, timed-out waiters, invalid entries and source-cache ownership.
 This is build machinery, not a new runtime dependency or lock subsystem.
 
-The exact Switchboard worktree still needs a controlled retest. Do not attribute
-its other document omissions or dynamic regions to the tag defect without
-separate evidence.
-Then return to the queued PR baseline and three-target release automation/
+The [actual Switchboard retest](../evidence/go-build-selection-2026-09-06.md)
+now passes: the requested tag admits the previously omitted test helper, with
+seven source-verified call sites and one test root. Native Go agrees on tag
+selection; the untagged helper remains explicitly excluded. Both indexes used
+fresh scratch data and preserved all 727 tracked backend files. Native Go also
+excludes 138 explicitly constrained files under this selection; matching
+aggregate omission counts alone neither prove more defects nor establish exact
+provider per-file parity. Dynamic dispatch and bundled JavaScript qualifications
+remain visible and separate from the repaired tag-selection defect.
+
+Land this checked repair, then return to the queued PR baseline and three-target release automation/
 CI-cost follow-up. Address the evidenced
 classification depth gap before advertising full four-language dead-code
 parity. Preserve real-repository dogfood, task-level comparison, and the

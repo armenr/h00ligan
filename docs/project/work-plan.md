@@ -13,7 +13,7 @@ three-platform release are complete. See [status](status.md) and
 [genealogy](../history/h00sh-genealogy.md). Do not restart the old assembly,
 transfer, or Git-cutover program. Preserve the incubator's unrelated work.
 
-## 1. Current: repair explicit Go build configuration
+## 1. Completed correctness slice: explicit Go build configuration
 
 Switchboard's real adoption trial exposed discarded `GOFLAGS`: native Go
 included a tagged test while h00ligan omitted it. The product captured explicit
@@ -40,14 +40,20 @@ Local completion (2026-09-06): resolver/adapter controls, installed CLI and MCP
 tag-selected reindexing, configuration-switch invalidation, tagged WATCH
 edit/restore/restart, and the complete Linux AMD64 `just ci-product` gate pass.
 The production change stays in the existing toolchain owner; no new cache,
-session or receipt subsystem was introduced. The remaining real-repository
-step needs the active Switchboard checkout path. Other reported omissions and
-dynamic regions remain separate investigations, not inferred fixes.
+session or receipt subsystem was introduced. The actual Switchboard standalone
+backend now passes the requested tag case: native Go selects the test document,
+and h00ligan returns seven source-verified call sites and its test root. The
+untagged control still excludes it. All 727 tracked backend files stayed
+unchanged. [Exact real-repository evidence](../evidence/go-build-selection-2026-09-06.md).
+Other reported omissions and dynamic regions remain separate qualifications,
+not inferred fixes; native Go also excludes 138 explicitly constrained files
+under the requested tag.
 
 An installed-gate repeat exposed an existing build-lock handoff/cleanup race.
-Repair it at lock admission/release, add a deterministic right-reason control,
-and rerun the full gate before checkpointing this slice. Keep this build-only
-blocker separate from Go semantic configuration and the wider CI-cost work.
+It was repaired at lock admission/release, with deterministic right-reason and
+ownership controls; the full product gate passed afterward. This build-only
+repair is separate from Go semantic configuration and the wider CI-cost work.
+Land the checked repair, then resume section 2 without starting another release.
 
 ### Completed: make the released tool understandable and usable
 
