@@ -2,8 +2,6 @@
 
 [Docs](../README.md) / Performance
 
-**Measure the wait the user actually feels.**
-
 Process startup, first index, a warm query, and an edit becoming queryable are
 different costs. The tables below keep them separate and name the workload.
 These are historical reference measurements, not new results for the currently

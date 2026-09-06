@@ -1,25 +1,22 @@
-# The h00ligan field guide
+# Documentation
 
 [Project home](../README.md) · [Downloads](https://github.com/armenr/h00ligan/releases/tag/h00ligan-v0.3.0)
 
-**Less spelunking. More understanding.**
+Start with installation and a first query, or choose a workflow below.
+These guides describe **0.3.0** unless a section identifies another version.
 
-You don’t need to learn the engine before asking your first question. Pick the
-job in front of you; follow the deeper links when they become useful.
-These user guides describe **0.3.0** unless a section explicitly says otherwise.
+## Getting started
 
-## Get your first useful answer
-
-| Start here | You’ll leave with… |
+| Guide | Contents |
 | --- | --- |
 | [Getting started](getting-started.md) | An installed binary, an index, and your first query |
-| [The guided tour](getting-started.md#try-the-guided-tour) | A tiny project with a definition, two callers, and a test you can check |
+| [The guided tour](getting-started.md#try-the-guided-tour) | A small project with a definition, two callers, and a test |
 | [MCP setup](mcp.md) | The same engine connected to your coding agent |
 
-New to the idea? [How it works](how-it-works.md) explains the map, the language
-providers, and what the result labels mean—without making you read an ADR.
+[How it works](how-it-works.md) explains indexing, language providers, and
+result labels.
 
-## Put it to work
+## Workflows
 
 | The job | The guide |
 | --- | --- |
@@ -29,17 +26,17 @@ providers, and what the result labels mean—without making you read an ADR.
 | Review potentially unused code | [Dead-code investigations](cli.md#investigate-dead-code-candidates) |
 | Compare an edit with the indexed baseline | [Structural diff and live search](cli.md#compare-the-index-with-an-edit) |
 | Keep answers current while you edit | [CLI WATCH](cli.md#keep-the-index-current-with-watch) or [MCP WATCH](mcp.md#keep-the-index-current) |
-| Get an agent to use the tool well | [Agent playbook and prompts](agent-integration.md) |
+| Configure agent workflows | [Agent instructions and prompts](agent-integration.md) |
 
-## Look something up
+## Reference
 
 - [Command reference](reference.md): every CLI verb and MCP tool, side by side.
 - [Languages and project setup](languages.md): included providers, prerequisites,
-  monorepos, and the difference between breadth and depth.
-- [Reading results](how-it-works.md#read-the-labels-not-the-tea-leaves): fresh,
+  monorepos, and capability coverage.
+- [Reading results](how-it-works.md#result-labels): fresh,
   stale, complete, qualified, and unavailable in plain language.
 - [Troubleshooting](troubleshooting.md): connection problems, confusing answers,
-  and the right kind of refresh.
+  and index recovery.
 - [Performance](performance/baseline.md): actual measurements and their workload.
 
 > [!IMPORTANT]
@@ -47,7 +44,7 @@ providers, and what the result labels mean—without making you read an ADR.
 > but **not reachability/dead-code classification in 0.3.0**. Complete Calls
 > does not mean every capability is complete. [See the capability table](languages.md#depth-and-known-limits).
 
-## Build, contribute, or go deeper
+## Contributing
 
 | Area | Start with |
 | --- | --- |
@@ -58,5 +55,5 @@ providers, and what the result labels mean—without making you read an ADR.
 | Writing or improving these docs | [Documentation style](documentation-style.md) |
 | Historical context | [Standalone genealogy](history/h00sh-genealogy.md) |
 
-Dated evidence describes the artifact tested at the time. It is useful history,
-not a promise that your installed binary has every later repair.
+Project status, work plans, and historical evidence describe development work.
+Check the version stated in a guide against your installed binary.

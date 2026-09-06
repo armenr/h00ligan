@@ -1,20 +1,18 @@
 # Using h00ligan with coding agents
 
-[Docs](README.md) / Agent playbook
-
-**Send the agent after an answer, not a bigger context window.**
+[Docs](README.md) / Agent integration
 
 An agent can use the CLI with `--format json` or the [MCP tools](mcp.md).
-Neither is a lesser interface. Both answer the same questions from the same
-index; MCP adds a persistent process and nonblocking indexing controls.
+Both return the same query results from the same index. MCP adds a persistent
+process and nonblocking indexing controls.
 
-The objective is to get to a defensible answer with less source scanning.
-Use h00ligan for identities and relationships, then read and edit source with
-the agent's ordinary tools. Do not use it ceremonially on every file.
+Use h00ligan for symbol identities and relationships, then read and edit source
+with the agent's ordinary tools. For a small file or a known location, a direct
+read may be simpler.
 
 [Investigation loop](#a-practical-investigation) ·
 [Copyable instructions](#copyable-repository-guidance) ·
-[Task prompts](#give-your-agent-a-real-job) ·
+[Task prompts](#task-prompts) ·
 [Common traps](#avoid-expensive-or-misleading-habits)
 
 ## A practical investigation
@@ -27,9 +25,9 @@ Suppose you need to change a function without missing a caller or a test:
    use the existing watcher. Wait for the exact terminal outcome.
 2. **Resolve the name.** `find` a definition; retain its file and
    `symbol_id`. Resolve ambiguity before using another symbol verb.
-3. **Read just enough.** `inspect` gives a concise dossier; `read` supplies
+3. **Read the relevant source.** `inspect` gives a summary; `read` supplies
    exact source and `type` describes members. Request selected sections when
-   a full dossier would add noise.
+   the other facets are not needed.
 4. **Trace the relevant edges.** `calls` finds incoming callers; `assess`
    gives transitive impact; `tests` identifies potential test entries.
    Use `filter=all` for an inclusive caller investigation.
@@ -43,8 +41,8 @@ Suppose you need to change a function without missing a caller or a test:
 With the [example project](getting-started.md#try-the-guided-tour), `greeting`
 resolves to `app.py`; `calls` finds `greet` and `test_greeting`;
 `tests` identifies `test_greeting`. This is enough to inspect both callers
-and select a test. It is not evidence that every Python capability works:
-`dead` remains unavailable in 0.3.0.
+and select a test. See [language support](languages.md#depth-and-known-limits)
+before requesting classification-dependent queries such as `dead`.
 
 ## Copyable repository guidance
 
@@ -78,13 +76,12 @@ read cannot materialize, and independent verification. Report misleading
 h00ligan output with the version, query, scope, and a small reproducer.
 ```
 
-This teaches tool selection and evidence handling without requiring a hook,
-service, login item, or vendor-specific plugin. A separate skill can later
-package useful workflows, but should link the [shared contract](reference.md)
-rather than redefine it. MCP permission/trust approval belongs to the host;
-repository guidance does not silently grant new privileges.
+These instructions require no hook, service, or vendor-specific plugin.
+Client-specific skills can link to the [shared reference](reference.md).
+Configure MCP permissions separately in the host; repository instructions
+do not grant tool access.
 
-## Give your agent a real job
+## Task prompts
 
 These work with either the CLI or MCP. Replace the bracketed subject before
 sending; leave indexing/refresh permission consistent with your repository rules.
@@ -99,13 +96,13 @@ Separate observed relationships from dynamic or missing evidence. Give me
 a focused change-and-test plan. Don’t edit source yet.
 ```
 
-### Find a refactor worth doing
+### Assess a possible refactor
 
 ```text
 Use h00ligan to investigate [module or directory]. Look at its dependencies,
 dependents, and coupling hotspots, then inspect the important source.
-Is there an evidenced ownership or abstraction problem, or just a busy
-shared utility? Suggest deletion, consolidation, or extraction only where
+Determine whether the relationships indicate an ownership or abstraction
+problem. Suggest deletion, consolidation, or extraction only where
 it simplifies the actual design. Label speculative ideas. Don’t edit yet.
 ```
 
@@ -119,9 +116,8 @@ runtime registration, and tests in source. If it doesn’t, explain the gap;
 don’t turn missing evidence into a deletion list. Make no changes.
 ```
 
-The last prompt is intentionally not “delete everything with zero callers.”
-In 0.3.0, Python/TypeScript classification is unavailable; an agent should
-say that, not keep reindexing until the task looks finished.
+Dead-code review requires more than a zero-caller result. Check language
+support, exported APIs, and runtime behavior before proposing a deletion.
 
 ## Avoid expensive or misleading habits
 

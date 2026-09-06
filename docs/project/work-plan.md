@@ -1,6 +1,6 @@
 # Work plan
 
-Last reconciled: 2026-09-06
+Last reconciled: 2026-09-07
 
 Keep the durable goal: truthful, portable, fast code intelligence that humans
 and agents can use in real polyglot repositories. Historical plans explain
@@ -8,11 +8,13 @@ past decisions; they do not override current evidence or operator direction.
 
 ## Current priority — documentation, then full language depth
 
-Operator reconciliation, 2026-09-06:
+Operator reconciliation, 2026-09-06; editorial revision, 2026-09-07:
 
-1. Give the repository docs a coherent visual and editorial facelift: a useful
-   front door, human CLI and agent/MCP paths, runnable examples, and honest
-   readiness. Keep it repo-native; no site framework or release build.
+1. Complete the documentation revision in PR #23: an owl identity, clear CLI
+   and agent/MCP paths, runnable examples, and explicit capability coverage.
+   Use restrained technical prose; keep development history out of user guides.
+   The historical h00.ligan page supplies visual cues only, not product claims.
+   Keep docs repo-native; no site framework or release build.
 2. Return to Python/TypeScript/JavaScript completion in section 3, ahead of
    further feature/performance claims. Successful indexing or complete Calls
    does not meet the requested full-language acceptance bar.

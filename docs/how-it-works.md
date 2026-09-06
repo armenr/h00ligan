@@ -1,14 +1,14 @@
-# A map you can ask questions of
+# How it works
 
 [Docs](README.md) / How it works
 
-A text search finds where a name appears. h00ligan helps answer what that name
-defines, who calls it, which tests lead to it, and what sits across its
-boundaries. It is a **local code-intelligence engine**: parsing plus static
-analysis, served through a CLI and MCP.
+A text search finds occurrences of a name. h00ligan resolves source definitions
+and relationships: who calls a function, which tests lead to it, and which
+modules depend on it. It combines parsing and static analysis, with results
+available through a CLI and MCP.
 
 It is not an LLM, a hosted search service, or a runtime tracer. It doesn’t
-execute your tests or rewrite your source. You bring the question—and the judgment.
+execute your tests or rewrite your source.
 
 ## From files to answers
 
@@ -38,7 +38,7 @@ The parsers and providers are shipped inside the executable. Rust/Go analysis
 also needs the project’s compatible compiler toolchain. Python/TypeScript
 providers do not need an ambient Python/Node executable, but they do need
 enough project configuration and dependency information to resolve the code.
-[Language setup](languages.md) spells this out.
+[Language setup](languages.md) lists the requirements.
 
 ## A caller is not a verdict
 
@@ -57,13 +57,12 @@ Different questions need different evidence:
 | “Is it unreachable?” | Language-specific entry points, reachability rules, and relevant call coverage |
 
 That last layer is not implemented for Python/TypeScript/JavaScript in 0.3.0.
-Caller queries can work while `dead` remains unavailable. It is unfinished
-product work, not something another SCIP installation or a retry will unlock.
+Caller queries can work while `dead` remains unavailable.
 
 For every language, reflection, runtime registration, build variants, and
 external API consumers limit what static analysis alone can conclude.
 
-## Read the labels, not the tea leaves
+## Result labels
 
 An answer has two separate dimensions: **what the index establishes** and
 **whether the live files still match it**.
@@ -102,7 +101,7 @@ are pending. You can explicitly allow earlier structural publication if your
 workflow accepts temporarily unavailable call evidence.
 [WATCH’s two policies](cli.md#keep-the-index-current-with-watch) explain the choice.
 
-## Local does not mean “run anything”
+## Local analysis and trust
 
 The index and analysis run locally; h00ligan needs no hosted analysis account.
 That is different from a blanket offline or sandbox guarantee. Semantic
@@ -114,5 +113,5 @@ executable owns the CLI, MCP server, watcher, and private providers. Embedded
 components may be materialized there; you do not install a second product or
 register a persistent service.
 
-Next: [try it](getting-started.md), [take on a real question](cli.md), or
-[connect an agent](mcp.md).
+Next: [getting started](getting-started.md), [CLI workflows](cli.md), or
+[MCP setup](mcp.md).

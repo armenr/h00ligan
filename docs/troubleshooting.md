@@ -2,16 +2,14 @@
 
 [Docs](README.md) / Troubleshooting
 
-**Let’s get you unstuck. Start with the symptom.**
-
 Start with `h00ligan --version` and `h00ligan status` for the intended root/data
-directory. Keep the error code and scope; they explain which next step matters.
+directory. Retain the error code, affected files, and configuration when diagnosing a failure.
 Do not begin by deleting the index, using `--force`, or reinstalling providers.
 
-[Can’t connect?](#setup-and-connection) ·
-[Answer looks wrong?](#coverage-and-answers) ·
-[Index or WATCH trouble?](#indexing-and-watch) ·
-[Need recovery?](#publication-recovery)
+[Connection](#setup-and-connection) ·
+[Query results](#coverage-and-answers) ·
+[Indexing and WATCH](#indexing-and-watch) ·
+[Recovery](#publication-recovery)
 
 ## Setup and connection
 
@@ -44,8 +42,9 @@ Do not begin by deleting the index, using `--force`, or reinstalling providers.
 
 ## Indexing and WATCH
 
-Cold semantic indexing can be expensive. Watch the active provider, progress,
-and heartbeat; don't compare a whole compiler load with a warm query. Use
+Cold semantic indexing loads project configuration and dependencies, so it
+typically takes longer than a warm query. Check the active provider, progress,
+and heartbeat. Use
 `--profile` for CLI timing detail. [Recorded benchmarks](performance/baseline.md)
 describe their own fixture and artifact, not a universal latency guarantee.
 
@@ -68,7 +67,7 @@ structural publication. It is a policy choice, not an error-clearing switch.
 Damaged/conflicting controls, a moved repository, or an index bound to a
 different root can require explicit recovery. First confirm the selected root
 and data directory, stop competing writers, and preserve any state you need.
-An unrelated bundle is not something to “adopt” just to make status green.
+Do not rebind an index that belongs to another project.
 
 For a confirmed intended bundle, CLI `index --scip --recover-publication` or
 MCP `reindex {"scip":true,"recover_publication":true}` requests rebuild and
@@ -91,4 +90,4 @@ source; say whether files/toolchains changed during the operation. Report a
 misleading result even if its process exit status was successful.
 
 [Open a bug report](https://github.com/armenr/h00ligan/issues/new?template=bug_report.yml).
-Small examples with an expected answer help us fix the owning problem faster.
+Include a small example with the expected result when possible.

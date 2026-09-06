@@ -2,11 +2,9 @@
 
 [Docs](README.md) / Getting started
 
-**Get it running. Ask something you can check.**
-
-By the end of this guide, you’ll have an index and know how to find a
-definition, its callers, and a relevant test. Start with your own project or
-the small guided tour below. This guide uses the released **0.3.0** executable.
+Install h00ligan, index a project, and find a definition, its callers, and a
+relevant test. Use your own project or the guided tour below. This guide uses
+the released **0.3.0** executable.
 
 [Install](#install) → [Index a project](#choose-a-project-and-index-it) →
 [Ask a question](#ask-your-first-question) → [Keep it current](#leave-watch-running)
@@ -93,8 +91,7 @@ system security globally to install it.
 
 Each archive includes the executable, a compact guide, changelog, build
 metadata, dependency inventory, and licenses. No companion binary or service
-needs to be installed. These repository guides include corrections made after
-0.3.0 was packaged; its immutable archive README may be older.
+needs to be installed.
 
 ## Choose a project and index it
 
@@ -137,7 +134,7 @@ later queries; the CLI names the active phase and emits progress heartbeats.
 
 ## Ask your first question
 
-First get the lay of the land, then find something you recognize:
+Start with a project overview, then search for a definition:
 
 ```bash
 h00ligan overview
@@ -145,7 +142,7 @@ h00ligan find '*Handler' --name --definitions-only
 ```
 
 Replace the pattern with a name from your project. `find` shows file paths and
-exact `symbol_id` selectors. Pick a result—not a guessed name—then ask:
+exact `symbol_id` selectors. Use a returned name and file in the next query:
 
 | Next question | Command shape |
 | --- | --- |
@@ -191,16 +188,14 @@ Check the results against the example source:
 | `calls greeting --filter all` | Two caller occurrences: `greet` and `test_greeting` |
 | `tests greeting` | One runnable test entry: `test_greeting` |
 
-You’ve now followed a definition out to its callers and a relevant test.
-That’s the everyday loop. `tests` finds the test; it does not run it or measure
-runtime coverage.
+`tests` identifies relevant tests through call paths. It does not execute them
+or measure runtime coverage.
 
 > [!IMPORTANT]
-> This tour also exposes unfinished work. `status` can show complete Python
-> Calls with unclassified nodes, and `dead _unused --file app.py` refuses with
-> `reachability_evidence_unavailable`. Python/TypeScript reachability
-> classification is not implemented in 0.3.0. Repeating the index will not fix
-> it; caller and test queries remain useful. [Why these are different](how-it-works.md#a-caller-is-not-a-verdict).
+> Python dead-code classification is not supported in 0.3.0. `status` can show
+> complete Calls with unclassified nodes; `dead _unused --file app.py` returns
+> `reachability_evidence_unavailable`. Caller and test queries remain available.
+> See [language support](languages.md#depth-and-known-limits).
 
 ## Leave WATCH running
 
@@ -212,9 +207,9 @@ Use another terminal for queries or edits; Ctrl-C stops WATCH. CLI and MCP can
 read the same bundle. Do not start several competing watchers for it. For an
 MCP-owned watcher, use [the MCP lifecycle](mcp.md#keep-the-index-current).
 
-## Your next move
+## Next steps
 
-- [Use it on real work](cli.md): callers, blast radius, tests, boundaries, and edits.
-- [Connect MCP](mcp.md): let your agent query the same map.
-- [Teach the workflow](agent-integration.md): copy a prompt or repository guidance.
-- [Something doesn’t line up?](troubleshooting.md) Start with the symptom.
+- [CLI workflows](cli.md): callers, change impact, tests, dependencies, and edits.
+- [MCP setup](mcp.md): connect a coding agent to the same index.
+- [Agent integration](agent-integration.md): repository instructions and task prompts.
+- [Troubleshooting](troubleshooting.md): diagnose setup, query, and indexing problems.

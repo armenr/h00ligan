@@ -44,9 +44,9 @@ providers. Rust/Go semantic loading still needs compatible project toolchains.
 Python/TypeScript semantic providers require no ambient language executable.
 All languages need suitable project/dependency resolution for complete evidence.
 
-## Current documentation and verified depth gap
+## Documentation and language support
 
-The current documentation pass adds a visual README, a task-oriented
+The documentation includes an owl wordmark, a task-oriented
 [docs home](../README.md), a plain-language [engine explanation](../how-it-works.md),
 and consistent navigation across CLI, MCP, agent, reference, and troubleshooting
 guides. Shared semantics stay in one reference; historical evidence stays
@@ -117,7 +117,7 @@ for release-PR head `92c5585`; all four source/policy checks passed without
 manual workflow approval. No release-PR auto-merge is configured, and no new
 release was published. App setup is complete, not an outstanding operator task.
 
-Current operator priority is the docs facelift, then the evidenced
+Current priority is the documentation revision in PR #23, then the
 Python/TypeScript classification depth gap and actual MNRV dogfood. Full
 language support requires end-to-end behavior, not just successful provider
 indexing. Keep the queued PR baseline, three-target release automation/CI-cost

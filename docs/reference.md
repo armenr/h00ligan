@@ -2,34 +2,33 @@
 
 [Docs](README.md) / Reference
 
-One repository model; two ways to ask it questions. The CLI's text renderer is
-for people, `--format json` is for scripts and CLI-using agents, and MCP serves
-the same typed query results through tools. This is the shared reference for
+The CLI prints text by default or JSON with `--format json`. MCP returns the
+same typed query results through tools. This is the shared reference for
 the **0.3.0** release. Use `h00ligan <verb> --help` or MCP tool discovery for
 the exhaustive argument schema of your installed build.
 
 [Pick a verb](#choose-a-verb-by-the-question) ·
-[CLI ↔ MCP](#the-deliberate-surface-differences) ·
+[CLI ↔ MCP](#cli-and-mcp-differences) ·
 [Defaults](#identity-scope-and-defaults) ·
 [Pagination](#pagination-and-bounds) ·
 [Result fields](#read-the-answer-including-its-qualifications)
 
-Learning by doing? Start with [CLI workflows](cli.md). New to terms such as
-generation or authority? [The short explanation](how-it-works.md#read-the-labels-not-the-tea-leaves)
-comes before the machine details.
+See [CLI workflows](cli.md) for examples and
+[result labels](how-it-works.md#result-labels) for definitions of generation,
+freshness, and authority.
 
 ## Choose a verb by the question
 
 | Question | CLI | MCP | What the answer means |
 | --- | --- | --- | --- |
-| What can I trust right now? | `status` | `status` | Publication, freshness, capability coverage, classification, and remedies. |
+| Is the index current, and what does it cover? | `status` | `status` | Publication, freshness, capability coverage, classification, and remedies. |
 | What is this repository made of? | `overview` | `overview` | Project units, topology, previews, and qualified health. |
 | Where is this definition? | `find QUERY` | `find` | Matching names/paths, kinds, and exact symbol selectors. |
 | What defines this type? | `type SYMBOL` | `type` | Structural members, methods, and represented relationships. |
 | Show me its source. | `read SYMBOL` | `read` | A paged source slice whose file still matches the indexed bytes. |
 | Who calls this? | `calls SYMBOL` | `calls` | Incoming, provider-evidenced source invocations—not outgoing callees. |
 | What could this change affect? | `assess SYMBOL` | `assess` | Transitive impact/blast radius, callers, tests, and qualified risk. |
-| Give me the useful context together. | `inspect SYMBOL` | `inspect` | A concise dossier of source, structure, callers, tests, and warnings. |
+| What is known about this symbol? | `inspect SYMBOL` | `inspect` | A summary of source, structure, callers, tests, and warnings. |
 | What tests could exercise this? | `tests SYMBOL` | `tests` | Runnable test entries connected through evidenced call paths; no test execution. |
 | What code deserves a dead-code review? | `dead [SYMBOL]` | `dead_code` | Qualified candidates or a single verdict, when reachability evidence exists. |
 | Where is coupling concentrated? | `audit` | `audit` | Ranked incoming coupling and qualified per-unit dead-code health, not complexity. |
@@ -45,7 +44,7 @@ comes before the machine details.
 There are **18 MCP tools**. No source-editing tool, `init`, `replace_symbol`,
 or `match` is shipped. `--help`, `--version`, and server startup are CLI concerns.
 
-## The deliberate surface differences
+## CLI and MCP differences
 
 | CLI | MCP equivalent |
 | --- | --- |

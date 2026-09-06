@@ -1,8 +1,6 @@
 # CLI workflows
 
-[Docs](README.md) / CLI field guide
-
-**A good investigation starts with a question, not a thousand-line dump.**
+[Docs](README.md) / CLI workflows
 
 The examples use the [guided-tour project](getting-started.md#try-the-guided-tour).
 Index it first, or substitute your own repository root, symbols, and file paths.
@@ -18,8 +16,6 @@ The CLI prints human-readable text by default. Every query also accepts
 
 ## Find and understand a definition
 
-“I’ve found the name. Now what am I actually looking at?”
-
 ```bash
 h00ligan --root examples/quickstart find greeting --name --definitions-only
 h00ligan --root examples/quickstart read greeting --file app.py
@@ -29,10 +25,10 @@ h00ligan --root examples/quickstart inspect greeting --file app.py
 
 `find` resolves identity; `read` returns source; `type` lists structural members;
 `inspect` combines source, structure, callers, tests, and warnings into a concise
-dossier. A missing facet does not necessarily make the other facets unusable.
+summary. A missing facet does not necessarily make the other facets unusable.
 
 Use `--sections source,callers,tests` with `inspect` to request only those facets.
-If a dossier preview is too short, use its dedicated verb and pagination.
+For more detail on a facet, use its dedicated command and pagination.
 
 For file navigation, force path interpretation:
 
@@ -44,8 +40,6 @@ Quote glob patterns such as `'*Handler'` so your shell doesn't expand them.
 There is no fuzzy “pick the nearest symbol” fallback for an ambiguous query.
 
 ## Before changing a function
-
-“If I change `greeting`, who needs my attention?”
 
 ```bash
 h00ligan --root examples/quickstart calls greeting --file app.py --filter all
@@ -68,12 +62,10 @@ After making the change, run the project's normal tests yourself. Static
 relationships help you choose what to inspect and test; they don't replace tests.
 
 In the tour, `calls` identifies `greet` and `test_greeting`; `tests` identifies
-`test_greeting`. Read those callers before changing the return format. You have
-a concrete review-and-test list, not a guarantee that a change is safe.
+`test_greeting`. Read those callers before changing the return format, then run
+the test to verify the change.
 
 ## Understand a boundary or choose a refactor
-
-“Is this module doing too much, or just used a lot?”
 
 ```bash
 h00ligan --root examples/quickstart overview
@@ -92,12 +84,9 @@ project, a lower threshold may be more useful. `--scope tests`, `conditional`,
 or `all` changes the population; preserve that scope when comparing results.
 
 High fan-in can describe a healthy shared utility. Read the dependencies and
-callers before proposing a split. Use the numbers to choose where to look,
-not to automate architectural taste.
+callers before deciding whether a module needs to be split.
 
 ## Investigate dead-code candidates
-
-“What deserves a closer look—not an automatic delete?”
 
 For a Rust/Go project with current reachability and complete relevant Calls evidence:
 
@@ -116,8 +105,6 @@ required by `dead`, even when their Calls evidence is complete. See
 [language limits](languages.md#depth-and-known-limits).
 
 ## Compare the index with an edit
-
-“What changed since the map was made?”
 
 ```bash
 h00ligan --root examples/quickstart diff app.py
@@ -159,7 +146,6 @@ structural publication for completed semantic enrichment.
 
 Use `watch --scip --require-complete-calls` when a non-complete Calls replacement
 must not publish. Don't combine this with an expectation of early, weaker output.
-No mode turns a failed provider into a successful semantic result.
 
 Defaults: 75 ms debounce, 1 s publication-control probe, 60 s deep integrity
 reconciliation. **75 ms is a quiet window, not an end-to-end latency promise.**
@@ -180,4 +166,4 @@ bound. [Pagination and limits](reference.md#pagination-and-bounds) explain the
 non-pageable previews and the source-character limit used by `read`.
 
 Next: [the command reference](reference.md) for exact flags, or
-[agent prompts](agent-integration.md#give-your-agent-a-real-job) to delegate an investigation.
+[agent prompts](agent-integration.md#task-prompts) for reusable investigation requests.
