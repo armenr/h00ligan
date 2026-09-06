@@ -1,8 +1,19 @@
 # Languages, projects, and evidence depth
 
+[Docs](README.md) / Languages and project setup
+
 h00ligan indexes Rust, Go, Python, and TypeScript/JavaScript, including JSX/TSX.
 That is not a claim that every query has equal depth in every language. Start
 with the question you need answered, then check its evidence.
+
+[What to install](#what-is-included-and-what-the-project-supplies) ·
+[What works](#depth-and-known-limits) ·
+[Monorepos](#monorepos-and-workspaces) ·
+[Toolchain changes](#toolchain-and-configuration-changes)
+
+The short answer to “Do I need another indexer?” is **no**. The answer to
+“Does every language have every capability?” is **not yet**. Those are separate
+questions, and both deserve a straight answer.
 
 ## What is included, and what the project supplies
 
@@ -150,3 +161,7 @@ analysis are not shipped language capabilities. Some configuration formats
 are **inputs to project discovery**, not fully indexed programming languages.
 New support needs meaningful questions, truthful evidence, and lifecycle
 tests—not merely another parser in a list.
+
+Next: [index your project](getting-started.md#choose-a-project-and-index-it),
+[interpret a result](how-it-works.md#read-the-labels-not-the-tea-leaves), or
+[diagnose a gap](troubleshooting.md#coverage-and-answers).

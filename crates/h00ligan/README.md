@@ -1,18 +1,20 @@
 # h00ligan — quick guide
 
+**Know the code. Then make your move.**
+
 h00ligan maps source definitions, callers, tests, and dependencies so humans
 and coding agents can understand a codebase before changing it. One local
 executable provides a human CLI, structured CLI output, repository-bound MCP,
 and WATCH. No database server, GPU, API key, or persistent service is required.
 
 This compact guide also ships inside release archives. Full guides live in the
-[repository documentation](https://github.com/armenr/h00ligan/blob/main/docs/getting-started.md).
+[documentation home](https://github.com/armenr/h00ligan/blob/main/docs/README.md).
 
 ## Install and prerequisites
 
 **0.3.0** ships Linux AMD64, Linux ARM64, and Apple Silicon archives plus
-`SHA256SUMS`. Intel Mac is deferred. The repository is currently private;
-downloads require access. Verify the downloaded archive against the checksum
+`SHA256SUMS`. Intel Mac is deferred. The repository and downloads are public.
+Verify the downloaded archive against the checksum
 manifest before extracting and installing its `h00ligan` on your `PATH`.
 Linux products are static; Apple Silicon targets macOS 11.0+ (acceptance runs
 on a current native runner, not every older OS). macOS is not Developer ID
@@ -140,6 +142,8 @@ clients receive the JSON in text content.
 
 ## More detail
 
+- [Getting started and guided tour](https://github.com/armenr/h00ligan/blob/main/docs/getting-started.md)
+- [How it works](https://github.com/armenr/h00ligan/blob/main/docs/how-it-works.md)
 - [Human CLI workflows](https://github.com/armenr/h00ligan/blob/main/docs/cli.md)
 - [MCP setup and lifecycle](https://github.com/armenr/h00ligan/blob/main/docs/mcp.md)
 - [Agent playbook](https://github.com/armenr/h00ligan/blob/main/docs/agent-integration.md)

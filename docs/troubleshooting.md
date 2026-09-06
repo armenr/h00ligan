@@ -1,15 +1,24 @@
 # Troubleshooting
 
+[Docs](README.md) / Troubleshooting
+
+**Let’s get you unstuck. Start with the symptom.**
+
 Start with `h00ligan --version` and `h00ligan status` for the intended root/data
 directory. Keep the error code and scope; they explain which next step matters.
 Do not begin by deleting the index, using `--force`, or reinstalling providers.
+
+[Can’t connect?](#setup-and-connection) ·
+[Answer looks wrong?](#coverage-and-answers) ·
+[Index or WATCH trouble?](#indexing-and-watch) ·
+[Need recovery?](#publication-recovery)
 
 ## Setup and connection
 
 | Symptom | What to check / do |
 | --- | --- |
 | `h00ligan` is not found | Use its full installed path, then fix your shell's `PATH`. A GUI MCP host may use a different environment. |
-| Release link is inaccessible | The repository is currently private. Use an account with access; this is not an installer failure. |
+| Release link is inaccessible | Use the public [0.3.0 release page](https://github.com/armenr/h00ligan/releases/tag/h00ligan-v0.3.0). Check the tag, asset name, network/proxy, and any GitHub error; an account invitation is not required. |
 | An Intel Mac archive is absent | Intel Mac is deferred. 0.3.0 ships Linux AMD64/ARM64 and Apple Silicon only. |
 | macOS refuses to open the binary | Verify its release checksum and use the normal macOS approval UI if you trust it. Do not disable security globally. |
 | MCP is connected but the index is unavailable | Discovery does not index. Call `reindex`, or run CLI `index`, with the intended semantic mode. |
@@ -80,3 +89,6 @@ shape (language, manifests, workspace/build configuration). A small reproducer
 is more useful than a raw repository or transcript. Redact secrets and private
 source; say whether files/toolchains changed during the operation. Report a
 misleading result even if its process exit status was successful.
+
+[Open a bug report](https://github.com/armenr/h00ligan/issues/new?template=bug_report.yml).
+Small examples with an expected answer help us fix the owning problem faster.

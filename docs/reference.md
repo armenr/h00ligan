@@ -1,10 +1,22 @@
 # CLI and MCP reference
 
+[Docs](README.md) / Reference
+
 One repository model; two ways to ask it questions. The CLI's text renderer is
 for people, `--format json` is for scripts and CLI-using agents, and MCP serves
 the same typed query results through tools. This is the shared reference for
 the **0.3.0** release. Use `h00ligan <verb> --help` or MCP tool discovery for
 the exhaustive argument schema of your installed build.
+
+[Pick a verb](#choose-a-verb-by-the-question) ·
+[CLI ↔ MCP](#the-deliberate-surface-differences) ·
+[Defaults](#identity-scope-and-defaults) ·
+[Pagination](#pagination-and-bounds) ·
+[Result fields](#read-the-answer-including-its-qualifications)
+
+Learning by doing? Start with [CLI workflows](cli.md). New to terms such as
+generation or authority? [The short explanation](how-it-works.md#read-the-labels-not-the-tea-leaves)
+comes before the machine details.
 
 ## Choose a verb by the question
 

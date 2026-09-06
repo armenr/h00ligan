@@ -1,13 +1,24 @@
 # CLI workflows
 
-Use h00ligan to answer a question, not to dump the whole repository into your
-terminal. The examples use the [guided-tour project](getting-started.md#try-the-guided-tour).
-With your own repository, substitute its root, symbols, and file paths.
+[Docs](README.md) / CLI field guide
+
+**A good investigation starts with a question, not a thousand-line dump.**
+
+The examples use the [guided-tour project](getting-started.md#try-the-guided-tour).
+Index it first, or substitute your own repository root, symbols, and file paths.
+
+[Understand a definition](#find-and-understand-a-definition) ·
+[Trace a change](#before-changing-a-function) ·
+[Explore boundaries](#understand-a-boundary-or-choose-a-refactor) ·
+[Review dead code](#investigate-dead-code-candidates) ·
+[Watch edits](#keep-the-index-current-with-watch)
 
 The CLI prints human-readable text by default. Every query also accepts
 `--format json`; [the reference](reference.md) explains shared bounds and fields.
 
 ## Find and understand a definition
+
+“I’ve found the name. Now what am I actually looking at?”
 
 ```bash
 h00ligan --root examples/quickstart find greeting --name --definitions-only
@@ -34,6 +45,8 @@ There is no fuzzy “pick the nearest symbol” fallback for an ambiguous query.
 
 ## Before changing a function
 
+“If I change `greeting`, who needs my attention?”
+
 ```bash
 h00ligan --root examples/quickstart calls greeting --file app.py --filter all
 h00ligan --root examples/quickstart assess greeting --file app.py --filter all --depth 3
@@ -54,7 +67,13 @@ Use `all` for an inclusive investigation; other choices are `dead` and
 After making the change, run the project's normal tests yourself. Static
 relationships help you choose what to inspect and test; they don't replace tests.
 
+In the tour, `calls` identifies `greet` and `test_greeting`; `tests` identifies
+`test_greeting`. Read those callers before changing the return format. You have
+a concrete review-and-test list, not a guarantee that a change is safe.
+
 ## Understand a boundary or choose a refactor
+
+“Is this module doing too much, or just used a lot?”
 
 ```bash
 h00ligan --root examples/quickstart overview
@@ -72,7 +91,13 @@ cyclomatic complexity or prove an architectural design is good or bad.
 project, a lower threshold may be more useful. `--scope tests`, `conditional`,
 or `all` changes the population; preserve that scope when comparing results.
 
+High fan-in can describe a healthy shared utility. Read the dependencies and
+callers before proposing a split. Use the numbers to choose where to look,
+not to automate architectural taste.
+
 ## Investigate dead-code candidates
+
+“What deserves a closer look—not an automatic delete?”
 
 For a Rust/Go project with current reachability and complete relevant Calls evidence:
 
@@ -91,6 +116,8 @@ required by `dead`, even when their Calls evidence is complete. See
 [language limits](languages.md#depth-and-known-limits).
 
 ## Compare the index with an edit
+
+“What changed since the map was made?”
 
 ```bash
 h00ligan --root examples/quickstart diff app.py
@@ -151,3 +178,6 @@ On pageable verbs, continue with the returned `page.next_cursor`, keeping the
 same arguments and generation. Do not raise `--limit` beyond its advertised
 bound. [Pagination and limits](reference.md#pagination-and-bounds) explain the
 non-pageable previews and the source-character limit used by `read`.
+
+Next: [the command reference](reference.md) for exact flags, or
+[agent prompts](agent-integration.md#give-your-agent-a-real-job) to delegate an investigation.

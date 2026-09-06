@@ -1,8 +1,15 @@
 # MCP: the same engine inside your agent
 
+[Docs](README.md) / MCP setup
+
+**Give your agent a map, not another mountain of context.**
+
 MCP is an alternative interface to the installed `h00ligan` executable, not a
 hosted service or a second analyzer. Your client starts a local process over
 stdio. It reads the same repository-local index as the CLI.
+
+[Connect](#connect-one-repository) → [Index](#build-the-first-semantic-index) →
+[Ask](#ask-the-same-questions-as-the-cli) → [Watch](#keep-the-index-current)
 
 ## Connect one repository
 
@@ -44,6 +51,10 @@ After reconnecting, the client should discover **18 tools**. Start with
 `status` and `overview`. Startup/discovery does not index the project. An
 unindexed status is a valid connected server, not a connection failure.
 
+> [!TIP]
+> Already indexed this root with the CLI? Query it immediately. MCP doesn’t
+> need a second index. Match the root and data directory, then check `status`.
+
 ## Build the first semantic index
 
 The examples below name the tool and its **arguments**, not a raw JSON-RPC
@@ -60,6 +71,15 @@ placeholder with that exact value:
 
 ```json
 {"operation_id": "<operation_id returned by reindex>"}
+```
+
+The lifecycle is small; the distinction at the end matters:
+
+```text
+reindex → operation_id → reindex_status (same ID)
+                              ├── running: check again later
+                              ├── succeeded: inspect result coverage, then query
+                              └── failed / cancelled / superseded: not success
 ```
 
 Poll at a reasonable interval while `terminal` is false; follow the reported

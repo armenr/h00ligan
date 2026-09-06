@@ -46,8 +46,11 @@ All languages need suitable project/dependency resolution for complete evidence.
 
 ## Current documentation and verified depth gap
 
-The current documentation pass separates human CLI workflows, MCP connection
-and lifecycle, agent guidance, and one shared verb/result reference.
+The current documentation pass adds a visual README, a task-oriented
+[docs home](../README.md), a plain-language [engine explanation](../how-it-works.md),
+and consistent navigation across CLI, MCP, agent, reference, and troubleshooting
+guides. Shared semantics stay in one reference; historical evidence stays
+separate from the reader’s getting-started path.
 The dependency-free Python tour is exercised against the actual 0.3.0 binary,
 not merely a development build or invented output.
 
@@ -104,15 +107,23 @@ at main `74dc46f`; all four required source/policy checks passed on the PR and
 merged main. Release Please's permission repair then created
 [PR #21 for 0.3.1](https://github.com/armenr/h00ligan/pull/21), without building
 or publishing. Its original built-in token left source CI waiting for approval.
-The current workflow change uses a repository-scoped GitHub App token to start
-those checks automatically; installed acceptance must still observe that real
-update and its exact-head CI. No release-PR auto-merge is configured.
+The App integration merged through
+[PR #22](https://github.com/armenr/h00ligan/pull/22) at `1b26c87` after green
+required checks. [Maintenance run 34035708433](https://github.com/armenr/h00ligan/actions/runs/34035708433)
+created the repository-only App token, verified its scope, updated the release
+PR, and revoked the token; distribution was skipped. That update automatically
+started [run 34035720870](https://github.com/armenr/h00ligan/actions/runs/34035720870)
+for release-PR head `92c5585`; all four source/policy checks passed without
+manual workflow approval. No release-PR auto-merge is configured, and no new
+release was published. App setup is complete, not an outstanding operator task.
 
-Return to the queued PR baseline and three-target release automation/
-CI-cost follow-up. Address the evidenced
-classification depth gap before advertising full four-language dead-code
-parity. Preserve real-repository dogfood, task-level comparison, and the
-performance program in [the work plan](work-plan.md).
+Current operator priority is the docs facelift, then the evidenced
+Python/TypeScript classification depth gap and actual MNRV dogfood. Full
+language support requires end-to-end behavior, not just successful provider
+indexing. Keep the queued PR baseline, three-target release automation/CI-cost
+follow-up, task-level comparison, and performance program in
+[the reconciled work plan](work-plan.md). Do not advertise four-language
+dead-code parity before that implementation and acceptance exist.
 
 The [performance baseline](../performance/baseline.md) remains dated,
 artifact- and fixture-bound reference evidence, not a new 0.3.0 benchmark.

@@ -1,5 +1,9 @@
 # Using h00ligan with coding agents
 
+[Docs](README.md) / Agent playbook
+
+**Send the agent after an answer, not a bigger context window.**
+
 An agent can use the CLI with `--format json` or the [MCP tools](mcp.md).
 Neither is a lesser interface. Both answer the same questions from the same
 index; MCP adds a persistent process and nonblocking indexing controls.
@@ -7,6 +11,11 @@ index; MCP adds a persistent process and nonblocking indexing controls.
 The objective is to get to a defensible answer with less source scanning.
 Use h00ligan for identities and relationships, then read and edit source with
 the agent's ordinary tools. Do not use it ceremonially on every file.
+
+[Investigation loop](#a-practical-investigation) ·
+[Copyable instructions](#copyable-repository-guidance) ·
+[Task prompts](#give-your-agent-a-real-job) ·
+[Common traps](#avoid-expensive-or-misleading-habits)
 
 ## A practical investigation
 
@@ -74,6 +83,45 @@ service, login item, or vendor-specific plugin. A separate skill can later
 package useful workflows, but should link the [shared contract](reference.md)
 rather than redefine it. MCP permission/trust approval belongs to the host;
 repository guidance does not silently grant new privileges.
+
+## Give your agent a real job
+
+These work with either the CLI or MCP. Replace the bracketed subject before
+sending; leave indexing/refresh permission consistent with your repository rules.
+
+### Trace a change before making it
+
+```text
+Investigate [function or behavior] using h00ligan and source inspection.
+Check the index root and freshness, resolve the actual definition, and
+trace callers, impact, and relevant tests. Use all callers and follow pages.
+Separate observed relationships from dynamic or missing evidence. Give me
+a focused change-and-test plan. Don’t edit source yet.
+```
+
+### Find a refactor worth doing
+
+```text
+Use h00ligan to investigate [module or directory]. Look at its dependencies,
+dependents, and coupling hotspots, then inspect the important source.
+Is there an evidenced ownership or abstraction problem, or just a busy
+shared utility? Suggest deletion, consolidation, or extraction only where
+it simplifies the actual design. Label speculative ideas. Don’t edit yet.
+```
+
+### Review potentially dead code
+
+```text
+Check whether h00ligan supports dead-code classification for this language
+and whether the relevant evidence is current and complete. If it does,
+investigate a small candidate set. Check callers, exports, build variants,
+runtime registration, and tests in source. If it doesn’t, explain the gap;
+don’t turn missing evidence into a deletion list. Make no changes.
+```
+
+The last prompt is intentionally not “delete everything with zero callers.”
+In 0.3.0, Python/TypeScript classification is unavailable; an agent should
+say that, not keep reindexing until the task looks finished.
 
 ## Avoid expensive or misleading habits
 

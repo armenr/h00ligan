@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 420" role="img" aria-labelledby="title description">
+  <title id="title">h00ligan — Know the code. Then make your move.</title>
+  <desc id="description">Local code intelligence for your terminal and your agents. A schematic traces main through greet to greeting, with test_greeting calling greeting too.</desc>
+  <defs>
+    <pattern id="grid" width="28" height="28" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="1" fill="#2b3b44"/>
+    </pattern>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0 0L8 4L0 8" fill="none" stroke="#b7ee67" stroke-width="1.4"/>
+    </marker>
+  </defs>
+  <rect width="1200" height="420" rx="20" fill="#101c24"/>
+  <rect x="600" y="24" width="576" height="372" fill="url(#grid)"/>
+  <path d="M0 20Q0 0 20 0H1180Q1200 0 1200 20" fill="none" stroke="#b7ee67" stroke-width="4"/>
+  <g font-family="Arial, Helvetica, sans-serif">
+    <text x="54" y="65" fill="#b7ee67" font-size="15" font-weight="700" letter-spacing="3">LOCAL CODE INTELLIGENCE</text>
+    <text x="48" y="171" fill="#f0f4ed" font-size="96" font-weight="800" letter-spacing="-5">h00ligan<tspan fill="#b7ee67">.</tspan></text>
+    <text x="54" y="235" fill="#f0f4ed" font-size="34" font-weight="600">Know the code.</text>
+    <text x="54" y="281" fill="#f0f4ed" font-size="34" font-weight="600">Then make your move.</text>
+    <text x="54" y="353" fill="#b3c4cc" font-size="16" letter-spacing="2">CLI  /  MCP  /  WATCH</text>
+  </g>
+  <g fill="none" stroke="#b7ee67" stroke-width="2" marker-end="url(#arrow)">
+    <path d="M827 110H895"/>
+    <path d="M994 136V207Q994 221 980 221H891"/>
+    <path d="M985 307V253Q985 241 973 241H891"/>
+  </g>
+  <g font-family="monospace" font-size="18">
+    <rect x="663" y="84" width="164" height="52" rx="8" fill="#182a34" stroke="#425763"/>
+    <text x="745" y="116" text-anchor="middle" fill="#d7e3e8">main</text>
+    <rect x="897" y="84" width="194" height="52" rx="8" fill="#182a34" stroke="#425763"/>
+    <text x="994" y="116" text-anchor="middle" fill="#d7e3e8">greet</text>
+    <rect x="672" y="196" width="217" height="72" rx="8" fill="#b7ee67"/>
+    <text x="780" y="239" text-anchor="middle" fill="#101c24" font-size="23" font-weight="700">greeting</text>
+    <rect x="879" y="309" width="212" height="52" rx="8" fill="#182a34" stroke="#e4ad76"/>
+    <text x="985" y="341" text-anchor="middle" fill="#f4cba1">test_greeting</text>
+  </g>
+  <text x="674" y="304" fill="#b3c4cc" font-size="12" font-family="Arial, Helvetica, sans-serif" letter-spacing="2">FOLLOW THE CALLERS.</text>
+</svg>
