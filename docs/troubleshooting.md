@@ -1,15 +1,22 @@
 # Troubleshooting
 
+[Docs](README.md) / Troubleshooting
+
 Start with `h00ligan --version` and `h00ligan status` for the intended root/data
-directory. Keep the error code and scope; they explain which next step matters.
+directory. Retain the error code, affected files, and configuration when diagnosing a failure.
 Do not begin by deleting the index, using `--force`, or reinstalling providers.
+
+[Connection](#setup-and-connection) ·
+[Query results](#coverage-and-answers) ·
+[Indexing and WATCH](#indexing-and-watch) ·
+[Recovery](#publication-recovery)
 
 ## Setup and connection
 
 | Symptom | What to check / do |
 | --- | --- |
 | `h00ligan` is not found | Use its full installed path, then fix your shell's `PATH`. A GUI MCP host may use a different environment. |
-| Release link is inaccessible | The repository is currently private. Use an account with access; this is not an installer failure. |
+| Release link is inaccessible | Use the public [0.3.0 release page](https://github.com/armenr/h00ligan/releases/tag/h00ligan-v0.3.0). Check the tag, asset name, network/proxy, and any GitHub error; an account invitation is not required. |
 | An Intel Mac archive is absent | Intel Mac is deferred. 0.3.0 ships Linux AMD64/ARM64 and Apple Silicon only. |
 | macOS refuses to open the binary | Verify its release checksum and use the normal macOS approval UI if you trust it. Do not disable security globally. |
 | MCP is connected but the index is unavailable | Discovery does not index. Call `reindex`, or run CLI `index`, with the intended semantic mode. |
@@ -35,8 +42,9 @@ Do not begin by deleting the index, using `--force`, or reinstalling providers.
 
 ## Indexing and WATCH
 
-Cold semantic indexing can be expensive. Watch the active provider, progress,
-and heartbeat; don't compare a whole compiler load with a warm query. Use
+Cold semantic indexing loads project configuration and dependencies, so it
+typically takes longer than a warm query. Check the active provider, progress,
+and heartbeat. Use
 `--profile` for CLI timing detail. [Recorded benchmarks](performance/baseline.md)
 describe their own fixture and artifact, not a universal latency guarantee.
 
@@ -59,7 +67,7 @@ structural publication. It is a policy choice, not an error-clearing switch.
 Damaged/conflicting controls, a moved repository, or an index bound to a
 different root can require explicit recovery. First confirm the selected root
 and data directory, stop competing writers, and preserve any state you need.
-An unrelated bundle is not something to “adopt” just to make status green.
+Do not rebind an index that belongs to another project.
 
 For a confirmed intended bundle, CLI `index --scip --recover-publication` or
 MCP `reindex {"scip":true,"recover_publication":true}` requests rebuild and
@@ -80,3 +88,6 @@ shape (language, manifests, workspace/build configuration). A small reproducer
 is more useful than a raw repository or transcript. Redact secrets and private
 source; say whether files/toolchains changed during the operation. Report a
 misleading result even if its process exit status was successful.
+
+[Open a bug report](https://github.com/armenr/h00ligan/issues/new?template=bug_report.yml).
+Include a small example with the expected result when possible.

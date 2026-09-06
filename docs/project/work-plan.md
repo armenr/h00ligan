@@ -1,10 +1,32 @@
 # Work plan
 
-Last reconciled: 2026-09-06
+Last reconciled: 2026-09-07
 
 Keep the durable goal: truthful, portable, fast code intelligence that humans
 and agents can use in real polyglot repositories. Historical plans explain
 past decisions; they do not override current evidence or operator direction.
+
+## Current priority — documentation, then full language depth
+
+Operator reconciliation, 2026-09-06; editorial revision, 2026-09-07:
+
+1. Complete the documentation revision in PR #23: an owl identity, clear CLI
+   and agent/MCP paths, runnable examples, and explicit capability coverage.
+   Use restrained technical prose; keep development history out of user guides.
+   The historical h00.ligan page supplies visual cues only, not product claims.
+   Keep docs repo-native; no site framework or release build.
+2. Return to Python/TypeScript/JavaScript completion in section 3, ahead of
+   further feature/performance claims. Successful indexing or complete Calls
+   does not meet the requested full-language acceptance bar.
+3. Exercise the actual MNRV project with a verified current one-file artifact,
+   separate test data, source corroboration, and respect for concurrent writers.
+   Turn missing behavior into owning regressions, not misleading setup advice.
+4. Finish the retained release/PR baseline in section 2 before the next shipping
+   decision; then continue performance and later-DX work in sections 4–5.
+
+The sections below preserve existing work areas and evidence; this list is
+the current execution order. Nothing is dropped. No release-PR merge, new tag,
+publication, or target-project mutation is part of the documentation pass.
 
 ## Completed baseline
 
@@ -54,8 +76,8 @@ It was repaired at lock admission/release, with deterministic right-reason and
 ownership controls; the full product gate passed afterward. This build-only
 repair is separate from Go semantic configuration and the wider CI-cost work.
 The checked repair merged as main `74dc46f` through PR #20, with all required
-PR and post-merge source checks green. Resume section 2 without starting
-another release.
+PR and post-merge source checks green. Follow the current priority above;
+this completed slice does not require another release.
 
 ### Completed: make the released tool understandable and usable
 
@@ -82,9 +104,11 @@ That condition is met; documentation was explicitly prioritized next.
 - Keep the published 0.3.0 source/tag/assets immutable.
 - Reduce evidenced cold/redundant CI work and cost without reducing acceptance.
 - Release Please's permission repair created PR #21 for 0.3.1 without a build
-  or publication. Finish the GitHub App token integration and verify a real
-  release-PR update starts its exact-head source checks without manual approval.
-  Keep the release PR unmerged until an intentional shipping decision.
+  or publication. The GitHub App integration is complete through PR #22: a
+  real App update started exact-head source CI without manual approval, and
+  all four checks passed. [Acceptance](status.md#current-sequence-and-evidence-limits).
+  Keep the release PR unmerged until an intentional shipping decision; do not
+  repeat the completed App-setup work.
 - Keep release summaries useful to humans, not just generated commit lists;
   describe improvements, remaining limitations, and upgrade implications.
 
@@ -100,9 +124,28 @@ do not paste synthetic “live” labels over unclassified nodes. Cover standalo
 and mixed repositories with right-reason, non-vacuous tests and installed
 CLI/MCP/WATCH acceptance before claiming equal dead-code depth.
 
+Cover language-owned roots, module initialization, exports, recognized test
+entries, framework registration, and dynamic-call qualifications deliberately.
+Propagate the result through `dead`, health/risk, `inspect`, `assess`, and
+mixed-language reports without changing what Calls itself proves. Preserve
+the existing compiler-backed providers and shared lifecycle owner. This is
+not solved by adding two inventory match arms or naming more parsers.
+
+The 2026-09-06 upstream Codanna inspection supplies adapter/framework test
+ideas, not evidence to replace our compiler-backed design or declare either
+product superior. Its v0.16.0 source uses compiled Tree-sitter grammars,
+language-specific resolution and shared graph traversal; its exposed surface
+does not supply an equivalent root-based dead-code classifier. The search
+covered 279 Rust files and nine registered MCP methods with caller/impact
+positives. A matched task-level runtime/accuracy comparison remains pending.
+[Inspected source](https://github.com/bartolli/codanna/tree/12e823c4d965dc8269322869df760dd12d19e415).
+
 Alongside that correctness work:
 
 - Use CLI/MCP/WATCH on real Rust, Go, Python, TypeScript and polyglot projects.
+- Prioritize the operator-named MNRV Python/TypeScript application. Read its
+  current local instructions before material testing, preserve active work,
+  and keep machine-local paths and private source out of tracked evidence.
 - Treat actively edited repositories as live work: preserve others' changes
   and separate generation evidence from current-source observations.
 - Record misleading answers, excess calls, setup friction, and scope confusion.

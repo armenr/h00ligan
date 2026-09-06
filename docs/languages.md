@@ -1,8 +1,15 @@
-# Languages, projects, and evidence depth
+# Language support
+
+[Docs](README.md) / Languages and project setup
 
 h00ligan indexes Rust, Go, Python, and TypeScript/JavaScript, including JSX/TSX.
-That is not a claim that every query has equal depth in every language. Start
-with the question you need answered, then check its evidence.
+The parsers and semantic providers are included in the executable. Project
+requirements and query coverage vary by language, as listed below.
+
+[What to install](#what-is-included-and-what-the-project-supplies) ·
+[What works](#depth-and-known-limits) ·
+[Monorepos](#monorepos-and-workspaces) ·
+[Toolchain changes](#toolchain-and-configuration-changes)
 
 ## What is included, and what the project supplies
 
@@ -23,10 +30,9 @@ state, not a prerequisite to install manually.
 provider interchange format, not an index file you need to generate yourself.
 An existing root `index.scip` is not automatically adopted or overwritten.
 
-The included provider is **not** a package manager. Set up your project's
-normal dependencies when they are needed to resolve imports. “No ambient
-Python/Node required” does not mean every missing external library can be
-inferred. Automatic compiler/toolchain download is not implemented.
+Install project dependencies as usual when they are needed to resolve imports.
+The providers do not install packages or infer the contents of missing libraries.
+Automatic compiler/toolchain download is not implemented.
 
 ## Depth and known limits
 
@@ -34,15 +40,13 @@ inferred. Automatic compiler/toolchain download is not implemented.
 | --- | --- | --- |
 | Definitions, source, types, structural relationships | Supported; valid but unrepresented syntax is qualified. | Supported; language-owned extraction and qualification. |
 | Explicit source callers and test-call paths | Provider-backed, scoped to the analyzed configuration. | Provider-backed, scoped to the analyzed configuration. |
-| Impact and dossiers | Structural and semantic facets, each with its own evidence. | Useful structural/caller/test facets; classification-dependent risk can be unavailable. |
+| Impact and inspection | Structural and semantic facets, each with its own evidence. | Structural/caller/test facets; classification-dependent risk can be unavailable. |
 | Reachability / dead-code classification | Implemented, with evidence and language-specific limits. | **Not implemented in 0.3.0.** Complete Calls alone does not make `dead` available. |
 
-The [quickstart](getting-started.md#try-the-guided-tour) is a concrete Python
-control: two callers and one test are found, Calls is complete, but `dead`
-refuses with `reachability_evidence_unavailable`. `status` can therefore report
-unclassified nodes and attention despite successful semantic indexing. Do not
-repeat indexing to “fix” an unimplemented capability. In a mixed repository,
-classification of one language does not certify another.
+Without reachability classification, `dead` returns
+`reachability_evidence_unavailable`, and `status` can report unclassified nodes
+despite complete Calls coverage. Reindexing does not enable this capability.
+In a mixed repository, classification support applies per language.
 
 For every language, preserve these boundaries:
 
@@ -59,8 +63,8 @@ For every language, preserve these boundaries:
   A local absence claim is not proof that deleting an API is safe.
 
 Strict `--require-complete-calls` is useful for tasks that demand full applicable
-Calls coverage, but can legitimately reject a repository with configuration
-exclusions. Inspect the reason; don't weaken the task's conclusion to hide it.
+Calls coverage. It can reject a repository with configuration exclusions;
+inspect the reported files and configuration before changing the indexing mode.
 
 ## Monorepos and workspaces
 
@@ -95,12 +99,13 @@ project/semantic-input symlinks have separately validated ownership rules.
 
 ### Go build tags
 
-**Released 0.3.0 discards explicit `GOFLAGS`.** The development repair retains
-supported flags and has passed local Linux AMD64 source and installed-product
-checks. It is not in the released binaries; rebuilding an unchanged 0.3.0 index
-with different tags does not work around that release's defect.
+> [!WARNING]
+> Version 0.3.0 ignores explicit `GOFLAGS`, including build tags. Custom tag
+> selection requires a build from `main` containing
+> [the GOFLAGS fix](https://github.com/armenr/h00ligan/pull/20). It is not in
+> the 0.3.0 downloads. The commands below apply to builds with that fix.
 
-With the repaired build, select tags explicitly when starting the process:
+Select tags when starting the process:
 
 ```bash
 GOFLAGS='-tags=integration,contract' h00ligan index --scip
@@ -148,5 +153,7 @@ projects; the provider process boundary is not an untrusted-code sandbox.
 PHP, SQL lineage, shell/config relationships, and arbitrary XML/YAML/JSON
 analysis are not shipped language capabilities. Some configuration formats
 are **inputs to project discovery**, not fully indexed programming languages.
-New support needs meaningful questions, truthful evidence, and lifecycle
-tests—not merely another parser in a list.
+
+Next: [index your project](getting-started.md#choose-a-project-and-index-it),
+[interpret a result](how-it-works.md#result-labels), or
+[diagnose a gap](troubleshooting.md#coverage-and-answers).

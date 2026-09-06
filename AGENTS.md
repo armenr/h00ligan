@@ -7,7 +7,9 @@ and WATCH refreshes for Rust, Go, Python, and TypeScript/JavaScript.
 ## Start here
 
 Read the root `README.md`, then `docs/agent-integration.md` for productive tool use and
-`docs/reference.md` for shared CLI/MCP semantics. `docs/getting-started.md` and `docs/mcp.md`
+`docs/reference.md` for shared CLI/MCP semantics. `docs/README.md` is the task-oriented
+documentation index; `docs/how-it-works.md` explains the model and result labels.
+`docs/getting-started.md` and `docs/mcp.md`
 cover setup; `docs/languages.md` states the depth limits. The compact
 `crates/h00ligan/README.md` also ships in release archives. Route current product judgment through
 `docs/project/status.md`, `docs/project/work-plan.md`, and the relevant `docs/architecture/`

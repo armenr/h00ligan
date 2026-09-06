@@ -6,13 +6,13 @@ executable provides a human CLI, structured CLI output, repository-bound MCP,
 and WATCH. No database server, GPU, API key, or persistent service is required.
 
 This compact guide also ships inside release archives. Full guides live in the
-[repository documentation](https://github.com/armenr/h00ligan/blob/main/docs/getting-started.md).
+[documentation home](https://github.com/armenr/h00ligan/blob/main/docs/README.md).
 
 ## Install and prerequisites
 
 **0.3.0** ships Linux AMD64, Linux ARM64, and Apple Silicon archives plus
-`SHA256SUMS`. Intel Mac is deferred. The repository is currently private;
-downloads require access. Verify the downloaded archive against the checksum
+`SHA256SUMS`. Intel Mac is deferred. The repository and downloads are public.
+Verify the downloaded archive against the checksum
 manifest before extracting and installing its `h00ligan` on your `PATH`.
 Linux products are static; Apple Silicon targets macOS 11.0+ (acceptance runs
 on a current native runner, not every older OS). macOS is not Developer ID
@@ -59,13 +59,13 @@ occurrences but must be reacquired after the generation changes.
 | Question | Verb |
 | --- | --- |
 | Find a definition / read it / inspect its type | `find`, `read`, `type` |
-| Show a concise dossier | `inspect` |
+| Summarize a symbol and its relationships | `inspect` |
 | Who calls it? What could a change affect? | `calls`, `assess` |
 | Which tests could exercise it? | `tests` (does not run tests) |
 | What dependencies cross a file/directory? | `deps` |
 | Review dead candidates / incoming-coupling hotspots | `dead`, `audit` |
 | Compare live source with the index / search live source | `diff`, `grep-context` |
-| Inspect index truth / repository structure | `status`, `overview` |
+| Check index freshness and coverage / repository structure | `status`, `overview` |
 
 Text is the default. Add `--format json` for scripts/agents and inspect errors,
 authority, freshness, and pagination. `calls` means incoming callers, not
@@ -76,15 +76,15 @@ outgoing callees. Use `--filter all` for the full caller population.
 `--scip --require-complete-calls` refuses incomplete applicable Calls
 coverage. Complete Calls does **not** enable unimplemented classification:
 Python/TypeScript reachability/dead-code classification is unavailable in
-0.3.0. Caller/test queries can still work. Do not interpret that gap as zero
-dead code or fix it by repeatedly reindexing.
+0.3.0. Caller/test queries remain available; unavailable classification does
+not mean there is no dead code.
 
 Leave `h00ligan watch --scip` running for updates; Ctrl-C stops it. WATCH
 can preserve a stronger last-good generation while semantics are pending.
 `--allow-capability-downgrade` explicitly permits early structural output
 and temporarily weaker semantic evidence. It is not a generic retry option.
 
-## MCP: the same answers
+## MCP setup
 
 Configure your MCP client's stdio server to execute:
 
@@ -140,9 +140,11 @@ clients receive the JSON in text content.
 
 ## More detail
 
+- [Getting started and guided tour](https://github.com/armenr/h00ligan/blob/main/docs/getting-started.md)
+- [How it works](https://github.com/armenr/h00ligan/blob/main/docs/how-it-works.md)
 - [Human CLI workflows](https://github.com/armenr/h00ligan/blob/main/docs/cli.md)
 - [MCP setup and lifecycle](https://github.com/armenr/h00ligan/blob/main/docs/mcp.md)
-- [Agent playbook](https://github.com/armenr/h00ligan/blob/main/docs/agent-integration.md)
+- [Agent integration](https://github.com/armenr/h00ligan/blob/main/docs/agent-integration.md)
 - [Shared verb/result reference](https://github.com/armenr/h00ligan/blob/main/docs/reference.md)
 - [Language depth and limits](https://github.com/armenr/h00ligan/blob/main/docs/languages.md)
 - [Troubleshooting](https://github.com/armenr/h00ligan/blob/main/docs/troubleshooting.md)

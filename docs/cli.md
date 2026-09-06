@@ -1,8 +1,15 @@
 # CLI workflows
 
-Use h00ligan to answer a question, not to dump the whole repository into your
-terminal. The examples use the [guided-tour project](getting-started.md#try-the-guided-tour).
-With your own repository, substitute its root, symbols, and file paths.
+[Docs](README.md) / CLI workflows
+
+The examples use the [guided-tour project](getting-started.md#try-the-guided-tour).
+Index it first, or substitute your own repository root, symbols, and file paths.
+
+[Understand a definition](#find-and-understand-a-definition) ·
+[Trace a change](#before-changing-a-function) ·
+[Explore boundaries](#understand-a-boundary-or-choose-a-refactor) ·
+[Review dead code](#investigate-dead-code-candidates) ·
+[Watch edits](#keep-the-index-current-with-watch)
 
 The CLI prints human-readable text by default. Every query also accepts
 `--format json`; [the reference](reference.md) explains shared bounds and fields.
@@ -18,10 +25,10 @@ h00ligan --root examples/quickstart inspect greeting --file app.py
 
 `find` resolves identity; `read` returns source; `type` lists structural members;
 `inspect` combines source, structure, callers, tests, and warnings into a concise
-dossier. A missing facet does not necessarily make the other facets unusable.
+summary. A missing facet does not necessarily make the other facets unusable.
 
 Use `--sections source,callers,tests` with `inspect` to request only those facets.
-If a dossier preview is too short, use its dedicated verb and pagination.
+For more detail on a facet, use its dedicated command and pagination.
 
 For file navigation, force path interpretation:
 
@@ -54,6 +61,10 @@ Use `all` for an inclusive investigation; other choices are `dead` and
 After making the change, run the project's normal tests yourself. Static
 relationships help you choose what to inspect and test; they don't replace tests.
 
+In the tour, `calls` identifies `greet` and `test_greeting`; `tests` identifies
+`test_greeting`. Read those callers before changing the return format, then run
+the test to verify the change.
+
 ## Understand a boundary or choose a refactor
 
 ```bash
@@ -71,6 +82,9 @@ cyclomatic complexity or prove an architectural design is good or bad.
 `audit` defaults to production scope and a fan-in threshold of 20. On a small
 project, a lower threshold may be more useful. `--scope tests`, `conditional`,
 or `all` changes the population; preserve that scope when comparing results.
+
+High fan-in can describe a healthy shared utility. Read the dependencies and
+callers before deciding whether a module needs to be split.
 
 ## Investigate dead-code candidates
 
@@ -132,7 +146,6 @@ structural publication for completed semantic enrichment.
 
 Use `watch --scip --require-complete-calls` when a non-complete Calls replacement
 must not publish. Don't combine this with an expectation of early, weaker output.
-No mode turns a failed provider into a successful semantic result.
 
 Defaults: 75 ms debounce, 1 s publication-control probe, 60 s deep integrity
 reconciliation. **75 ms is a quiet window, not an end-to-end latency promise.**
@@ -151,3 +164,6 @@ On pageable verbs, continue with the returned `page.next_cursor`, keeping the
 same arguments and generation. Do not raise `--limit` beyond its advertised
 bound. [Pagination and limits](reference.md#pagination-and-bounds) explain the
 non-pageable previews and the source-character limit used by `read`.
+
+Next: [the command reference](reference.md) for exact flags, or
+[agent prompts](agent-integration.md#task-prompts) for reusable investigation requests.

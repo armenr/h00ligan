@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" role="img" aria-labelledby="title description">
+  <title id="title">h00ligan</title>
+  <desc id="description">A perched owl with broad round eye discs, one crossed eye, one open amber eye, a hooked beak, feathered wings, and talons beside the h00ligan wordmark.</desc>
+  <rect width="1200" height="320" rx="16" fill="#131416"/>
+  <g transform="translate(172 16)">
+    <path d="M67 136Q47 167 61 207Q80 243 128 254Q176 243 195 207Q209 167 189 136Z" fill="#e8e4da"/>
+    <g fill="#292b2b" stroke="#e8e4da" stroke-width="5" stroke-linejoin="round">
+      <path d="M61 141Q26 167 42 217L57 239 66 211 78 222 89 185 95 158Z"/>
+      <path d="M195 141Q230 167 214 217L199 239 190 211 178 222 167 185 161 158Z"/>
+    </g>
+    <path d="M37 42 82 61Q128 41 174 61L219 42 207 77Q229 97 225 124Q220 164 176 176L128 190 80 176Q36 164 31 124Q27 97 49 77Z" fill="#292b2b" stroke="#e8e4da" stroke-width="5" stroke-linejoin="round"/>
+    <circle cx="85" cy="113" r="43" fill="#e8e4da"/>
+    <circle cx="171" cy="113" r="43" fill="#e8e4da"/>
+    <circle cx="85" cy="113" r="29" fill="#131416"/>
+    <circle cx="171" cy="113" r="29" fill="#131416"/>
+    <path d="m73 101 24 24m0-24-24 24" fill="none" stroke="#d4a017" stroke-width="8" stroke-linecap="round"/>
+    <circle cx="171" cy="113" r="20" fill="#d4a017"/>
+    <circle cx="171" cy="113" r="10" fill="#131416"/>
+    <circle cx="166" cy="108" r="3" fill="#e8e4da"/>
+    <path d="M117 148Q128 140 139 148L132 164 125 171 127 157Z" fill="#d4a017"/>
+    <g fill="none" stroke="#292b2b" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="m97 193 9 8 9-8m26 0 9 8 9-8m-40 15 9 8 9-8m-17 14 8 6 8-6"/>
+    </g>
+    <path d="M43 265H213" fill="none" stroke="#777971" stroke-width="5" stroke-linecap="round"/>
+    <g fill="none" stroke="#d4a017" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M101 244v16m-8 8 8-8 8 8m-8-8v11M155 244v16m-8 8 8-8 8 8m-8-8v11"/>
+    </g>
+  </g>
+  <text x="481" y="197" fill="#e8e4da" font-family="ui-monospace, 'DejaVu Sans Mono', monospace" font-size="116" font-weight="700" letter-spacing="-6">h<tspan fill="#d4a017">00</tspan>ligan</text>
+</svg>

@@ -1,7 +1,12 @@
 # Developing h00ligan
 
+[Docs](README.md) / Development
+
 These are **contributor** instructions. Release users do not need this build
 environment; start with [installation](getting-started.md#install) instead.
+
+Improving the guides? See [documentation style](documentation-style.md) for the
+voice, navigation, examples, and proportionate checks used here.
 
 ## Environment and source build
 

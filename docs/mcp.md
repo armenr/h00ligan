@@ -1,8 +1,13 @@
-# MCP: the same engine inside your agent
+# MCP setup
+
+[Docs](README.md) / MCP setup
 
 MCP is an alternative interface to the installed `h00ligan` executable, not a
 hosted service or a second analyzer. Your client starts a local process over
 stdio. It reads the same repository-local index as the CLI.
+
+[Connect](#connect-one-repository) → [Index](#build-the-first-semantic-index) →
+[Ask](#ask-the-same-questions-as-the-cli) → [Watch](#keep-the-index-current)
 
 ## Connect one repository
 
@@ -28,8 +33,8 @@ shape is:
 }
 ```
 
-This is a configuration **shape**, not a universal host-specific filename or
-installation command. Use your client's MCP settings and approval/reload flow.
+The configuration file and reload procedure depend on your MCP client.
+Use its MCP settings and approval flow.
 Replace both paths; do not expect `~` or shell variables in JSON to expand.
 GUI clients may not inherit your terminal's `PATH`, which is why the binary
 path is explicit. Do not wrap the server in a shell that prints banners to stdout.
@@ -43,6 +48,10 @@ tool arguments cannot switch roots. One monorepo can instead use one root.
 After reconnecting, the client should discover **18 tools**. Start with
 `status` and `overview`. Startup/discovery does not index the project. An
 unindexed status is a valid connected server, not a connection failure.
+
+> [!TIP]
+> MCP can use an index created by the CLI. Match the root and data directory,
+> then check `status`; a second index is not needed.
 
 ## Build the first semantic index
 
@@ -62,6 +71,15 @@ placeholder with that exact value:
 {"operation_id": "<operation_id returned by reindex>"}
 ```
 
+An indexing operation progresses as follows:
+
+```text
+reindex → operation_id → reindex_status (same ID)
+                              ├── running: check again later
+                              ├── succeeded: inspect result coverage, then query
+                              └── failed / cancelled / superseded: not success
+```
+
 Poll at a reasonable interval while `terminal` is false; follow the reported
 phase and progress. `terminal:true` means it ended, **not** that it succeeded.
 Require `state:"succeeded"`, inspect `result` and its capability coverage, and
@@ -70,8 +88,8 @@ Best-effort semantic indexing can succeed with an explicit coverage gap.
 
 For an automated task that needs complete applicable Calls coverage, start
 with `{"scip":true,"require_complete_calls":true}`. Without `scip:true`, a
-reindex is structural only. These flags do not enable unimplemented language
-capabilities or make dynamic behavior statically knowable.
+reindex is structural only. These flags request call coverage; they do not
+enable additional language capabilities.
 
 To cancel, call **`reindex_cancel`** with the same exact `operation_id`, then
 observe its terminal result. IDs belong to that process; do not reuse one
@@ -107,8 +125,8 @@ For a server rooted at `examples/quickstart`, call these in order:
 ```
 
 These match the [CLI tour](getting-started.md#try-the-guided-tour). A real
-project will have different names; use `find` output, not invented IDs.
-`inspect` combines a concise dossier; `assess` asks about change impact.
+project will have different names; use the definitions returned by `find`.
+`inspect` combines source and relationship summaries; `assess` reports change impact.
 Use [the shared reference](reference.md) for all tools, defaults, and paging.
 
 ## Keep the index current
@@ -156,4 +174,4 @@ retry switches. Normal query tools do not edit project source.
 
 If the client cannot connect, tools are absent, an old binary remains loaded,
 or queries return qualifications, use [troubleshooting](troubleshooting.md).
-For agent behavior rather than host plumbing, see [the playbook](agent-integration.md).
+For repository instructions and task prompts, see [agent integration](agent-integration.md).
