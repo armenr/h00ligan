@@ -58,7 +58,8 @@ targets. The existing workflow rejects using a stale green source run after
 
 ### Release automation identity
 
-Release Please uses a private GitHub App installed only on this repository.
+Release Please uses a private GitHub App token restricted to this repository.
+Install the App on only the repositories where release automation is intended.
 Configure the repository Actions variable `RELEASE_APP_CLIENT_ID` and secret
 `RELEASE_APP_PRIVATE_KEY`; never put the private key in source or release notes.
 The App needs Contents and Pull requests read-write access, no webhooks,
