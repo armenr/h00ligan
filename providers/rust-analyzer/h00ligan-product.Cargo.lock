@@ -967,7 +967,7 @@ dependencies = [
 
 [[package]]
 name = "h00ligan"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "clap",
@@ -1064,7 +1064,7 @@ dependencies = [
 
 [[package]]
 name = "h00ligan-product"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "h00ligan",
  "h00ligan-provider-protocol",
