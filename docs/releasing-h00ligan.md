@@ -16,8 +16,8 @@ at source `0bd933483ceeef6e25a0d11c822bb0e7d03bd9d9`, with three archives:
 - `h00ligan-0.3.0-linux-arm64.tar.gz`
 - `h00ligan-0.3.0-macos-arm64.tar.gz`
 
-A release-wide `SHA256SUMS` accompanies them. Repository visibility is still
-private. **Intel Mac is parked** under explicit operator direction.
+A release-wide `SHA256SUMS` accompanies them. The repository is public as
+verified on 2026-09-06. **Intel Mac is parked** under explicit operator direction.
 
 In [run 33971941146](https://github.com/armenr/h00ligan/actions/runs/33971941146),
 those three native jobs passed installed acceptance. Intel compiled but failed
@@ -31,8 +31,10 @@ build identity checks. Downloaded Linux CLI/MCP/WATCH behavior was exercised.
 Do not describe that as a green end-to-end automatic run. The workflow still
 contains the Intel lane; **reconcile its target policy before the next native
 dispatch** rather than paying for another known four-target failure. Release
-Please's next real PR creation also needs verification; a successful no-op is
-not proof that repository permissions permit creating a PR.
+Please's repository permission was repaired on 2026-09-06: maintenance
+[run 34012749986](https://github.com/armenr/h00ligan/actions/runs/34012749986/attempts/2)
+created [the 0.3.1 preparation PR](https://github.com/armenr/h00ligan/pull/21)
+without building or publishing a release.
 
 Do not retag 0.3.0, replace its assets, or rewrite its changelog to incorporate
 later documentation. Those bytes are the published historical product.
@@ -53,6 +55,33 @@ shipped set is three. That mismatch is pending engineering work, not something
 this documentation silently fixes. Preserve all acceptance checks for retained
 targets. The existing workflow rejects using a stale green source run after
 `main` advances.
+
+### Release automation identity
+
+Release Please uses a private GitHub App installed only on this repository.
+Configure the repository Actions variable `RELEASE_APP_CLIENT_ID` and secret
+`RELEASE_APP_PRIVATE_KEY`; never put the private key in source or release notes.
+The App needs Contents and Pull requests read-write access, no webhooks,
+administration permission, or running service. No personal access token is needed.
+
+After current-green-main admission, the workflow mints a short-lived installation
+token with exactly those two permissions for the current repository, checks its
+repository population, and revokes it when the job ends. The built-in
+`GITHUB_TOKEN` stays read-only in the maintenance job. Credentials are not passed
+to source-PR code or distributed binaries.
+
+The App token lets release-PR updates start normal source CI automatically.
+With the built-in token, GitHub instead requires an explicit workflow-approval
+click. This is distinct from reviewing or merging the release PR: the App does
+neither automatically. The release PR may stay open while work accumulates;
+only its intentional merge followed by green source CI starts distribution.
+See [GitHub's token-trigger rules](https://docs.github.com/en/actions/concepts/security/github_token).
+
+Before calling a credentials change accepted, observe the real maintenance
+job mint/use/revoke its token and update the release PR, then verify automatic
+CI at that exact PR head. A static workflow check or an existing secret's name
+does not prove the installed App/key pair works. Leave the release PR unmerged
+when only testing release preparation; that does not authorize publication.
 
 Before starting a future run, inspect existing queued/running jobs, the exact
 source SHA, draft/tag state and artifact availability. Reuse accepted exact-source

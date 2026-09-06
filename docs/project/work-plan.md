@@ -53,7 +53,9 @@ An installed-gate repeat exposed an existing build-lock handoff/cleanup race.
 It was repaired at lock admission/release, with deterministic right-reason and
 ownership controls; the full product gate passed afterward. This build-only
 repair is separate from Go semantic configuration and the wider CI-cost work.
-Land the checked repair, then resume section 2 without starting another release.
+The checked repair merged as main `74dc46f` through PR #20, with all required
+PR and post-merge source checks green. Resume section 2 without starting
+another release.
 
 ### Completed: make the released tool understandable and usable
 
@@ -79,8 +81,12 @@ That condition is met; documentation was explicitly prioritized next.
   Apple Silicon. Intel Mac repair is **parked**, not waived as a success.
 - Keep the published 0.3.0 source/tag/assets immutable.
 - Reduce evidenced cold/redundant CI work and cost without reducing acceptance.
-- Verify Release Please's next actual PR creation; a successful no-op run does
-  not prove repository permission for that operation.
+- Release Please's permission repair created PR #21 for 0.3.1 without a build
+  or publication. Finish the GitHub App token integration and verify a real
+  release-PR update starts its exact-head source checks without manual approval.
+  Keep the release PR unmerged until an intentional shipping decision.
+- Keep release summaries useful to humans, not just generated commit lists;
+  describe improvements, remaining limitations, and upgrade implications.
 
 Exit: a comprehensible PR baseline and a truthful, repeatable release path.
 No unrelated visibility, permission, history, or license change is implied.

@@ -48,6 +48,115 @@ PRODUCT_VERSION_UPDATERS = [
 ]
 
 
+def check_release_credentials(workflow: str) -> list[str]:
+    """Check the release steps' credential wiring; actionlint owns YAML semantics."""
+    failures: list[str] = []
+    steps = re.split(r"(?m)^      - ", workflow)[1:]
+
+    def step_with_id(step_id: str) -> str:
+        matches = [
+            step for step in steps
+            if re.search(rf"(?m)^        id: {re.escape(step_id)}$", step)
+        ]
+        return matches[0] if len(matches) == 1 else ""
+
+    token = step_with_id("release-token")
+    if not re.search(
+        r"(?m)^        uses: actions/create-github-app-token@[0-9a-f]{40}(?: #.*)?$",
+        token,
+    ):
+        failures.append("release maintenance must mint one pinned GitHub App token")
+    if "        if: steps.gate.outputs.current == 'true'\n" not in token:
+        failures.append("release App token must follow current-green-main admission")
+    inputs = re.findall(r"(?m)^          ([\w-]+): ([^\n]+)$", token)
+    expected = {
+        "client-id": "${{ vars.RELEASE_APP_CLIENT_ID }}",
+        "private-key": "${{ secrets.RELEASE_APP_PRIVATE_KEY }}",
+        "owner": "${{ github.repository_owner }}",
+        "repositories": "${{ github.event.repository.name }}",
+        "permission-contents": "write",
+        "permission-pull-requests": "write",
+        "skip-token-revoke": "false",
+    }
+    if len(inputs) != len(expected) or dict(inputs) != expected:
+        failures.append(
+            "release App token must be repository-scoped, least-privilege and revoked"
+        )
+    release = step_with_id("release")
+    if not re.search(
+        r"(?m)^          token: \$\{\{ steps\.release-token\.outputs\.token \}\}$",
+        release,
+    ):
+        failures.append(
+            "Release Please must use the App token so its PR checks run unattended"
+        )
+    if token and release and workflow.index(token) > workflow.index(release):
+        failures.append("release App token must be minted before Release Please")
+    return failures
+
+
+def check_release_credentials_canaries() -> list[str]:
+    good = """jobs:
+  release-please:
+    steps:
+      - name: Mint release credentials
+        if: steps.gate.outputs.current == 'true'
+        id: release-token
+        uses: actions/create-github-app-token@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+          skip-token-revoke: false
+      - name: Maintain release
+        id: release
+        with:
+          token: ${{ steps.release-token.outputs.token }}
+"""
+    failures = check_release_credentials(good)
+    if failures:
+        return [f"release credential known-positive failed: {failures!r}"]
+    prefix, token_and_release = good.split("      - name: Mint release credentials", 1)
+    token_step, release_step = token_and_release.split("      - name: Maintain release", 1)
+    mutants = {
+        "built-in token": good.replace(
+            "token: ${{ steps.release-token.outputs.token }}",
+            "token: ${{ secrets.GITHUB_TOKEN }}",
+        ),
+        "mutable action": good.replace("a" * 40, "v3"),
+        "wrong repository": good.replace("github.event.repository.name", "vars.OTHER_REPO"),
+        "whole installation": good.replace(
+            "          repositories: ${{ github.event.repository.name }}\n", ""
+        ),
+        "unrestricted permissions": good.replace(
+            "          permission-contents: write\n", ""
+        ),
+        "extra permissions": good.replace(
+            "          permission-contents: write\n",
+            "          permission-contents: write\n          permission-administration: write\n",
+        ),
+        "unrevoked token": good.replace("skip-token-revoke: false", "skip-token-revoke: true"),
+        "missing freshness gate": good.replace(
+            "        if: steps.gate.outputs.current == 'true'\n", ""
+        ),
+        "duplicate input": good.replace(
+            "          owner: ${{ github.repository_owner }}\n",
+            "          owner: ${{ github.repository_owner }}\n" * 2,
+        ),
+        "reordered token": (
+            prefix + "      - name: Maintain release" + release_step
+            + "      - name: Mint release credentials" + token_step
+        ),
+    }
+    for name, mutant in mutants.items():
+        if mutant == good or not check_release_credentials(mutant):
+            failures.append(f"release credential mutant escaped: {name}")
+    return failures
+
+
 def check_product_release_scope(
     config: dict[object, object],
     manifest: dict[object, object],
@@ -323,6 +432,8 @@ def main() -> int:
 
     version = cargo.get("package", {}).get("version")
     failures = check_product_release_scope_canaries()
+    failures.extend(check_release_credentials_canaries())
+    failures.extend(check_release_credentials(release_workflow))
     if not isinstance(version, str) or not SEMVER.fullmatch(version):
         failures.append(f"Cargo version is not plain SemVer: {version!r}")
     check_product_release_scope(

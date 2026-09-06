@@ -6,7 +6,8 @@ Last verified: 2026-09-06
 
 **h00ligan 0.3.0 is published** in the standalone repository:
 [release and downloads](https://github.com/armenr/h00ligan/releases/tag/h00ligan-v0.3.0).
-The repository remains private. Publication did not change its visibility.
+The repository is public as verified on 2026-09-06; older private-status notes
+do not describe its current visibility.
 
 - Tag: `h00ligan-v0.3.0`.
 - Source: `0bd933483ceeef6e25a0d11c822bb0e7d03bd9d9`.
@@ -98,7 +99,16 @@ aggregate omission counts alone neither prove more defects nor establish exact
 provider per-file parity. Dynamic dispatch and bundled JavaScript qualifications
 remain visible and separate from the repaired tag-selection defect.
 
-Land this checked repair, then return to the queued PR baseline and three-target release automation/
+The Go repair merged through [PR #20](https://github.com/armenr/h00ligan/pull/20)
+at main `74dc46f`; all four required source/policy checks passed on the PR and
+merged main. Release Please's permission repair then created
+[PR #21 for 0.3.1](https://github.com/armenr/h00ligan/pull/21), without building
+or publishing. Its original built-in token left source CI waiting for approval.
+The current workflow change uses a repository-scoped GitHub App token to start
+those checks automatically; installed acceptance must still observe that real
+update and its exact-head CI. No release-PR auto-merge is configured.
+
+Return to the queued PR baseline and three-target release automation/
 CI-cost follow-up. Address the evidenced
 classification depth gap before advertising full four-language dead-code
 parity. Preserve real-repository dogfood, task-level comparison, and the
